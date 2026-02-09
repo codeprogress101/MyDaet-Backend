@@ -1,0 +1,272 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    /** -------------------------
+     * Helpers
+     * ------------------------- */
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function role() {
+      return signedIn() && request.auth.token.role != null
+        ? request.auth.token.role
+        : "resident";
+    }
+
+    function isSuperAdmin() {
+      return role() == "super_admin";
+    }
+
+    function isAdminOrHigher() {
+      return role() == "admin" || role() == "super_admin";
+    }
+
+    function isModeratorOrHigher() {
+      return role() == "moderator" || role() == "admin" || role() == "super_admin";
+    }
+
+    function isOwner(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    function isAllowedUserSelfUpdate() {
+      return request.resource.data.diff(resource.data).changedKeys()
+        .hasOnly(["displayName", "photoUrl", "phone", "updatedAt"]);
+    }
+
+    function hasNoPrivilegedUserFieldChanges() {
+      return !request.resource.data.diff(resource.data).changedKeys()
+        .hasAny(["role", "status", "uid", "email", "createdAt"]);
+    }
+
+    /** -------------------------
+     * USERS
+     * /users/{uid}
+     * ------------------------- */
+    match /users/{uid} {
+      allow create: if isOwner(uid)
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.role == "resident";
+
+      allow read: if isOwner(uid) || isAdminOrHigher();
+
+      allow update: if (
+        isOwner(uid)
+        && hasNoPrivilegedUserFieldChanges()
+        && isAllowedUserSelfUpdate()
+      ) || isAdminOrHigher();
+
+      allow delete: if isSuperAdmin();
+
+      match /fcmTokens/{token} {
+        allow read, write: if isOwner(uid);
+      }
+
+      match /notifications/{notificationId} {
+        allow read: if isOwner(uid);
+        allow update, delete: if isOwner(uid);
+        allow create: if false;
+      }
+
+      match /announcementReads/{announcementId} {
+        allow read, write: if isOwner(uid);
+      }
+    }
+
+    /** -------------------------
+     * AUDIT LOGS
+     * /audit_logs/{id}
+     * ------------------------- */
+    match /audit_logs/{id} {
+      allow read: if isAdminOrHigher();
+      allow write: if false;
+    }
+
+    /** -------------------------
+     * REPORTS
+     * /reports/{reportId}
+     * Production policy:
+     * - Resident creates, reads own
+     * - Moderator reads only assigned to them
+     * - Admin/SuperAdmin reads all
+     * - Workflow updates via Functions (server)
+     * ------------------------- */
+
+     match /stats/{docId} {
+      allow read: if isModeratorOrHigher();
+      allow write: if false;
+    }
+
+    match /stats/daily/{dayId} {
+      allow read: if isModeratorOrHigher();
+      allow write: if false;
+    }
+
+    match /stats/assignees/{uid} {
+      allow read: if isModeratorOrHigher() && (isAdminOrHigher() || request.auth.uid == uid);
+      allow write: if false;
+    }
+
+    match /reports/{reportId} {
+
+      // Resident can create report and must stamp ownership
+      allow create: if signedIn()
+        && request.resource.data.createdByUid == request.auth.uid
+        && request.resource.data.status == "submitted";
+
+      // Read: creator OR admin+ OR assigned moderator
+      allow read: if signedIn() && (
+        resource.data.createdByUid == request.auth.uid
+        || isAdminOrHigher()
+        || (role() == "moderator" && resource.data.assignedToUid == request.auth.uid)
+      );
+
+      // Update:
+      // - Resident can edit ONLY their own report content BEFORE it is handled
+      //   and CANNOT change workflow fields (status/assignedToUid/createdByUid)
+      // - Admin+ can update (but best practice: use Functions for workflow)
+      // - Assigned moderator can update status only
+      allow update: if signedIn() && (
+        (
+          resource.data.createdByUid == request.auth.uid
+          && (resource.data.status == "submitted" || resource.data.status == "in_review")
+          && request.resource.data.createdByUid == resource.data.createdByUid
+          && request.resource.data.assignedToUid == resource.data.assignedToUid
+          && request.resource.data.status == resource.data.status
+          && !request.resource.data.diff(resource.data).changedKeys()
+            .hasAny([
+              "lastActionByUid",
+              "lastActionByEmail",
+              "lastActionByName",
+              "lastActionByRole",
+              "lastActionAt",
+              "archived",
+              "archivedAt",
+              "archivedByUid",
+              "archivedByEmail",
+              "archivedByName",
+              "archivedByRole"
+            ])
+        )
+        || isAdminOrHigher()
+        || (
+          role() == "moderator"
+          && resource.data.assignedToUid == request.auth.uid
+          && request.resource.data.diff(resource.data).changedKeys()
+            .hasOnly([
+              "status",
+              "updatedAt",
+              "lastActionByUid",
+              "lastActionByEmail",
+              "lastActionByName",
+              "lastActionByRole",
+              "lastActionAt"
+            ])
+          && request.resource.data.lastActionByUid == request.auth.uid
+          && request.resource.data.lastActionByRole == request.auth.token.role
+          && request.resource.data.lastActionByEmail == request.auth.token.email
+        )
+      );
+
+      // Delete only admin+
+      allow delete: if isAdminOrHigher();
+
+      // Optional: messages subcollection
+      match /messages/{messageId} {
+        allow read: if signedIn() && (
+          get(/databases/$(database)/documents/reports/$(reportId)).data.createdByUid == request.auth.uid
+          || isAdminOrHigher()
+          || (
+            role() == "moderator"
+            && get(/databases/$(database)/documents/reports/$(reportId)).data.assignedToUid == request.auth.uid
+          )
+        );
+
+        allow create: if signedIn() && (
+          get(/databases/$(database)/documents/reports/$(reportId)).data.createdByUid == request.auth.uid
+          || isAdminOrHigher()
+          || (
+            role() == "moderator"
+            && get(/databases/$(database)/documents/reports/$(reportId)).data.assignedToUid == request.auth.uid
+          )
+        );
+
+        allow update, delete: if false;
+      }
+
+      match /history/{historyId} {
+        allow read: if signedIn() && (
+          get(/databases/$(database)/documents/reports/$(reportId)).data.createdByUid == request.auth.uid
+          || isAdminOrHigher()
+          || (
+            role() == "moderator"
+            && get(/databases/$(database)/documents/reports/$(reportId)).data.assignedToUid == request.auth.uid
+          )
+        );
+        allow write: if false;
+      }
+    }
+
+    /** -------------------------
+     * ADVERTISEMENTS
+     * /ads/{adId}
+     * - Admin/SuperAdmin can create/update/delete
+     * - Moderator can read all (for moderation/visibility)
+     * - Residents read published only
+     * - Reactions are per-user subcollection
+     * ------------------------- */
+    match /ads/{adId} {
+      allow read: if signedIn() && (
+        resource.data.status == "published"
+        || isModeratorOrHigher()
+      );
+
+      allow create: if isModeratorOrHigher()
+        && request.resource.data.createdByUid == request.auth.uid
+        && request.resource.data.status in ["draft", "published"];
+
+      allow update, delete: if isModeratorOrHigher();
+
+      match /reactions/{uid} {
+        allow read: if isOwner(uid) || isModeratorOrHigher();
+        allow create, update: if isOwner(uid)
+          && request.resource.data.type in ["like", "dislike"];
+        allow delete: if isOwner(uid);
+      }
+    }
+
+    /** -------------------------
+     * ANNOUNCEMENTS
+     * /announcements/{announcementId}
+     * - Moderator+ can create/update/delete
+     * - Residents read published only
+     * ------------------------- */
+    match /announcements/{announcementId} {
+      allow read: if signedIn() && (
+        resource.data.status == "published"
+        || isModeratorOrHigher()
+      );
+
+      allow create: if isModeratorOrHigher()
+        && request.resource.data.createdByUid == request.auth.uid
+        && request.resource.data.status in ["draft", "published"];
+
+      allow update, delete: if isModeratorOrHigher();
+
+      match /views/{viewerUid} {
+        allow read: if isOwner(viewerUid) || isAdminOrHigher();
+        allow create, update: if signedIn() && request.auth.uid == viewerUid;
+        allow delete: if false;
+      }
+    }
+
+    /** -------------------------
+     * Default deny
+     * ------------------------- */
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

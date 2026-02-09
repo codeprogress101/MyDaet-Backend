@@ -1,0 +1,75 @@
+rules_version = '2';
+
+// Craft rules based on data in your Firestore database
+// allow write: if firestore.get(
+//    /databases/(default)/documents/users/$(request.auth.uid)).data.isAdmin;
+service firebase.storage {
+  match /b/{bucket}/o {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function role() {
+      return signedIn() && request.auth.token.role != null
+        ? request.auth.token.role
+        : "resident";
+    }
+
+    function isModeratorOrHigher() {
+      return role() == "moderator" || role() == "admin" || role() == "super_admin";
+    }
+
+    function isAdminOrHigher() {
+      return role() == "admin" || role() == "super_admin";
+    }
+
+    function reportDoc(reportId) {
+      return firestore.get(/databases/(default)/documents/reports/$(reportId));
+    }
+
+    function canReadReport(reportId) {
+      return signedIn() && (
+        reportDoc(reportId).data.createdByUid == request.auth.uid
+        || isAdminOrHigher()
+        || (
+          role() == "moderator"
+          && reportDoc(reportId).data.assignedToUid == request.auth.uid
+        )
+      );
+    }
+
+    function canWriteReportNote(reportId) {
+      return signedIn() && (
+        isAdminOrHigher()
+        || (
+          role() == "moderator"
+          && reportDoc(reportId).data.assignedToUid == request.auth.uid
+        )
+      );
+    }
+
+    match /ads/{adId}/{fileName} {
+      allow read: if signedIn();
+      allow write: if isModeratorOrHigher();
+    }
+
+    match /announcements/{announcementId}/{fileName} {
+      allow read: if signedIn();
+      allow write: if isModeratorOrHigher();
+    }
+
+    match /reports/{uid}/{reportId}/{fileName} {
+      allow read: if signedIn() && (request.auth.uid == uid || isModeratorOrHigher());
+      allow write: if signedIn() && request.auth.uid == uid;
+    }
+
+    match /report_notes/{reportId}/{messageId}/{fileName} {
+      allow read: if canReadReport(reportId);
+      allow write: if canWriteReportNote(reportId);
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
