@@ -14,7 +14,7 @@ service cloud.firestore {
         ? request.auth.token.role
         : "resident";
     }
-
+ 
     function isSuperAdmin() {
       return role() == "super_admin";
     }

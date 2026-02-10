@@ -17,3 +17,4 @@ admin
     console.error("❌ Error setting custom claims:", error);
     process.exit(1);
   });
+ 
