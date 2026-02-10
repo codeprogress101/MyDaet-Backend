@@ -7,13 +7,40 @@ const db = admin.firestore();
 /**
  * Role definitions
  */
-type Role = "resident" | "moderator" | "admin" | "super_admin";
-const ALLOWED_ROLES: Role[] = ["resident", "moderator", "admin", "super_admin"];
+type Role = "resident" | "moderator" | "office_admin" | "super_admin" | "admin";
+type NormalizedRole = "resident" | "moderator" | "office_admin" | "super_admin";
+const ALLOWED_ROLES: Role[] = [
+  "resident",
+  "moderator",
+  "office_admin",
+  "super_admin",
+  "admin",
+];
 
 const OPEN_STATUSES = ["submitted", "in_review", "assigned", "in_progress"] as const;
 
 function isOpenStatus(s: string): boolean {
   return (OPEN_STATUSES as readonly string[]).includes(s);
+}
+
+function normalizeRole(raw: unknown): NormalizedRole {
+  if (!raw) return "resident";
+  const role = String(raw).trim().toLowerCase();
+  if (role === "admin") return "super_admin";
+  if (role === "super_admin") return "super_admin";
+  if (role === "office_admin") return "office_admin";
+  if (role === "moderator") return "moderator";
+  return "resident";
+}
+
+function coerceString(value: unknown): string | null {
+  if (!value) return null;
+  const text = String(value).trim();
+  return text.length > 0 ? text : null;
+}
+
+function coerceBool(value: unknown, fallback = true): boolean {
+  return typeof value === "boolean" ? value : fallback;
 }
 
 function ymd(date: Date): string {
@@ -61,6 +88,16 @@ async function getTokensForUids(uids: string[]) {
 async function getResidentUids(): Promise<string[]> {
   const snap = await db.collection("users").where("role", "==", "resident").get();
   return snap.docs.map((d) => d.id);
+}
+
+async function getUserProfile(uid: string) {
+  const snap = await db.collection("users").doc(uid).get();
+  const data = snap.exists ? snap.data() ?? {} : {};
+  const role = normalizeRole(data.role);
+  const officeId = coerceString(data.officeId);
+  const officeName = coerceString(data.officeName);
+  const isActive = coerceBool(data.isActive, true);
+  return { role, officeId, officeName, isActive, data };
 }
 
 async function sendPushToUsers(uids: string[], payload: NotificationData) {
@@ -200,6 +237,9 @@ export const onAuthUserCreated = functions.auth.user().onCreate(async (user) => 
       uid,
       email: user.email ?? null,
       role: "resident", // display only; authority is via custom claims
+      officeId: null,
+      officeName: null,
+      isActive: true,
       status: "active",
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     },
@@ -216,7 +256,23 @@ export const getMyClaims = functions.https.onCall(async (_data, context) => {
   if (!context.auth) {
     throw new functions.https.HttpsError("unauthenticated", "Auth required.");
   }
-  return context.auth.token;
+  const uid = context.auth.uid;
+  const token = context.auth.token ?? {};
+
+  const tokenRole = normalizeRole(token.role);
+  const tokenOfficeId = coerceString(token.officeId);
+  const tokenOfficeName = coerceString(token.officeName);
+  const tokenIsActive =
+    typeof token.isActive === "boolean" ? token.isActive : undefined;
+
+  const profile = await getUserProfile(uid);
+
+  return {
+    role: token.role ? tokenRole : profile.role,
+    officeId: tokenOfficeId ?? profile.officeId,
+    officeName: tokenOfficeName ?? profile.officeName,
+    isActive: tokenIsActive ?? profile.isActive,
+  };
 });
 
 /**
@@ -229,7 +285,7 @@ export const setUserRole = functions.https.onCall(async (data, context) => {
     throw new functions.https.HttpsError("unauthenticated", "Auth required.");
   }
 
-  const callerRole = (context.auth.token.role as Role | undefined) ?? "resident";
+  const callerRole = normalizeRole(context.auth.token.role);
   if (callerRole !== "super_admin") {
     throw new functions.https.HttpsError(
       "permission-denied",
@@ -238,18 +294,59 @@ export const setUserRole = functions.https.onCall(async (data, context) => {
   }
 
   const uid = data?.uid;
-  const role = data?.role as Role;
+  const rawRole = data?.role as Role;
 
-  if (typeof uid !== "string" || !ALLOWED_ROLES.includes(role)) {
+  if (typeof uid !== "string" || !ALLOWED_ROLES.includes(rawRole)) {
     throw new functions.https.HttpsError("invalid-argument", "Invalid uid or role.");
   }
 
-  await admin.auth().setCustomUserClaims(uid, { role });
+  const nextRole = normalizeRole(rawRole);
+  const targetProfile = await getUserProfile(uid);
+
+  if (targetProfile.role === "super_admin" && nextRole !== "super_admin") {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "Cannot change role of super_admin."
+    );
+  }
+
+  const needsOffice = nextRole === "office_admin" || nextRole === "moderator";
+  let officeId = coerceString(data?.officeId) ?? targetProfile.officeId;
+  let officeName = coerceString(data?.officeName) ?? targetProfile.officeName;
+  const isActive =
+    typeof data?.isActive === "boolean" ? data.isActive : targetProfile.isActive;
+
+  if (needsOffice && !officeId) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "officeId is required for office_admin or moderator."
+    );
+  }
+
+  if (!needsOffice) {
+    officeId = null;
+    officeName = null;
+  }
+
+  if (officeId && !officeName) {
+    const officeSnap = await db.collection("offices").doc(officeId).get();
+    officeName = coerceString(officeSnap.data()?.name);
+  }
+
+  await admin.auth().setCustomUserClaims(uid, {
+    role: nextRole,
+    officeId,
+    officeName,
+    isActive,
+  });
 
   // keep Firestore display role in-sync (critical for dropdowns / UI)
   await db.collection("users").doc(uid).set(
     {
-      role,
+      role: nextRole,
+      officeId,
+      officeName,
+      isActive,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     },
     { merge: true }
@@ -257,6 +354,50 @@ export const setUserRole = functions.https.onCall(async (data, context) => {
 
   return { success: true };
 });
+
+/**
+ * =========================
+ * SYNC USER CLAIMS
+ * =========================
+ * Keep auth custom claims in sync with Firestore user profile.
+ */
+export const onUserWrite = functions.firestore
+  .document("users/{uid}")
+  .onWrite(async (change, context) => {
+    const uid = context.params.uid as string;
+    if (!change.after.exists) {
+      await admin.auth().setCustomUserClaims(uid, {});
+      return;
+    }
+
+    const data = change.after.data() ?? {};
+    const role = normalizeRole(data.role);
+    let officeId = coerceString(data.officeId);
+    let officeName = coerceString(data.officeName);
+    const isActive = coerceBool(data.isActive, true);
+
+    if (role === "super_admin" || role === "resident") {
+      officeId = null;
+      officeName = null;
+    }
+
+    await admin.auth().setCustomUserClaims(uid, {
+      role,
+      officeId,
+      officeName,
+      isActive,
+    });
+
+    if (data.role === "admin") {
+      await change.after.ref.set(
+        {
+          role: "super_admin",
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    }
+  });
 
 /**
  * =========================
@@ -493,16 +634,35 @@ export const onReportNotify = functions.firestore
       const assignedToUid = (after.assignedToUid ?? null) as string | null;
       const createdByEmail = (after.createdByEmail ?? null) as string | null;
       const createdByName = (after.createdByName ?? null) as string | null;
+      const reportOfficeId = coerceString(after.officeId);
 
-      const adminSnap = await db
+      const superSnap = await db
         .collection("users")
         .where("role", "in", ["admin", "super_admin"])
         .get();
-      const adminUids = adminSnap.docs.map((d) => d.id);
+      const superUids = superSnap.docs.map((d) => d.id);
+
+      let officeAdminUids: string[] = [];
+      if (reportOfficeId) {
+        const officeSnap = await db
+          .collection("users")
+          .where("role", "==", "office_admin")
+          .where("officeId", "==", reportOfficeId)
+          .get();
+        officeAdminUids = officeSnap.docs.map((d) => d.id);
+      } else {
+        const officeSnap = await db
+          .collection("users")
+          .where("role", "==", "office_admin")
+          .get();
+        officeAdminUids = officeSnap.docs.map((d) => d.id);
+      }
+
+      const adminUids = Array.from(new Set([...superUids, ...officeAdminUids]));
 
       await notifyUsers(adminUids, {
         title: "New report submitted",
-        body: `${title} • ${category}`,
+        body: `${title} - ${category}`,
         type: "report_created",
         reportId,
         status,
@@ -523,6 +683,7 @@ export const onReportNotify = functions.firestore
         reportCategory: category,
         status,
         assignedToUid: assignedToUid ?? null,
+        officeId: reportOfficeId ?? null,
         actorUid: createdByUid,
         actorEmail: createdByEmail,
         actorName: createdByName,
@@ -541,6 +702,7 @@ export const onReportNotify = functions.firestore
     const actorEmail = (after.lastActionByEmail ?? "") as string;
     const actorName = (after.lastActionByName ?? "") as string;
     const actorRole = (after.lastActionByRole ?? "") as string;
+    const reportOfficeId = coerceString(after.officeId ?? before.officeId);
 
     const beforeStatus = (before.status ?? "submitted") as string;
     const afterStatus = (after.status ?? "submitted") as string;
@@ -558,7 +720,7 @@ export const onReportNotify = functions.firestore
       if (afterAssigned) {
         await notifyUsers([afterAssigned], {
           title: "Report assigned to you",
-          body: `${title} • ${category}`,
+          body: `${title} - ${category}`,
           type: "report_assigned",
           reportId,
           status: afterStatus,
@@ -583,6 +745,7 @@ export const onReportNotify = functions.firestore
         status: afterStatus,
         fromAssignedUid: beforeAssigned ?? null,
         toAssignedUid: afterAssigned ?? null,
+        officeId: reportOfficeId ?? null,
         actorUid: actorUid || null,
         actorEmail: actorEmail || null,
         actorName: actorName || null,
@@ -597,7 +760,7 @@ export const onReportNotify = functions.firestore
         : "Your report was assigned to a moderator.";
       await notifyUsers([createdByUid], {
         title: "Report update",
-        body: `${title} • ${detail}`,
+        body: `${title} - ${detail}`,
         type: "report_updated",
         reportId,
         status: afterStatus,
@@ -626,6 +789,7 @@ export const onReportNotify = functions.firestore
         toStatus: afterStatus,
         status: afterStatus,
         assignedToUid: afterAssigned ?? null,
+        officeId: reportOfficeId ?? null,
         actorUid: actorUid || null,
         actorEmail: actorEmail || null,
         actorName: actorName || null,
@@ -652,6 +816,7 @@ export const onReportNotify = functions.firestore
         reportCategory: category,
         status: afterStatus,
         assignedToUid: afterAssigned ?? null,
+        officeId: reportOfficeId ?? null,
         actorUid: actorUid || null,
         actorEmail: actorEmail || null,
         actorName: actorName || null,
@@ -683,7 +848,7 @@ export const onAnnouncementNotify = functions.firestore
     const category = (after.category ?? "") as string;
     const announcementId = context.params.announcementId as string;
 
-    const body = category ? `${title} • ${category}` : title;
+    const body = category ? `${title} - ${category}` : title;
     const residentUids = await getResidentUids();
 
     await notifyUsers(residentUids, {
@@ -711,6 +876,7 @@ export const onAnnouncementAudit = functions.firestore
       const category = (after.category ?? "") as string;
       const status = (after.status ?? "draft") as string;
       const actor = announcementActor(after as Record<string, unknown>);
+      const officeId = coerceString((after as Record<string, unknown>).officeId);
 
       await addAuditLog({
         action: "announcement_created",
@@ -718,6 +884,7 @@ export const onAnnouncementAudit = functions.firestore
         announcementTitle: title,
         announcementCategory: category,
         status,
+        officeId: officeId ?? null,
         ...actor,
         message: "Announcement created.",
       });
@@ -729,6 +896,7 @@ export const onAnnouncementAudit = functions.firestore
       const category = (before.category ?? "") as string;
       const status = (before.status ?? "draft") as string;
       const actor = announcementActor(before as Record<string, unknown>);
+      const officeId = coerceString((before as Record<string, unknown>).officeId);
 
       await addAuditLog({
         action: "announcement_deleted",
@@ -736,6 +904,7 @@ export const onAnnouncementAudit = functions.firestore
         announcementTitle: title,
         announcementCategory: category,
         status,
+        officeId: officeId ?? null,
         ...actor,
         message: "Announcement deleted.",
       });
@@ -750,6 +919,7 @@ export const onAnnouncementAudit = functions.firestore
     const title = (after.title ?? "Announcement") as string;
     const category = (after.category ?? "") as string;
     const actor = announcementActor(after as Record<string, unknown>);
+    const officeId = coerceString((after as Record<string, unknown>).officeId);
 
     if (statusChanged && afterStatus === "published") {
       await addAuditLog({
@@ -758,6 +928,7 @@ export const onAnnouncementAudit = functions.firestore
         announcementTitle: title,
         announcementCategory: category,
         status: afterStatus,
+        officeId: officeId ?? null,
         ...actor,
         message: "Announcement published.",
       });
@@ -771,6 +942,7 @@ export const onAnnouncementAudit = functions.firestore
         announcementTitle: title,
         announcementCategory: category,
         status: afterStatus,
+        officeId: officeId ?? null,
         ...actor,
         message: "Announcement unpublished.",
       });
@@ -783,6 +955,7 @@ export const onAnnouncementAudit = functions.firestore
       announcementTitle: title,
       announcementCategory: category,
       status: afterStatus,
+      officeId: officeId ?? null,
       ...actor,
       message: statusChanged ? "Announcement status updated." : "Announcement updated.",
     });

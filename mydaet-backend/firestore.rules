@@ -9,22 +9,100 @@ service cloud.firestore {
       return request.auth != null;
     }
 
-    function role() {
-      return signedIn() && request.auth.token.role != null
-        ? request.auth.token.role
-        : "resident";
+    function signedInUser() {
+      return signedIn();
     }
- 
+
+    function tokenRole() {
+      return (request.auth != null && request.auth.token.role != null)
+        ? request.auth.token.role
+        : null;
+    }
+
+    function tokenOfficeId() {
+      return (request.auth != null && request.auth.token.officeId != null)
+        ? request.auth.token.officeId
+        : null;
+    }
+
+    function userDoc() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function hasUserData() {
+      return signedIn() && userDoc().data != null;
+    }
+
+    function roleRaw() {
+      return (request.auth != null && request.auth.token.role != null)
+        ? request.auth.token.role
+        : (hasUserData() && userDoc().data.role != null
+            ? userDoc().data.role
+            : null);
+    }
+
+    function role() {
+      return roleRaw() == "admin"
+        ? "super_admin"
+        : (roleRaw() in ["super_admin", "office_admin", "moderator", "resident"]
+            ? roleRaw()
+            : "resident");
+    }
+
+    function officeId() {
+      return (request.auth != null && request.auth.token.officeId != null)
+        ? request.auth.token.officeId
+        : (hasUserData() && userDoc().data.officeId != null
+            ? userDoc().data.officeId
+            : null);
+    }
+
+    function isActive() {
+      return (request.auth != null && request.auth.token.isActive != null)
+        ? request.auth.token.isActive
+        : (hasUserData() && userDoc().data.isActive != null
+            ? userDoc().data.isActive
+            : true);
+    }
+
+    function activeUser() {
+      return signedIn() && isActive();
+    }
+
     function isSuperAdmin() {
       return role() == "super_admin";
     }
 
-    function isAdminOrHigher() {
-      return role() == "admin" || role() == "super_admin";
+    function isOfficeAdmin() {
+      return role() == "office_admin";
     }
 
-    function isModeratorOrHigher() {
-      return role() == "moderator" || role() == "admin" || role() == "super_admin";
+    function isModerator() {
+      return role() == "moderator";
+    }
+
+    function isResident() {
+      return role() == "resident";
+    }
+
+    function isStaff() {
+      return isSuperAdmin() || isOfficeAdmin() || isModerator();
+    }
+
+    function isSuperAdminByDoc() {
+      return hasUserData() && userDoc().data.role in ["super_admin", "admin"];
+    }
+
+    function hasOfficeId(data) {
+      return data.keys().hasAny(["officeId"]) && data.officeId != null && data.officeId != "";
+    }
+
+    function officeAllowed(data) {
+      return !hasOfficeId(data) || (officeId() != null && data.officeId == officeId());
+    }
+
+    function sameOffice(data) {
+      return officeId() != null && data.officeId == officeId();
     }
 
     function isOwner(uid) {
@@ -38,7 +116,7 @@ service cloud.firestore {
 
     function hasNoPrivilegedUserFieldChanges() {
       return !request.resource.data.diff(resource.data).changedKeys()
-        .hasAny(["role", "status", "uid", "email", "createdAt"]);
+        .hasAny(["role", "status", "uid", "email", "createdAt", "officeId", "officeName", "isActive"]);
     }
 
     /** -------------------------
@@ -48,30 +126,50 @@ service cloud.firestore {
     match /users/{uid} {
       allow create: if isOwner(uid)
         && request.resource.data.uid == request.auth.uid
-        && request.resource.data.role == "resident";
+        && request.resource.data.role == "resident"
+        && (!("officeId" in request.resource.data) || request.resource.data.officeId == null)
+        && (!("officeName" in request.resource.data) || request.resource.data.officeName == null)
+        && (!("isActive" in request.resource.data) || request.resource.data.isActive == true);
 
-      allow read: if isOwner(uid) || isAdminOrHigher();
+      allow read: if signedInUser() && isOwner(uid);
+      allow read: if signedInUser() && tokenRole() in ["super_admin", "admin"];
+      allow read: if signedInUser()
+        && tokenRole() == "office_admin"
+        && tokenOfficeId() != null
+        && resource.data.officeId == tokenOfficeId()
+        && resource.data.role in ["resident", "moderator", "office_admin"];
 
-      allow update: if (
-        isOwner(uid)
-        && hasNoPrivilegedUserFieldChanges()
-        && isAllowedUserSelfUpdate()
-      ) || isAdminOrHigher();
+      allow update: if activeUser() && (
+        (
+          isOwner(uid)
+          && hasNoPrivilegedUserFieldChanges()
+          && isAllowedUserSelfUpdate()
+        )
+        || (
+          isSuperAdmin()
+          && (resource.data.role != "super_admin" || request.resource.data.role == "super_admin")
+          && (
+            request.resource.data.role in ["office_admin", "moderator"]
+              ? (request.resource.data.officeId != null && request.resource.data.officeId != "")
+              : true
+          )
+        )
+      );
 
-      allow delete: if isSuperAdmin();
+      allow delete: if activeUser() && isSuperAdmin();
 
       match /fcmTokens/{token} {
-        allow read, write: if isOwner(uid);
+        allow read, write: if signedInUser() && isOwner(uid);
       }
 
       match /notifications/{notificationId} {
-        allow read: if isOwner(uid);
-        allow update, delete: if isOwner(uid);
+        allow read: if signedInUser() && isOwner(uid);
+        allow update, delete: if signedInUser() && isOwner(uid);
         allow create: if false;
       }
 
       match /announcementReads/{announcementId} {
-        allow read, write: if isOwner(uid);
+        allow read, write: if signedInUser() && isOwner(uid);
       }
     }
 
@@ -80,55 +178,60 @@ service cloud.firestore {
      * /audit_logs/{id}
      * ------------------------- */
     match /audit_logs/{id} {
-      allow read: if isAdminOrHigher();
+      allow read: if signedInUser() && (
+        isSuperAdmin()
+        || (isOfficeAdmin() && officeId() != null && resource.data.officeId == officeId())
+      );
       allow write: if false;
     }
 
     /** -------------------------
      * REPORTS
      * /reports/{reportId}
-     * Production policy:
-     * - Resident creates, reads own
-     * - Moderator reads only assigned to them
-     * - Admin/SuperAdmin reads all
-     * - Workflow updates via Functions (server)
      * ------------------------- */
 
-     match /stats/{docId} {
-      allow read: if isModeratorOrHigher();
+    match /stats/{docId} {
+      allow read: if signedInUser() && isStaff();
       allow write: if false;
     }
 
     match /stats/daily/{dayId} {
-      allow read: if isModeratorOrHigher();
+      allow read: if signedInUser() && isStaff();
       allow write: if false;
     }
 
     match /stats/assignees/{uid} {
-      allow read: if isModeratorOrHigher() && (isAdminOrHigher() || request.auth.uid == uid);
+      allow read: if signedInUser() && isStaff() && (isSuperAdmin() || request.auth.uid == uid);
       allow write: if false;
     }
 
     match /reports/{reportId} {
+      // TODO: Backfill report.officeId for stricter office scoping.
 
       // Resident can create report and must stamp ownership
-      allow create: if signedIn()
+      allow create: if activeUser()
         && request.resource.data.createdByUid == request.auth.uid
-        && request.resource.data.status == "submitted";
+        && request.resource.data.status == "submitted"
+        && request.resource.data.officeId != null
+        && request.resource.data.officeId != ""
+        && request.resource.data.officeName != null
+        && request.resource.data.officeName != "";
 
       // Read: creator OR admin+ OR assigned moderator
-      allow read: if signedIn() && (
+      allow read: if signedInUser() && (
         resource.data.createdByUid == request.auth.uid
-        || isAdminOrHigher()
-        || (role() == "moderator" && resource.data.assignedToUid == request.auth.uid)
+        || isSuperAdmin()
+        || (isOfficeAdmin() && officeAllowed(resource.data))
+        || (isModerator() && resource.data.assignedToUid == request.auth.uid)
       );
 
       // Update:
       // - Resident can edit ONLY their own report content BEFORE it is handled
       //   and CANNOT change workflow fields (status/assignedToUid/createdByUid)
-      // - Admin+ can update (but best practice: use Functions for workflow)
+      // - SuperAdmin can update any
+      // - Office admin can update within office scope
       // - Assigned moderator can update status only
-      allow update: if signedIn() && (
+      allow update: if activeUser() && (
         (
           resource.data.createdByUid == request.auth.uid
           && (resource.data.status == "submitted" || resource.data.status == "in_review")
@@ -137,6 +240,7 @@ service cloud.firestore {
           && request.resource.data.status == resource.data.status
           && !request.resource.data.diff(resource.data).changedKeys()
             .hasAny([
+              "officeId",
               "lastActionByUid",
               "lastActionByEmail",
               "lastActionByName",
@@ -150,9 +254,14 @@ service cloud.firestore {
               "archivedByRole"
             ])
         )
-        || isAdminOrHigher()
+        || isSuperAdmin()
         || (
-          role() == "moderator"
+          isOfficeAdmin()
+          && officeAllowed(resource.data)
+          && request.resource.data.officeId == resource.data.officeId
+        )
+        || (
+          isModerator()
           && resource.data.assignedToUid == request.auth.uid
           && request.resource.data.diff(resource.data).changedKeys()
             .hasOnly([
@@ -165,30 +274,31 @@ service cloud.firestore {
               "lastActionAt"
             ])
           && request.resource.data.lastActionByUid == request.auth.uid
-          && request.resource.data.lastActionByRole == request.auth.token.role
+          && request.resource.data.lastActionByRole == roleRaw()
           && request.resource.data.lastActionByEmail == request.auth.token.email
         )
       );
 
-      // Delete only admin+
-      allow delete: if isAdminOrHigher();
+      // Delete only super admin
+      allow delete: if activeUser() && isSuperAdmin();
 
       // Optional: messages subcollection
       match /messages/{messageId} {
-        allow read: if signedIn() && (
+        allow read: if signedInUser() && (
           get(/databases/$(database)/documents/reports/$(reportId)).data.createdByUid == request.auth.uid
-          || isAdminOrHigher()
+          || isSuperAdmin()
+          || (isOfficeAdmin() && officeAllowed(get(/databases/$(database)/documents/reports/$(reportId)).data))
           || (
-            role() == "moderator"
+            isModerator()
             && get(/databases/$(database)/documents/reports/$(reportId)).data.assignedToUid == request.auth.uid
           )
         );
 
-        allow create: if signedIn() && (
-          get(/databases/$(database)/documents/reports/$(reportId)).data.createdByUid == request.auth.uid
-          || isAdminOrHigher()
+        allow create: if activeUser() && (
+          isSuperAdmin()
+          || (isOfficeAdmin() && officeAllowed(get(/databases/$(database)/documents/reports/$(reportId)).data))
           || (
-            role() == "moderator"
+            isModerator()
             && get(/databases/$(database)/documents/reports/$(reportId)).data.assignedToUid == request.auth.uid
           )
         );
@@ -197,11 +307,12 @@ service cloud.firestore {
       }
 
       match /history/{historyId} {
-        allow read: if signedIn() && (
+        allow read: if signedInUser() && (
           get(/databases/$(database)/documents/reports/$(reportId)).data.createdByUid == request.auth.uid
-          || isAdminOrHigher()
+          || isSuperAdmin()
+          || (isOfficeAdmin() && officeAllowed(get(/databases/$(database)/documents/reports/$(reportId)).data))
           || (
-            role() == "moderator"
+            isModerator()
             && get(/databases/$(database)/documents/reports/$(reportId)).data.assignedToUid == request.auth.uid
           )
         );
@@ -212,54 +323,95 @@ service cloud.firestore {
     /** -------------------------
      * ADVERTISEMENTS
      * /ads/{adId}
-     * - Admin/SuperAdmin can create/update/delete
-     * - Moderator can read all (for moderation/visibility)
-     * - Residents read published only
-     * - Reactions are per-user subcollection
      * ------------------------- */
     match /ads/{adId} {
-      allow read: if signedIn() && (
+      allow read: if signedInUser() && (
         resource.data.status == "published"
-        || isModeratorOrHigher()
+        || isStaff()
       );
 
-      allow create: if isModeratorOrHigher()
+      allow create: if activeUser() && isStaff()
         && request.resource.data.createdByUid == request.auth.uid
         && request.resource.data.status in ["draft", "published"];
 
-      allow update, delete: if isModeratorOrHigher();
+      allow update, delete: if activeUser() && isStaff();
 
       match /reactions/{uid} {
-        allow read: if isOwner(uid) || isModeratorOrHigher();
-        allow create, update: if isOwner(uid)
+        allow read: if signedInUser() && (isOwner(uid) || isStaff());
+        allow create, update: if signedInUser() && isOwner(uid)
           && request.resource.data.type in ["like", "dislike"];
-        allow delete: if isOwner(uid);
+        allow delete: if signedInUser() && isOwner(uid);
       }
     }
 
     /** -------------------------
      * ANNOUNCEMENTS
      * /announcements/{announcementId}
-     * - Moderator+ can create/update/delete
-     * - Residents read published only
      * ------------------------- */
     match /announcements/{announcementId} {
-      allow read: if signedIn() && (
+      allow read: if signedInUser() && (
         resource.data.status == "published"
-        || isModeratorOrHigher()
+        || isStaff()
       );
 
-      allow create: if isModeratorOrHigher()
+      allow create: if activeUser() && isStaff()
         && request.resource.data.createdByUid == request.auth.uid
         && request.resource.data.status in ["draft", "published"];
 
-      allow update, delete: if isModeratorOrHigher();
+      allow update, delete: if activeUser() && isStaff();
 
       match /views/{viewerUid} {
-        allow read: if isOwner(viewerUid) || isAdminOrHigher();
-        allow create, update: if signedIn() && request.auth.uid == viewerUid;
+        allow read: if signedInUser() && (isOwner(viewerUid) || isSuperAdmin());
+        allow create, update: if signedInUser() && request.auth.uid == viewerUid;
         allow delete: if false;
       }
+    }
+
+    /** -------------------------
+     * OFFICES
+     * /offices/{officeId}
+     * ------------------------- */
+    match /offices/{officeId} {
+      allow read: if signedInUser();
+      allow create, update, delete: if activeUser() && (isSuperAdmin() || isSuperAdminByDoc());
+    }
+
+    /** -------------------------
+     * APPOINTMENTS (Phase 2 prep)
+     * /appointments/{appointmentId}
+     * ------------------------- */
+    match /appointments/{appointmentId} {
+      allow read: if activeUser() && (
+        isSuperAdmin()
+        || ((isOfficeAdmin() || isModerator())
+          && officeId() != null
+          && resource.data.officeId == officeId())
+      );
+      allow create, update, delete: if activeUser() && (
+        isSuperAdmin()
+        || (isOfficeAdmin()
+          && officeId() != null
+          && request.resource.data.officeId == officeId())
+      );
+    }
+
+    /** -------------------------
+     * OFFICE SLOTS (Phase 2 prep)
+     * /office_slots/{slotId}
+     * ------------------------- */
+    match /office_slots/{slotId} {
+      allow read: if activeUser() && (
+        isSuperAdmin()
+        || ((isOfficeAdmin() || isModerator())
+          && officeId() != null
+          && resource.data.officeId == officeId())
+      );
+      allow create, update, delete: if activeUser() && (
+        isSuperAdmin()
+        || (isOfficeAdmin()
+          && officeId() != null
+          && request.resource.data.officeId == officeId())
+      );
     }
 
     /** -------------------------

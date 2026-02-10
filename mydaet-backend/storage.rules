@@ -1,66 +1,99 @@
 rules_version = '2';
 
-// Craft rules based on data in your Firestore database
-// allow write: if firestore.get(
-//    /databases/(default)/documents/users/$(request.auth.uid)).data.isAdmin;
 service firebase.storage {
   match /b/{bucket}/o {
     function signedIn() {
       return request.auth != null;
     }
 
-    function role() {
-      return signedIn() && request.auth.token.role != null
+    function roleRaw() {
+      return (request.auth != null && request.auth.token.role != null)
         ? request.auth.token.role
-        : "resident";
+        : null;
     }
 
-    function isModeratorOrHigher() {
-      return role() == "moderator" || role() == "admin" || role() == "super_admin";
+    function role() {
+      return roleRaw() == "admin"
+        ? "super_admin"
+        : (roleRaw() in ["super_admin", "office_admin", "moderator", "resident"]
+            ? roleRaw()
+            : "resident");
     }
- 
-    function isAdminOrHigher() {
-      return role() == "admin" || role() == "super_admin";
+
+    function officeId() {
+      return (request.auth != null && request.auth.token.officeId != null)
+        ? request.auth.token.officeId
+        : null;
+    }
+
+    function isActive() {
+      return (request.auth != null && request.auth.token.isActive != null)
+        ? request.auth.token.isActive
+        : true;
+    }
+
+    function activeUser() {
+      return signedIn() && isActive();
+    }
+
+    function isSuperAdmin() {
+      return role() == "super_admin";
+    }
+
+    function isOfficeAdmin() {
+      return role() == "office_admin";
+    }
+
+    function isModerator() {
+      return role() == "moderator";
+    }
+
+    function isStaff() {
+      return isSuperAdmin() || isOfficeAdmin() || isModerator();
     }
 
     function reportDoc(reportId) {
       return firestore.get(/databases/(default)/documents/reports/$(reportId));
     }
 
+    function reportOfficeAllowed(reportId) {
+      return reportDoc(reportId).data.officeId == null
+        || reportDoc(reportId).data.officeId == ""
+        || (officeId() != null && reportDoc(reportId).data.officeId == officeId());
+    }
+
     function canReadReport(reportId) {
-      return signedIn() && (
+      return activeUser() && (
         reportDoc(reportId).data.createdByUid == request.auth.uid
-        || isAdminOrHigher()
-        || (
-          role() == "moderator"
-          && reportDoc(reportId).data.assignedToUid == request.auth.uid
-        )
+        || isSuperAdmin()
+        || (isOfficeAdmin() && reportOfficeAllowed(reportId))
+        || (isModerator() && reportDoc(reportId).data.assignedToUid == request.auth.uid)
       );
     }
 
     function canWriteReportNote(reportId) {
-      return signedIn() && (
-        isAdminOrHigher()
-        || (
-          role() == "moderator"
-          && reportDoc(reportId).data.assignedToUid == request.auth.uid
-        )
+      return activeUser() && (
+        isSuperAdmin()
+        || (isOfficeAdmin() && reportOfficeAllowed(reportId))
+        || (isModerator() && reportDoc(reportId).data.assignedToUid == request.auth.uid)
       );
     }
 
     match /ads/{adId}/{fileName} {
-      allow read: if signedIn();
-      allow write: if isModeratorOrHigher();
+      allow read: if activeUser();
+      allow write: if activeUser() && isStaff();
     }
 
     match /announcements/{announcementId}/{fileName} {
-      allow read: if signedIn();
-      allow write: if isModeratorOrHigher();
+      allow read: if activeUser();
+      allow write: if activeUser() && isStaff();
     }
 
     match /reports/{uid}/{reportId}/{fileName} {
-      allow read: if signedIn() && (request.auth.uid == uid || isModeratorOrHigher());
-      allow write: if signedIn() && request.auth.uid == uid;
+      allow read: if canReadReport(reportId);
+      allow write: if activeUser()
+        && request.auth.uid == uid
+        && reportDoc(reportId).data.createdByUid == request.auth.uid;
     }
 
     match /report_notes/{reportId}/{messageId}/{fileName} {
