@@ -97,6 +97,10 @@ service cloud.firestore {
       return data.keys().hasAny(["officeId"]) && data.officeId != null && data.officeId != "";
     }
 
+    function hasNonEmptyString(data, field) {
+      return data.keys().hasAny([field]) && data[field] is string && data[field] != "";
+    }
+
     function officeAllowed(data) {
       return !hasOfficeId(data) || (officeId() != null && data.officeId == officeId());
     }
@@ -212,10 +216,8 @@ service cloud.firestore {
       allow create: if activeUser()
         && request.resource.data.createdByUid == request.auth.uid
         && request.resource.data.status == "submitted"
-        && request.resource.data.officeId != null
-        && request.resource.data.officeId != ""
-        && request.resource.data.officeName != null
-        && request.resource.data.officeName != "";
+        && hasNonEmptyString(request.resource.data, "officeId")
+        && hasNonEmptyString(request.resource.data, "officeName");
 
       // Read: creator OR admin+ OR assigned moderator
       allow read: if signedInUser() && (
