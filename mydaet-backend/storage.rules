@@ -79,6 +79,33 @@ service firebase.storage {
       );
     }
 
+    function dtsDoc(docId) {
+      return firestore.get(/databases/(default)/documents/dts_documents/$(docId));
+    }
+
+    function dtsOfficeAllowed(docId) {
+      return isSuperAdmin()
+        || (
+          isStaff()
+          && officeId() != null
+          && (
+            dtsDoc(docId).data.currentOfficeId == officeId()
+            || (
+              dtsDoc(docId).data.pendingTransfer != null
+              && dtsDoc(docId).data.pendingTransfer.toOfficeId == officeId()
+            )
+          )
+        );
+    }
+
+    function canReadDts(docId) {
+      return activeUser() && (
+        isSuperAdmin()
+        || dtsOfficeAllowed(docId)
+        || dtsDoc(docId).data.submittedByUid == request.auth.uid
+      );
+    }
+
     match /ads/{adId}/{fileName} {
       allow read: if activeUser();
       allow write: if activeUser() && isStaff();
@@ -99,6 +126,26 @@ service firebase.storage {
     match /report_notes/{reportId}/{messageId}/{fileName} {
       allow read: if canReadReport(reportId);
       allow write: if canWriteReportNote(reportId);
+    }
+
+    match /dts/{docId}/cover/{fileName} {
+      allow read: if canReadDts(docId);
+      allow write: if activeUser() && isStaff() && dtsOfficeAllowed(docId);
+    }
+
+    match /dts/{docId}/attachments/{fileName} {
+      allow read: if canReadDts(docId);
+      allow write: if activeUser() && isStaff() && dtsOfficeAllowed(docId);
+    }
+
+    match /dts_qr_codes/{fileName} {
+      allow read: if signedIn() && isStaff();
+      allow write: if false;
+    }
+
+    match /dts_qr_exports/{fileName} {
+      allow read: if signedIn() && isStaff();
+      allow write: if false;
     }
 
     match /{allPaths=**} {

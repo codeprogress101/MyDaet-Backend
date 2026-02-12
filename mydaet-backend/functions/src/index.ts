@@ -1,5 +1,8 @@
 import * as functions from "firebase-functions/v1";
 import * as admin from "firebase-admin";
+import * as crypto from "crypto";
+import * as qrcode from "qrcode";
+import AdmZip from "adm-zip";
 
 admin.initializeApp();
 const db = admin.firestore();
@@ -221,6 +224,47 @@ function announcementActor(data: Record<string, unknown> | null) {
     actorName: (d.lastActionByName ?? d.createdByName ?? null) as string | null,
     actorRole: (d.lastActionByRole ?? null) as string | null,
   };
+}
+
+function sha256(input: string): string {
+  return crypto.createHash("sha256").update(input).digest("hex");
+}
+
+function randomCode(prefix = "DTS-QR"): string {
+  const bytes = crypto.randomBytes(6).toString("hex").toUpperCase();
+  return `${prefix}-${bytes}`;
+}
+
+async function createQrPng(value: string): Promise<Buffer> {
+  return qrcode.toBuffer(value, {
+    type: "png",
+    margin: 1,
+    width: 512,
+    errorCorrectionLevel: "M",
+  });
+}
+
+function dtsInstructions(status: string) {
+  const normalized = status.toUpperCase();
+  switch (normalized) {
+    case "IN_TRANSIT":
+      return "Your document is in transit to the next office.";
+    case "WITH_OFFICE":
+      return "Your document has been received by the office.";
+    case "IN_PROCESS":
+      return "Your document is being processed.";
+    case "FOR_APPROVAL":
+      return "Your document is pending approval.";
+    case "RELEASED":
+      return "Your document is ready for release or pickup.";
+    case "ARCHIVED":
+      return "Your document has been archived.";
+    case "PULLED_OUT":
+      return "Your document has been pulled out for review.";
+    case "RECEIVED":
+    default:
+      return "Your document has been received by Records.";
+  }
 }
 
 /**
@@ -1035,3 +1079,226 @@ export const onAdReactionWrite = functions.firestore
       );
     });
   });
+
+/**
+ * =========================
+ * DTS TRACKING LOOKUP
+ * =========================
+ * Lookup by trackingNo + PIN and return a sanitized payload.
+ */
+export const dtsTrackByTrackingNo = functions.https.onCall(
+  async (data, _context) => {
+    const trackingNo = coerceString(data?.trackingNo);
+    const pin = coerceString(data?.pin);
+
+    if (!trackingNo || !pin) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "trackingNo and pin are required."
+      );
+    }
+
+    const snap = await db
+      .collection("dts_documents")
+      .where("trackingNo", "==", trackingNo)
+      .limit(1)
+      .get();
+
+    if (snap.empty) {
+      throw new functions.https.HttpsError("not-found", "Document not found.");
+    }
+
+    const doc = snap.docs[0];
+    const dataRow = doc.data() ?? {};
+    const hash = coerceString(dataRow.publicPinHash) ?? "";
+    if (!hash || sha256(pin) !== hash) {
+      throw new functions.https.HttpsError(
+        "permission-denied",
+        "Invalid tracking PIN."
+      );
+    }
+
+    const confidentiality = (dataRow.confidentiality ?? "public")
+      .toString()
+      .toLowerCase();
+    const hideSensitive = confidentiality == "confidential";
+    const title = hideSensitive
+      ? null
+      : (dataRow.title ?? "").toString().trim() || null;
+    const currentOfficeName = hideSensitive
+      ? null
+      : (dataRow.currentOfficeName ?? dataRow.currentOfficeId ?? null);
+
+    let updatedAt: number | null = null;
+    if (dataRow.updatedAt instanceof admin.firestore.Timestamp) {
+      updatedAt = dataRow.updatedAt.toMillis();
+    } else if (dataRow.createdAt instanceof admin.firestore.Timestamp) {
+      updatedAt = dataRow.createdAt.toMillis();
+    }
+
+    const status = (dataRow.status ?? "RECEIVED").toString();
+
+    return {
+      trackingNo,
+      title,
+      status,
+      lastUpdated: updatedAt,
+      currentOfficeName,
+      instructions: dtsInstructions(status),
+    };
+  }
+);
+
+/**
+ * =========================
+ * DTS QR GENERATION
+ * =========================
+ * Generates QR codes and stores them in Firestore + Storage.
+ */
+export const generateDtsQrCodes = functions.https.onCall(
+  async (data, context) => {
+    if (!context.auth) {
+      throw new functions.https.HttpsError("unauthenticated", "Auth required.");
+    }
+
+    const callerRole = normalizeRole(context.auth.token.role);
+    if (callerRole !== "super_admin") {
+      throw new functions.https.HttpsError(
+        "permission-denied",
+        "Only super_admin can generate QR codes."
+      );
+    }
+
+    const countRaw = typeof data?.count === "number" ? data.count : 50;
+    const prefix = coerceString(data?.prefix) ?? "DTS-QR";
+    const count = Math.max(1, Math.min(200, Math.floor(countRaw)));
+
+    const created: Array<{ code: string; path: string }> = [];
+    const bucket = admin.storage().bucket();
+
+    let batch = db.batch();
+    let batchSize = 0;
+
+    async function commitBatch() {
+      if (batchSize === 0) return;
+      await batch.commit();
+      batch = db.batch();
+      batchSize = 0;
+    }
+
+    while (created.length < count) {
+      const code = randomCode(prefix);
+      const ref = db.collection("dts_qr_codes").doc(code);
+      const snap = await ref.get();
+      if (snap.exists) {
+        continue;
+      }
+
+      const path = `dts_qr_codes/${code}.png`;
+      const png = await createQrPng(code);
+      await bucket.file(path).save(png, {
+        metadata: {
+          contentType: "image/png",
+        },
+      });
+
+      batch.set(ref, {
+        qrCode: code,
+        status: "unused",
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        createdByUid: context.auth.uid,
+        imagePath: path,
+      });
+      batchSize += 1;
+      created.push({ code, path });
+
+      if (batchSize >= 400) {
+        await commitBatch();
+      }
+    }
+
+    await commitBatch();
+
+    return {
+      count: created.length,
+      codes: created.map((c) => c.code),
+      items: created,
+    };
+  }
+);
+
+/**
+ * =========================
+ * DTS QR EXPORT ZIP
+ * =========================
+ * Exports up to 10 QR PNGs into a zip file and returns a download URL.
+ */
+export const exportDtsQrZip = functions.https.onCall(
+  async (data, context) => {
+    if (!context.auth) {
+      throw new functions.https.HttpsError("unauthenticated", "Auth required.");
+    }
+
+    const callerRole = normalizeRole(context.auth.token.role);
+    if (callerRole !== "super_admin") {
+      throw new functions.https.HttpsError(
+        "permission-denied",
+        "Only super_admin can export QR codes."
+      );
+    }
+
+    const bucket = admin.storage().bucket();
+    let codes: string[] = [];
+    if (Array.isArray(data?.codes)) {
+      codes = data.codes
+        .map((c: unknown) => (c ? String(c).trim() : ""))
+        .filter((c: string) => c.length > 0);
+    }
+
+    if (codes.length === 0) {
+      const snap = await db
+        .collection("dts_qr_codes")
+        .orderBy("createdAt", "desc")
+        .limit(10)
+        .get();
+      codes = snap.docs.map((d) => d.id);
+    }
+
+    codes = codes.slice(0, 10);
+    if (codes.length === 0) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "No QR codes available."
+      );
+    }
+
+    const zip = new AdmZip();
+    for (const code of codes) {
+      const doc = await db.collection("dts_qr_codes").doc(code).get();
+      if (!doc.exists) {
+        continue;
+      }
+      // Generate QR PNG on the fly to avoid storage download errors.
+      const png = await createQrPng(code);
+      zip.addFile(`${code}.png`, png);
+    }
+
+    const zipBuffer = zip.toBuffer();
+    const exportPath = `dts_qr_exports/qr-batch-${Date.now()}.zip`;
+    await bucket.file(exportPath).save(zipBuffer, {
+      metadata: { contentType: "application/zip" },
+    });
+
+    const [downloadUrl] = await bucket.file(exportPath).getSignedUrl({
+      action: "read",
+      expires: Date.now() + 1000 * 60 * 60,
+    });
+
+    return {
+      count: codes.length,
+      path: exportPath,
+      downloadUrl,
+      codes,
+    };
+  }
+);

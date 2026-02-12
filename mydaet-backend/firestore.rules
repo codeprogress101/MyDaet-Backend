@@ -93,6 +93,16 @@ service cloud.firestore {
       return hasUserData() && userDoc().data.role in ["super_admin", "admin"];
     }
 
+    function isStaffByDoc() {
+      return hasUserData() && userDoc().data.role in ["super_admin", "admin", "office_admin", "moderator"];
+    }
+
+    function officeIdByDoc() {
+      return hasUserData() && userDoc().data.officeId != null
+        ? userDoc().data.officeId
+        : null;
+    }
+
     function hasOfficeId(data) {
       return data.keys().hasAny(["officeId"]) && data.officeId != null && data.officeId != "";
     }
@@ -121,6 +131,33 @@ service cloud.firestore {
     function hasNoPrivilegedUserFieldChanges() {
       return !request.resource.data.diff(resource.data).changedKeys()
         .hasAny(["role", "status", "uid", "email", "createdAt", "officeId", "officeName", "isActive"]);
+    }
+
+    function dtsOfficeAllowed(data) {
+      return isSuperAdmin()
+        || isSuperAdminByDoc()
+        || (
+          (isStaff() || isStaffByDoc())
+          && (
+            (officeId() != null && data.currentOfficeId == officeId())
+            || (officeIdByDoc() != null && data.currentOfficeId == officeIdByDoc())
+            || (data.pendingTransfer != null && officeId() != null && data.pendingTransfer.toOfficeId == officeId())
+            || (data.pendingTransfer != null && officeIdByDoc() != null && data.pendingTransfer.toOfficeId == officeIdByDoc())
+          )
+        );
+    }
+
+    function dtsCanRead(data) {
+      return signedInUser() && (
+        isSuperAdmin()
+        || isSuperAdminByDoc()
+        || dtsOfficeAllowed(data)
+        || (isResident() && data.submittedByUid == request.auth.uid)
+      );
+    }
+
+    function dtsQrDoc(qrCode) {
+      return get(/databases/$(database)/documents/dts_qr_codes/$(qrCode));
     }
 
     /** -------------------------
@@ -320,6 +357,67 @@ service cloud.firestore {
         );
         allow write: if false;
       }
+    }
+
+    /** -------------------------
+     * DTS DOCUMENTS
+     * /dts_documents/{docId}
+     * ------------------------- */
+    match /dts_documents/{docId} {
+      allow create: if activeUser()
+        && isStaff()
+        && hasNonEmptyString(request.resource.data, "qrCode")
+        && hasNonEmptyString(request.resource.data, "trackingNo")
+        && hasNonEmptyString(request.resource.data, "publicPinHash")
+        && hasNonEmptyString(request.resource.data, "title")
+        && hasNonEmptyString(request.resource.data, "docType")
+        && hasNonEmptyString(request.resource.data, "currentOfficeId")
+        && request.resource.data.status == "RECEIVED"
+        && !exists(/databases/$(database)/documents/dts_qr_index/$(request.resource.data.qrCode))
+        && exists(/databases/$(database)/documents/dts_qr_codes/$(request.resource.data.qrCode))
+        && dtsQrDoc(request.resource.data.qrCode).data.status == "unused"
+        && (
+          isSuperAdmin()
+          || (officeId() != null && request.resource.data.currentOfficeId == officeId())
+        );
+
+      allow read: if dtsCanRead(resource.data);
+
+      allow update: if activeUser() && (
+        isSuperAdmin()
+        || dtsOfficeAllowed(resource.data)
+      );
+
+      allow delete: if activeUser() && isSuperAdmin();
+
+      match /timeline/{eventId} {
+        allow read: if signedInUser() && isStaff();
+        allow create: if activeUser() && isStaff();
+        allow update, delete: if false;
+      }
+    }
+
+    match /dts_qr_index/{qrCode} {
+      allow read: if signedInUser() && isStaff();
+      allow create: if activeUser() && isStaff()
+        && !exists(/databases/$(database)/documents/dts_qr_index/$(qrCode));
+      allow update, delete: if false;
+    }
+
+    match /dts_qr_codes/{qrCode} {
+      allow read: if signedInUser() && isStaff();
+      allow create: if false;
+      allow update: if activeUser() && isStaff()
+        && resource.data.status == "unused"
+        && request.resource.data.status == "used"
+        && request.resource.data.docId != null;
+      allow delete: if false;
+    }
+
+    match /dts_counters/{year} {
+      allow read: if signedInUser() && isStaff();
+      allow create, update: if activeUser() && isStaff();
+      allow delete: if false;
     }
 
     /** -------------------------

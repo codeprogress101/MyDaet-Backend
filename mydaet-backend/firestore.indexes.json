@@ -72,6 +72,22 @@
         { "fieldPath": "role", "order": "ASCENDING" },
         { "fieldPath": "officeId", "order": "ASCENDING" }
       ]
+    },
+    {
+      "collectionGroup": "dts_documents",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "currentOfficeId", "order": "ASCENDING" },
+        { "fieldPath": "updatedAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "dts_documents",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "submittedByUid", "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "DESCENDING" }
+      ]
     }
   ],
   "fieldOverrides": []
