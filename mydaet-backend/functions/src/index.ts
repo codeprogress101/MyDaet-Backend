@@ -63,6 +63,7 @@ type NotificationData = {
   body: string;
   type: string;
   reportId?: string;
+  dtsDocId?: string;
   announcementId?: string;
   status?: string;
   createdByUid?: string;
@@ -120,6 +121,7 @@ async function sendPushToUsers(uids: string[], payload: NotificationData) {
       data: {
         type: payload.type,
         reportId: payload.reportId ?? "",
+        dtsDocId: payload.dtsDocId ?? "",
         announcementId: payload.announcementId ?? "",
         status: payload.status ?? "",
         createdByUid: payload.createdByUid ?? "",
@@ -163,6 +165,7 @@ async function addNotifications(uids: string[], payload: NotificationData) {
         body: payload.body,
         type: payload.type,
         reportId: payload.reportId ?? "",
+        dtsDocId: payload.dtsDocId ?? "",
         announcementId: payload.announcementId ?? null,
         status: payload.status ?? null,
         createdByUid: payload.createdByUid ?? null,
@@ -267,6 +270,39 @@ function dtsInstructions(status: string) {
   }
 }
 
+function dtsEventLabel(type: string): string {
+  switch ((type || "").toUpperCase()) {
+    case "TRANSFER_INITIATED":
+      return "Transfer initiated";
+    case "TRANSFER_CONFIRMED":
+      return "Transfer confirmed";
+    case "STATUS_CHANGED":
+      return "Status changed";
+    case "RETURNED":
+      return "Transfer returned";
+    case "RELEASED":
+      return "Released";
+    case "ARCHIVED":
+      return "Archived";
+    case "PULLED_OUT":
+      return "Pulled out";
+    case "NOTE":
+      return "Note added";
+    case "RECEIVED":
+    default:
+      return "Received";
+  }
+}
+
+function formatEventTime(date: Date): string {
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Manila",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  }).format(date);
+}
+
 /**
  * =========================
  * AUTH TRIGGER
@@ -316,6 +352,23 @@ export const getMyClaims = functions.https.onCall(async (_data, context) => {
     officeId: tokenOfficeId ?? profile.officeId,
     officeName: tokenOfficeName ?? profile.officeName,
     isActive: tokenIsActive ?? profile.isActive,
+  };
+});
+
+/**
+ * =========================
+ * GET SERVER TIME
+ * =========================
+ * Trusted online time source for clients.
+ */
+export const getServerTime = functions.https.onCall(async (_data, context) => {
+  if (!context.auth) {
+    throw new functions.https.HttpsError("unauthenticated", "Auth required.");
+  }
+  const now = new Date();
+  return {
+    epochMs: now.getTime(),
+    iso: now.toISOString(),
   };
 });
 
@@ -1082,6 +1135,133 @@ export const onAdReactionWrite = functions.firestore
 
 /**
  * =========================
+ * DTS MOVEMENT NOTIFICATIONS
+ * =========================
+ * Push notification + inbox entry whenever a timeline movement is appended.
+ */
+export const onDtsTimelineNotify = functions.firestore
+  .document("dts_documents/{docId}/timeline/{eventId}")
+  .onCreate(async (snap, context) => {
+    const docId = context.params.docId as string;
+    const event = snap.data() ?? {};
+
+    const dtsSnap = await db.collection("dts_documents").doc(docId).get();
+    if (!dtsSnap.exists) return;
+
+    const dts = dtsSnap.data() ?? {};
+    const trackingNo = coerceString(dts.trackingNo) ?? docId;
+    const status = coerceString(dts.status) ?? "RECEIVED";
+    const eventType = coerceString(event.type) ?? "NOTE";
+    const notifiableTypes = new Set([
+      "RECEIVED",
+      "TRANSFER_INITIATED",
+      "TRANSFER_CONFIRMED",
+      "STATUS_CHANGED",
+      "RETURNED",
+      "RELEASED",
+      "ARCHIVED",
+      "PULLED_OUT",
+    ]);
+    if (!notifiableTypes.has(eventType.toUpperCase())) return;
+    const actorUid = coerceString(event.byUid);
+
+    let actorName = "Staff";
+    let actorEmail: string | null = null;
+    let actorRole: string | null = null;
+    let actorOfficeId: string | null = null;
+    if (actorUid) {
+      const actorSnap = await db.collection("users").doc(actorUid).get();
+      const actor = actorSnap.data() ?? {};
+      actorName =
+        coerceString(actor.displayName) ??
+        coerceString(actor.email) ??
+        actorUid;
+      actorEmail = coerceString(actor.email);
+      actorRole = normalizeRole(actor.role);
+      actorOfficeId = coerceString(actor.officeId);
+    }
+
+    const when = snap.createTime?.toDate() ?? new Date();
+    const whenLabel = formatEventTime(when);
+    const movementLabel = dtsEventLabel(eventType);
+    const eventNotes = coerceString(event.notes);
+    const fromOfficeId = coerceString(event.fromOfficeId);
+    const toOfficeId = coerceString(event.toOfficeId);
+    const currentOfficeId = coerceString(dts.currentOfficeId);
+    const currentOfficeName = coerceString(dts.currentOfficeName);
+    const title = coerceString(dts.title) ?? "Document";
+    const trackingNoText = coerceString(dts.trackingNo) ?? docId;
+    const officeIdForScope =
+      toOfficeId ?? currentOfficeId ?? fromOfficeId ?? actorOfficeId;
+
+    await addAuditLog({
+      action: `dts_${eventType.toLowerCase()}`,
+      dtsDocId: docId,
+      dtsTrackingNo: trackingNoText,
+      dtsQrCode: coerceString(dts.qrCode),
+      dtsTitle: title,
+      dtsDocType: coerceString(dts.docType),
+      dtsConfidentiality: coerceString(dts.confidentiality),
+      status,
+      eventType: eventType.toUpperCase(),
+      eventNotes: eventNotes ?? null,
+      fromOfficeId: fromOfficeId ?? null,
+      toOfficeId: toOfficeId ?? null,
+      officeId: officeIdForScope ?? null,
+      currentOfficeId: currentOfficeId ?? null,
+      currentOfficeName: currentOfficeName ?? null,
+      actorUid: actorUid ?? null,
+      actorName,
+      actorEmail: actorEmail ?? null,
+      actorRole: actorRole ?? null,
+      actorOfficeId: actorOfficeId ?? null,
+      message: eventNotes != null && eventNotes.length > 0
+        ? `DTS ${trackingNoText}: ${movementLabel}. ${eventNotes}`
+        : `DTS ${trackingNoText}: ${movementLabel} by ${actorName} at ${whenLabel}.`,
+    });
+
+    const recipients = new Set<string>();
+    const submittedByUid = coerceString(dts.submittedByUid);
+    const createdByUid = coerceString(dts.createdByUid);
+    const currentCustodianUid = coerceString(dts.currentCustodianUid);
+    if (submittedByUid) recipients.add(submittedByUid);
+    if (createdByUid) recipients.add(createdByUid);
+    if (currentCustodianUid) recipients.add(currentCustodianUid);
+
+    // Notify receiving office staff on transfer initiation.
+    if (eventType.toUpperCase() === "TRANSFER_INITIATED") {
+      const toOfficeId =
+        coerceString(event.toOfficeId) ??
+        coerceString((dts.pendingTransfer as Record<string, unknown> | undefined)?.toOfficeId);
+      if (toOfficeId) {
+        const officeStaffSnap = await db
+          .collection("users")
+          .where("officeId", "==", toOfficeId)
+          .get();
+        for (const doc of officeStaffSnap.docs) {
+          const role = normalizeRole(doc.data().role);
+          if (role === "office_admin" || role === "moderator") {
+            recipients.add(doc.id);
+          }
+        }
+      }
+    }
+
+    if (actorUid) recipients.delete(actorUid);
+    if (recipients.size === 0) return;
+
+    await notifyUsers(Array.from(recipients), {
+      title: "Document update",
+      body: `${trackingNo}: ${movementLabel} by ${actorName} at ${whenLabel}.`,
+      type: "dts_movement",
+      dtsDocId: docId,
+      status,
+      createdByUid: actorUid ?? undefined,
+    });
+  });
+
+/**
+ * =========================
  * DTS TRACKING LOOKUP
  * =========================
  * Lookup by trackingNo + PIN and return a sanitized payload.
@@ -1151,6 +1331,79 @@ export const dtsTrackByTrackingNo = functions.https.onCall(
 
 /**
  * =========================
+ * DTS SAVE TRACKED DOC TO ACCOUNT
+ * =========================
+ * Allows a signed-in user to save a tracked hard-copy record into My Documents.
+ */
+export const dtsSaveTrackedDocument = functions.https.onCall(
+  async (data, context) => {
+    if (!context.auth) {
+      throw new functions.https.HttpsError("unauthenticated", "Auth required.");
+    }
+
+    const trackingNo = coerceString(data?.trackingNo);
+    const pin = coerceString(data?.pin);
+    if (!trackingNo || !pin) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "trackingNo and pin are required."
+      );
+    }
+
+    const snap = await db
+      .collection("dts_documents")
+      .where("trackingNo", "==", trackingNo)
+      .limit(1)
+      .get();
+
+    if (snap.empty) {
+      throw new functions.https.HttpsError("not-found", "Document not found.");
+    }
+
+    const doc = snap.docs[0];
+    const dataRow = doc.data() ?? {};
+    const hash = coerceString(dataRow.publicPinHash) ?? "";
+    if (!hash || sha256(pin) !== hash) {
+      throw new functions.https.HttpsError(
+        "permission-denied",
+        "Invalid tracking PIN."
+      );
+    }
+
+    const existingOwner = coerceString(dataRow.submittedByUid);
+    if (existingOwner && existingOwner !== context.auth.uid) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "This document is already linked to another account."
+      );
+    }
+
+    await doc.ref.set(
+      {
+        submittedByUid: context.auth.uid,
+        saveToResidentAccount: true,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    await doc.ref.collection("timeline").add({
+      type: "NOTE",
+      byUid: context.auth.uid,
+      notes: "Resident linked this document to account.",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    return {
+      saved: true,
+      docId: doc.id,
+      trackingNo,
+    };
+  }
+);
+
+/**
+ * =========================
  * DTS QR GENERATION
  * =========================
  * Generates QR codes and stores them in Firestore + Storage.
@@ -1161,7 +1414,11 @@ export const generateDtsQrCodes = functions.https.onCall(
       throw new functions.https.HttpsError("unauthenticated", "Auth required.");
     }
 
-    const callerRole = normalizeRole(context.auth.token.role);
+    let callerRole = normalizeRole(context.auth.token.role);
+    if (callerRole !== "super_admin") {
+      const profile = await getUserProfile(context.auth.uid);
+      callerRole = profile.role;
+    }
     if (callerRole !== "super_admin") {
       throw new functions.https.HttpsError(
         "permission-denied",
@@ -1239,7 +1496,11 @@ export const exportDtsQrZip = functions.https.onCall(
       throw new functions.https.HttpsError("unauthenticated", "Auth required.");
     }
 
-    const callerRole = normalizeRole(context.auth.token.role);
+    let callerRole = normalizeRole(context.auth.token.role);
+    if (callerRole !== "super_admin") {
+      const profile = await getUserProfile(context.auth.uid);
+      callerRole = profile.role;
+    }
     if (callerRole !== "super_admin") {
       throw new functions.https.HttpsError(
         "permission-denied",
@@ -1273,6 +1534,7 @@ export const exportDtsQrZip = functions.https.onCall(
     }
 
     const zip = new AdmZip();
+    const exportedCodes: string[] = [];
     for (const code of codes) {
       const doc = await db.collection("dts_qr_codes").doc(code).get();
       if (!doc.exists) {
@@ -1281,6 +1543,14 @@ export const exportDtsQrZip = functions.https.onCall(
       // Generate QR PNG on the fly to avoid storage download errors.
       const png = await createQrPng(code);
       zip.addFile(`${code}.png`, png);
+      exportedCodes.push(code);
+    }
+
+    if (exportedCodes.length === 0) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "No valid QR code records found for export."
+      );
     }
 
     const zipBuffer = zip.toBuffer();
@@ -1289,16 +1559,22 @@ export const exportDtsQrZip = functions.https.onCall(
       metadata: { contentType: "application/zip" },
     });
 
-    const [downloadUrl] = await bucket.file(exportPath).getSignedUrl({
-      action: "read",
-      expires: Date.now() + 1000 * 60 * 60,
-    });
+    let downloadUrl: string | null = null;
+    try {
+      const result = await bucket.file(exportPath).getSignedUrl({
+        action: "read",
+        expires: Date.now() + 1000 * 60 * 60,
+      });
+      downloadUrl = result[0];
+    } catch (error) {
+      console.warn("exportDtsQrZip: signed URL generation failed", error);
+    }
 
     return {
-      count: codes.length,
+      count: exportedCodes.length,
       path: exportPath,
       downloadUrl,
-      codes,
+      codes: exportedCodes,
     };
   }
 );

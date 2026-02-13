@@ -85,8 +85,24 @@
       "collectionGroup": "dts_documents",
       "queryScope": "COLLECTION",
       "fields": [
+        { "fieldPath": "currentOfficeName", "order": "ASCENDING" },
+        { "fieldPath": "updatedAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "dts_documents",
+      "queryScope": "COLLECTION",
+      "fields": [
         { "fieldPath": "submittedByUid", "order": "ASCENDING" },
         { "fieldPath": "createdAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "dts_documents",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "createdByUid", "order": "ASCENDING" },
+        { "fieldPath": "updatedAt", "order": "DESCENDING" }
       ]
     }
   ],

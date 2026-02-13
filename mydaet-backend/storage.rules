@@ -12,24 +12,50 @@ service firebase.storage {
         : null;
     }
 
+    function userDoc() {
+      return firestore.get(/databases/(default)/documents/users/$(request.auth.uid));
+    }
+
+    function hasUserData() {
+      return signedIn() && userDoc().data != null;
+    }
+
+    function roleRawByDoc() {
+      return hasUserData() && userDoc().data.role != null
+        ? userDoc().data.role
+        : null;
+    }
+
     function role() {
-      return roleRaw() == "admin"
+      return (roleRaw() != null ? roleRaw() : roleRawByDoc()) == "admin"
         ? "super_admin"
-        : (roleRaw() in ["super_admin", "office_admin", "moderator", "resident"]
-            ? roleRaw()
+        : ((roleRaw() != null ? roleRaw() : roleRawByDoc()) in ["super_admin", "office_admin", "moderator", "resident"]
+            ? (roleRaw() != null ? roleRaw() : roleRawByDoc())
             : "resident");
     }
 
     function officeId() {
       return (request.auth != null && request.auth.token.officeId != null)
         ? request.auth.token.officeId
-        : null;
+        : (hasUserData() && userDoc().data.officeId != null
+            ? userDoc().data.officeId
+            : null);
+    }
+
+    function officeName() {
+      return (request.auth != null && request.auth.token.officeName != null)
+        ? request.auth.token.officeName
+        : (hasUserData() && userDoc().data.officeName != null
+            ? userDoc().data.officeName
+            : null);
     }
 
     function isActive() {
       return (request.auth != null && request.auth.token.isActive != null)
         ? request.auth.token.isActive
-        : true;
+        : (hasUserData() && userDoc().data.isActive != null
+            ? userDoc().data.isActive
+            : true);
     }
 
     function activeUser() {
@@ -87,12 +113,17 @@ service firebase.storage {
       return isSuperAdmin()
         || (
           isStaff()
-          && officeId() != null
           && (
-            dtsDoc(docId).data.currentOfficeId == officeId()
+            (officeId() != null && dtsDoc(docId).data.currentOfficeId == officeId())
+            || (officeName() != null && dtsDoc(docId).data.currentOfficeName != null && dtsDoc(docId).data.currentOfficeName == officeName())
+            || (dtsDoc(docId).data.currentCustodianUid != null && dtsDoc(docId).data.currentCustodianUid == request.auth.uid)
             || (
               dtsDoc(docId).data.pendingTransfer != null
-              && dtsDoc(docId).data.pendingTransfer.toOfficeId == officeId()
+              && (
+                (officeId() != null && dtsDoc(docId).data.pendingTransfer.toOfficeId == officeId())
+                || (officeName() != null && dtsDoc(docId).data.pendingTransfer.toOfficeName != null && dtsDoc(docId).data.pendingTransfer.toOfficeName == officeName())
+                || (dtsDoc(docId).data.pendingTransfer.toUid != null && dtsDoc(docId).data.pendingTransfer.toUid == request.auth.uid)
+              )
             )
           )
         );

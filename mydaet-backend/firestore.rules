@@ -57,6 +57,14 @@ service cloud.firestore {
             : null);
     }
 
+    function officeName() {
+      return (request.auth != null && request.auth.token.officeName != null)
+        ? request.auth.token.officeName
+        : (hasUserData() && userDoc().data.officeName != null
+            ? userDoc().data.officeName
+            : null);
+    }
+
     function isActive() {
       return (request.auth != null && request.auth.token.isActive != null)
         ? request.auth.token.isActive
@@ -103,6 +111,12 @@ service cloud.firestore {
         : null;
     }
 
+    function officeNameByDoc() {
+      return hasUserData() && userDoc().data.officeName != null
+        ? userDoc().data.officeName
+        : null;
+    }
+
     function hasOfficeId(data) {
       return data.keys().hasAny(["officeId"]) && data.officeId != null && data.officeId != "";
     }
@@ -141,8 +155,14 @@ service cloud.firestore {
           && (
             (officeId() != null && data.currentOfficeId == officeId())
             || (officeIdByDoc() != null && data.currentOfficeId == officeIdByDoc())
+            || (officeName() != null && data.currentOfficeName != null && data.currentOfficeName == officeName())
+            || (officeNameByDoc() != null && data.currentOfficeName != null && data.currentOfficeName == officeNameByDoc())
             || (data.pendingTransfer != null && officeId() != null && data.pendingTransfer.toOfficeId == officeId())
             || (data.pendingTransfer != null && officeIdByDoc() != null && data.pendingTransfer.toOfficeId == officeIdByDoc())
+            || (data.pendingTransfer != null && officeName() != null && data.pendingTransfer.toOfficeName != null && data.pendingTransfer.toOfficeName == officeName())
+            || (data.pendingTransfer != null && officeNameByDoc() != null && data.pendingTransfer.toOfficeName != null && data.pendingTransfer.toOfficeName == officeNameByDoc())
+            || (data.pendingTransfer != null && data.pendingTransfer.toUid != null && data.pendingTransfer.toUid == request.auth.uid)
+            || (data.currentCustodianUid != null && data.currentCustodianUid == request.auth.uid)
           )
         );
     }
