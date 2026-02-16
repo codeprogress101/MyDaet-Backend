@@ -8,7 +8,10 @@
     "shell": "npm run build && firebase functions:shell",
     "start": "npm run shell",
     "deploy": "npm run lint && npm run build && firebase deploy --only functions",
-    "logs": "firebase functions:log"
+    "logs": "firebase functions:log",
+    "backfill:report-offices": "node scripts/backfill-report-offices.js",
+    "audit:users": "node scripts/audit-user-office-consistency.js",
+    "test:rules": "npx firebase-tools emulators:exec --only firestore \"node tests/firestore.rules.test.js\""
   },
   "engines": {
     "node": "22"
@@ -21,6 +24,7 @@
     "qrcode": "^1.5.4"
   },
   "devDependencies": {
+    "@firebase/rules-unit-testing": "^4.0.1",
     "@typescript-eslint/eslint-plugin": "^5.12.0",
     "@typescript-eslint/parser": "^5.12.0",
     "@types/adm-zip": "^0.5.5",

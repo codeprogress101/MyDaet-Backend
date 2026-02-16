@@ -129,10 +129,6 @@ service cloud.firestore {
       return !hasOfficeId(data) || (officeId() != null && data.officeId == officeId());
     }
 
-    function sameOffice(data) {
-      return officeId() != null && data.officeId == officeId();
-    }
-
     function isOwner(uid) {
       return signedIn() && request.auth.uid == uid;
     }
@@ -178,6 +174,10 @@ service cloud.firestore {
 
     function dtsQrDoc(qrCode) {
       return get(/databases/$(database)/documents/dts_qr_codes/$(qrCode));
+    }
+
+    function dtsDocById(docId) {
+      return get(/databases/$(database)/documents/dts_documents/$(docId));
     }
 
     /** -------------------------
@@ -403,16 +403,19 @@ service cloud.firestore {
 
       allow read: if dtsCanRead(resource.data);
 
-      allow update: if activeUser() && (
-        isSuperAdmin()
-        || dtsOfficeAllowed(resource.data)
-      );
+      // All state mutations must run through callable functions (server-side checks).
+      allow update: if false;
 
       allow delete: if activeUser() && isSuperAdmin();
 
       match /timeline/{eventId} {
         allow read: if signedInUser() && isStaff();
-        allow create: if activeUser() && isStaff();
+        allow create: if activeUser()
+          && isStaff()
+          && dtsOfficeAllowed(dtsDocById(docId).data)
+          && request.resource.data.keys().hasAll(["type", "byUid", "createdAt"])
+          && request.resource.data.byUid == request.auth.uid
+          && request.resource.data.type is string;
         allow update, delete: if false;
       }
     }
