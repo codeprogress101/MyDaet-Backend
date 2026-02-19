@@ -42,11 +42,13 @@ service cloud.firestore {
     }
 
     function role() {
-      return roleRaw() == "admin"
+      return roleRaw() in ["admin", "super_admin", "superAdmin", "superadmin", "SUPER_ADMIN", "SUPERADMIN"]
         ? "super_admin"
-        : (roleRaw() in ["super_admin", "office_admin", "moderator", "resident"]
-            ? roleRaw()
-            : "resident");
+        : (roleRaw() in ["office_admin", "officeAdmin", "officeadmin", "OFFICE_ADMIN"]
+            ? "office_admin"
+            : (roleRaw() in ["moderator", "MODERATOR"]
+                ? "moderator"
+                : "resident"));
     }
 
     function officeId() {
@@ -180,6 +182,56 @@ service cloud.firestore {
       return get(/databases/$(database)/documents/dts_documents/$(docId));
     }
 
+    function validLifecycleStatus(statusValue) {
+      return statusValue in ["draft", "published", "archived"];
+    }
+
+    function canWritePublishedState(statusValue) {
+      return validLifecycleStatus(statusValue)
+        && (isSuperAdmin() || isOfficeAdmin() || statusValue == "draft");
+    }
+
+    function officeMatches(targetOfficeId) {
+      return isSuperAdmin()
+        || (officeId() != null && targetOfficeId != null && targetOfficeId != "" && officeId() == targetOfficeId);
+    }
+
+    function defaultPublicHearingOffices() {
+      return ["SANGGUNIANG_BAYAN", "OFFICE_OF_THE_MAYOR"];
+    }
+
+    function publicHearingConfigPath() {
+      return /databases/$(database)/documents/system_config/rbac;
+    }
+
+    function publicHearingOfficeAllowed(targetOfficeId) {
+      return targetOfficeId in defaultPublicHearingOffices()
+        || (exists(publicHearingConfigPath())
+          && get(publicHearingConfigPath()).data.publicHearingOffices is list
+          && targetOfficeId in get(publicHearingConfigPath()).data.publicHearingOffices);
+    }
+
+    function docTypeOfficeAllowed(docType, targetOfficeId) {
+      return (
+        (docType in ["ordinance", "resolution"]
+          && targetOfficeId == "SANGGUNIANG_BAYAN"
+          && officeMatches("SANGGUNIANG_BAYAN"))
+        || (docType == "executive_order"
+          && targetOfficeId == "OFFICE_OF_THE_MAYOR"
+          && officeMatches("OFFICE_OF_THE_MAYOR"))
+        || (docType == "public_hearing"
+          && targetOfficeId != null
+          && targetOfficeId != ""
+          && officeMatches(targetOfficeId)
+          && publicHearingOfficeAllowed(targetOfficeId))
+      );
+    }
+
+    function jobOfficeAllowed(targetOfficeId) {
+      return isSuperAdmin()
+        || (isOfficeAdmin() && officeId() != null && targetOfficeId != null && targetOfficeId != "" && officeId() == targetOfficeId);
+    }
+
     /** -------------------------
      * USERS
      * /users/{uid}
@@ -193,9 +245,9 @@ service cloud.firestore {
         && (!("isActive" in request.resource.data) || request.resource.data.isActive == true);
 
       allow read: if signedInUser() && isOwner(uid);
-      allow read: if signedInUser() && tokenRole() in ["super_admin", "admin"];
+      allow read: if signedInUser() && tokenRole() in ["super_admin", "superAdmin", "superadmin", "admin", "SUPER_ADMIN", "SUPERADMIN"];
       allow read: if signedInUser()
-        && tokenRole() == "office_admin"
+        && tokenRole() in ["office_admin", "officeAdmin", "officeadmin", "OFFICE_ADMIN"]
         && tokenOfficeId() != null
         && resource.data.officeId == tokenOfficeId()
         && resource.data.role in ["resident", "moderator", "office_admin"];
@@ -276,12 +328,12 @@ service cloud.firestore {
         && hasNonEmptyString(request.resource.data, "officeId")
         && hasNonEmptyString(request.resource.data, "officeName");
 
-      // Read: creator OR admin+ OR assigned moderator
+      // Read:
+      // - staff (moderator/office admin/super admin) can list and view reports
+      // - residents can only read their own reports
       allow read: if signedInUser() && (
-        resource.data.createdByUid == request.auth.uid
-        || isSuperAdmin()
-        || (isOfficeAdmin() && officeAllowed(resource.data))
-        || (isModerator() && resource.data.assignedToUid == request.auth.uid)
+        isStaff()
+        || resource.data.createdByUid == request.auth.uid
       );
 
       // Update:
@@ -472,10 +524,8 @@ service cloud.firestore {
      * /announcements/{announcementId}
      * ------------------------- */
     match /announcements/{announcementId} {
-      allow read: if signedInUser() && (
-        resource.data.status == "published"
-        || isStaff()
-      );
+      allow read: if resource.data.status == "published"
+        || (signedInUser() && isStaff());
 
       allow create: if activeUser() && isStaff()
         && request.resource.data.createdByUid == request.auth.uid
@@ -488,6 +538,54 @@ service cloud.firestore {
         allow create, update: if signedInUser() && request.auth.uid == viewerUid;
         allow delete: if false;
       }
+    }
+
+    /** -------------------------
+     * PUBLIC DOCUMENTS
+     * /public_docs/{docId}
+     * ------------------------- */
+    match /public_docs/{docId} {
+      allow read: if resource.data.status == "published"
+        || (signedInUser() && isStaff());
+
+      allow create: if activeUser()
+        && isStaff()
+        && request.resource.data.docType in ["ordinance", "resolution", "executive_order", "public_hearing"]
+        && canWritePublishedState(request.resource.data.status)
+        && docTypeOfficeAllowed(request.resource.data.docType, request.resource.data.officeId)
+        && request.resource.data.createdByUid == request.auth.uid;
+
+      allow update: if activeUser()
+        && isStaff()
+        && request.resource.data.docType in ["ordinance", "resolution", "executive_order", "public_hearing"]
+        && canWritePublishedState(request.resource.data.status)
+        && docTypeOfficeAllowed(request.resource.data.docType, request.resource.data.officeId)
+        && request.resource.data.createdByUid == resource.data.createdByUid;
+
+      allow delete: if false;
+    }
+
+    /** -------------------------
+     * JOBS
+     * /jobs/{jobId}
+     * ------------------------- */
+    match /jobs/{jobId} {
+      allow read: if resource.data.status == "published"
+        || (signedInUser() && isStaff());
+
+      allow create: if activeUser()
+        && (isSuperAdmin() || isOfficeAdmin())
+        && canWritePublishedState(request.resource.data.status)
+        && jobOfficeAllowed(request.resource.data.officeId)
+        && request.resource.data.createdByUid == request.auth.uid;
+
+      allow update: if activeUser()
+        && (isSuperAdmin() || isOfficeAdmin())
+        && canWritePublishedState(request.resource.data.status)
+        && jobOfficeAllowed(request.resource.data.officeId)
+        && request.resource.data.createdByUid == resource.data.createdByUid;
+
+      allow delete: if false;
     }
 
     /** -------------------------

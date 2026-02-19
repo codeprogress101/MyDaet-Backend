@@ -27,11 +27,13 @@ service firebase.storage {
     }
 
     function role() {
-      return (roleRaw() != null ? roleRaw() : roleRawByDoc()) == "admin"
+      return (roleRaw() != null ? roleRaw() : roleRawByDoc()) in ["admin", "super_admin", "superAdmin", "superadmin", "SUPER_ADMIN", "SUPERADMIN"]
         ? "super_admin"
-        : ((roleRaw() != null ? roleRaw() : roleRawByDoc()) in ["super_admin", "office_admin", "moderator", "resident"]
-            ? (roleRaw() != null ? roleRaw() : roleRawByDoc())
-            : "resident");
+        : ((roleRaw() != null ? roleRaw() : roleRawByDoc()) in ["office_admin", "officeAdmin", "officeadmin", "OFFICE_ADMIN"]
+            ? "office_admin"
+            : ((roleRaw() != null ? roleRaw() : roleRawByDoc()) in ["moderator", "MODERATOR"]
+                ? "moderator"
+                : "resident"));
     }
 
     function officeId() {
@@ -145,6 +147,17 @@ service firebase.storage {
     match /announcements/{announcementId}/{fileName} {
       allow read: if activeUser();
       allow write: if activeUser() && isStaff();
+    }
+
+    match /public_docs/{docType}/pdf/{filePath=**} {
+      allow read: if true;
+      allow write: if activeUser()
+        && isStaff()
+        && docType in ["ordinance", "resolution", "executive_order", "public_hearing", "generic"]
+        && request.resource != null
+        && request.resource.size < 25 * 1024 * 1024
+        && request.resource.contentType != null
+        && request.resource.contentType.matches("application/pdf.*");
     }
 
     match /reports/{uid}/{reportId}/{fileName} {

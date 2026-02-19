@@ -30,8 +30,8 @@ function normalizeRole(raw: unknown): NormalizedRole {
   if (!raw) return "resident";
   const role = String(raw).trim().toLowerCase();
   if (role === "admin") return "super_admin";
-  if (role === "super_admin") return "super_admin";
-  if (role === "office_admin") return "office_admin";
+  if (role === "super_admin" || role === "superadmin" || role === "super-admin") return "super_admin";
+  if (role === "office_admin" || role === "officeadmin" || role === "office-admin") return "office_admin";
   if (role === "moderator") return "moderator";
   return "resident";
 }
