@@ -26,14 +26,65 @@ service firebase.storage {
         : null;
     }
 
+    function roleCandidate() {
+      return roleRaw() != null
+        ? roleRaw()
+        : roleRawByDoc();
+    }
+
+    function roleString() {
+      return roleCandidate() is string
+        ? roleCandidate()
+        : "";
+    }
+
+    function roleMatches(pattern) {
+      return roleString() != "" && roleString().matches(pattern);
+    }
+
+    function hasSuperAdminFlag() {
+      return request.auth != null && (
+        request.auth.token.superAdmin == true
+        || request.auth.token.isSuperAdmin == true
+        || request.auth.token.super_admin == true
+      );
+    }
+
+    function hasOfficeAdminFlag() {
+      return request.auth != null && (
+        request.auth.token.officeAdmin == true
+        || request.auth.token.office_admin == true
+        || request.auth.token.isOfficeAdmin == true
+      );
+    }
+
+    function hasModeratorFlag() {
+      return request.auth != null && (
+        request.auth.token.moderator == true
+        || request.auth.token.isModerator == true
+        || request.auth.token.clerk == true
+      );
+    }
+
     function role() {
-      return (roleRaw() != null ? roleRaw() : roleRawByDoc()) in ["admin", "super_admin", "superAdmin", "superadmin", "SUPER_ADMIN", "SUPERADMIN"]
+      return (
+        hasSuperAdminFlag()
+        || roleMatches("^[\\s]*[sS][uU][pP][eE][rR][ _-]?[aA][dD][mM][iI][nN][\\s]*$")
+      )
         ? "super_admin"
-        : ((roleRaw() != null ? roleRaw() : roleRawByDoc()) in ["office_admin", "officeAdmin", "officeadmin", "OFFICE_ADMIN"]
-            ? "office_admin"
-            : ((roleRaw() != null ? roleRaw() : roleRawByDoc()) in ["moderator", "MODERATOR"]
+        : (
+          hasOfficeAdminFlag()
+          || roleMatches("^[\\s]*[aA][dD][mM][iI][nN][\\s]*$")
+          || roleMatches("^[\\s]*[oO][fF][fF][iI][cC][eE][ _-]?[aA][dD][mM][iI][nN][\\s]*$")
+        )
+            ? "admin"
+            : (
+              hasModeratorFlag()
+              || roleMatches("^[\\s]*[mM][oO][dD][eE][rR][aA][tT][oO][rR][\\s]*$")
+              || roleMatches("^[\\s]*[cC][lL][eE][rR][kK][\\s]*$")
+            )
                 ? "moderator"
-                : "resident"));
+                : "resident";
     }
 
     function officeId() {
@@ -69,7 +120,7 @@ service firebase.storage {
     }
 
     function isOfficeAdmin() {
-      return role() == "office_admin";
+      return role() == "admin";
     }
 
     function isModerator() {
@@ -92,16 +143,15 @@ service firebase.storage {
 
     function canReadReport(reportId) {
       return activeUser() && (
-        reportDoc(reportId).data.createdByUid == request.auth.uid
-        || isSuperAdmin()
-        || (isOfficeAdmin() && reportOfficeAllowed(reportId))
-        || (isModerator() && reportDoc(reportId).data.assignedToUid == request.auth.uid)
+        isStaff()
+        || reportDoc(reportId).data.createdByUid == request.auth.uid
       );
     }
 
     function canWriteReportNote(reportId) {
       return activeUser() && (
-        isSuperAdmin()
+        reportDoc(reportId).data.createdByUid == request.auth.uid
+        || isSuperAdmin()
         || (isOfficeAdmin() && reportOfficeAllowed(reportId))
         || (isModerator() && reportDoc(reportId).data.assignedToUid == request.auth.uid)
       );
@@ -145,6 +195,11 @@ service firebase.storage {
     }
 
     match /announcements/{announcementId}/{fileName} {
+      allow read: if activeUser();
+      allow write: if false;
+    }
+
+    match /posts/{postId}/{fileName} {
       allow read: if activeUser();
       allow write: if activeUser() && isStaff();
     }

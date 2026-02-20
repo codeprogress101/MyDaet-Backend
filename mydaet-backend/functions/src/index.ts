@@ -3,6 +3,13 @@ import * as admin from "firebase-admin";
 import * as crypto from "crypto";
 import * as qrcode from "qrcode";
 import AdmZip from "adm-zip";
+import bcrypt from "bcryptjs";
+import {
+  HttpsError as HttpsErrorV2,
+  onCall as onCallV2,
+  onRequest as onRequestV2,
+  type CallableRequest,
+} from "firebase-functions/v2/https";
 
 admin.initializeApp();
 const db = admin.firestore();
@@ -11,14 +18,21 @@ const db = admin.firestore();
  * Role definitions
  */
 type Role = "resident" | "moderator" | "office_admin" | "super_admin" | "admin";
-type NormalizedRole = "resident" | "moderator" | "office_admin" | "super_admin";
+type NormalizedRole = "resident" | "moderator" | "admin" | "super_admin";
 const ALLOWED_ROLES: Role[] = [
   "resident",
   "moderator",
+  "admin",
   "office_admin",
   "super_admin",
-  "admin",
 ];
+const USER_MANAGEMENT_ROLES: NormalizedRole[] = [
+  "resident",
+  "moderator",
+  "admin",
+  "super_admin",
+];
+const USER_MIN_PASSWORD_LENGTH = 8;
 
 const OPEN_STATUSES = ["submitted", "in_review", "assigned", "in_progress"] as const;
 
@@ -29,9 +43,15 @@ function isOpenStatus(s: string): boolean {
 function normalizeRole(raw: unknown): NormalizedRole {
   if (!raw) return "resident";
   const role = String(raw).trim().toLowerCase();
-  if (role === "admin") return "super_admin";
   if (role === "super_admin" || role === "superadmin" || role === "super-admin") return "super_admin";
-  if (role === "office_admin" || role === "officeadmin" || role === "office-admin") return "office_admin";
+  if (
+    role === "admin" ||
+    role === "office_admin" ||
+    role === "officeadmin" ||
+    role === "office-admin"
+  ) {
+    return "admin";
+  }
   if (role === "moderator") return "moderator";
   return "resident";
 }
@@ -102,6 +122,67 @@ async function getUserProfile(uid: string) {
   const officeName = coerceString(data.officeName);
   const isActive = coerceBool(data.isActive, true);
   return { role, officeId, officeName, isActive, data };
+}
+
+function roleDisplayLabel(role: NormalizedRole): string {
+  if (role === "super_admin") return "Super Admin";
+  if (role === "admin") return "Admin";
+  if (role === "moderator") return "Moderator";
+  return "Resident";
+}
+
+function roleRequiresOffice(role: NormalizedRole): boolean {
+  return role === "admin" || role === "moderator";
+}
+
+function parseEpochMs(value: unknown): number {
+  if (!value) return 0;
+  if (value instanceof admin.firestore.Timestamp) {
+    return value.toDate().getTime();
+  }
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? 0 : value.getTime();
+  }
+  if (typeof value === "string") {
+    const time = Date.parse(value);
+    return Number.isNaN(time) ? 0 : time;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  return 0;
+}
+
+function toIsoString(value: unknown): string | null {
+  if (!value) return null;
+  if (value instanceof admin.firestore.Timestamp) {
+    return value.toDate().toISOString();
+  }
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value.toISOString();
+  }
+  const parsed = new Date(String(value));
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.toISOString();
+}
+
+function serializeReportRow(
+  id: string,
+  row: FirebaseFirestore.DocumentData
+): Record<string, unknown> {
+  const data = row ?? {};
+  return {
+    id,
+    ...data,
+    createdAt: toIsoString(data.createdAt),
+    updatedAt: toIsoString(data.updatedAt),
+    lastActionAt: toIsoString(data.lastActionAt),
+  };
+}
+
+function isAuthUserNotFound(error: unknown): boolean {
+  const code = String((error as { code?: unknown })?.code ?? "");
+  return code.includes("auth/user-not-found");
 }
 
 async function sendPushToUsers(uids: string[], payload: NotificationData) {
@@ -278,6 +359,17 @@ type StaffContext = {
   profileData: Record<string, unknown>;
 };
 
+type CallableContextLike = {
+  auth?: {
+    uid: string;
+    token: Record<string, unknown>;
+  } | null;
+  rawRequest?: {
+    ip?: string | null;
+    headers?: Record<string, unknown> | null;
+  } | null;
+};
+
 const DTS_STATUSES = new Set([
   "RECEIVED",
   "IN_TRANSIT",
@@ -289,11 +381,12 @@ const DTS_STATUSES = new Set([
   "PULLED_OUT",
 ]);
 
-const DTS_PIN_MAX_ATTEMPTS = 5;
+const DTS_PIN_MAX_ATTEMPTS = 10;
 const DTS_PIN_LOCK_MINUTES = 15;
 const DTS_TRACK_SESSION_TTL_HOURS = 12;
 const DTS_TRACK_SESSION_ROTATION_BYTES = 24;
-const FUNCTIONS_BUILD_VERSION = "2026.02.16.1";
+const DTS_PIN_BCRYPT_ROUNDS = 12;
+const FUNCTIONS_BUILD_VERSION = "2026.02.20.1";
 
 function normalizeDtsStatus(raw: unknown, fallback = "RECEIVED"): string {
   const value = String(raw ?? "")
@@ -332,7 +425,7 @@ function canTransitionDtsStatus(fromStatus: string, toStatus: string): boolean {
 }
 
 async function requireStaffContext(
-  context: functions.https.CallableContext
+  context: CallableContextLike
 ): Promise<StaffContext> {
   if (!context.auth) {
     throw new functions.https.HttpsError("unauthenticated", "Auth required.");
@@ -358,7 +451,7 @@ async function requireStaffContext(
       "Inactive account."
     );
   }
-  if (!(role === "super_admin" || role === "office_admin" || role === "moderator")) {
+  if (!(role === "super_admin" || role === "admin" || role === "moderator")) {
     throw new functions.https.HttpsError(
       "permission-denied",
       "Staff access required."
@@ -371,6 +464,53 @@ async function requireStaffContext(
     officeId,
     officeName,
     profileData: profile.data as Record<string, unknown>,
+  };
+}
+
+async function requireSuperAdminContext(
+  context: CallableContextLike
+): Promise<StaffContext> {
+  const actor = await requireStaffContext(context);
+  if (actor.role !== "super_admin") {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "Only super_admin can manage staff users."
+    );
+  }
+  return actor;
+}
+
+async function resolveManagedOffice(
+  role: NormalizedRole,
+  requestedOfficeId: string | null,
+  requestedOfficeName: string | null,
+  fallbackOfficeId: string | null,
+  fallbackOfficeName: string | null
+): Promise<{ officeId: string | null; officeName: string | null }> {
+  if (!roleRequiresOffice(role)) {
+    return {
+      officeId: null,
+      officeName: null,
+    };
+  }
+
+  const officeId = requestedOfficeId ?? fallbackOfficeId;
+  let officeName = requestedOfficeName ?? fallbackOfficeName;
+  if (!officeId) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "officeId is required for admin or moderator."
+      );
+  }
+
+  if (!officeName) {
+    const officeSnap = await db.collection("offices").doc(officeId).get();
+    officeName = coerceString(officeSnap.data()?.name);
+  }
+
+  return {
+    officeId,
+    officeName,
   };
 }
 
@@ -432,6 +572,52 @@ function actorDisplayName(actor: StaffContext): string {
   );
 }
 
+function toCallableContextFromV2(
+  request: CallableRequest<unknown>
+): CallableContextLike {
+  return {
+    auth: request.auth
+      ? {
+          uid: request.auth.uid,
+          token: (request.auth.token ?? {}) as Record<string, unknown>,
+        }
+      : null,
+    rawRequest: {
+      ip: request.rawRequest?.ip ?? null,
+      headers: (request.rawRequest?.headers ?? null) as Record<string, unknown> | null,
+    },
+  };
+}
+
+const CALLABLE_ERROR_CODES = new Set([
+  "cancelled",
+  "unknown",
+  "invalid-argument",
+  "deadline-exceeded",
+  "not-found",
+  "already-exists",
+  "permission-denied",
+  "resource-exhausted",
+  "failed-precondition",
+  "aborted",
+  "out-of-range",
+  "unimplemented",
+  "internal",
+  "unavailable",
+  "data-loss",
+  "unauthenticated",
+]);
+
+function normalizeCallableErrorForV2(error: unknown): HttpsErrorV2 {
+  if (error instanceof HttpsErrorV2) return error;
+  const candidate = error as { code?: unknown; message?: unknown; details?: unknown };
+  const rawCode = String(candidate.code ?? "").toLowerCase();
+  const safeCode = CALLABLE_ERROR_CODES.has(rawCode) ? rawCode : "internal";
+  type HttpsErrorCode = ConstructorParameters<typeof HttpsErrorV2>[0];
+  const message = String(candidate.message ?? "Request failed.");
+  return new HttpsErrorV2(safeCode as HttpsErrorCode, message, candidate.details);
+}
+
 function sanitizeDtsAttachments(raw: unknown): Array<Record<string, unknown>> {
   if (!Array.isArray(raw)) return [];
   const allowed = ["name", "path", "url", "uploadedAt", "contentType"];
@@ -452,20 +638,42 @@ function sanitizeDtsAttachments(raw: unknown): Array<Record<string, unknown>> {
   return output;
 }
 
-function pinHashFromDoc(pin: string, data: Record<string, unknown>): string {
+type TrackingLookupContext = {
+  auth?: { uid?: string } | null;
+  rawRequest?: { ip?: string | null } | null;
+};
+
+function legacyPinHashFromDoc(pin: string, data: Record<string, unknown>): string {
   const salt = coerceString(data.publicPinSalt);
   return salt ? sha256(`${pin}:${salt}`) : sha256(pin);
+}
+
+function isBcryptHash(hash: string): boolean {
+  return /^\$2[aby]\$\d{2}\$/.test(hash);
+}
+
+async function hashTrackingPin(pin: string): Promise<string> {
+  return bcrypt.hash(pin, DTS_PIN_BCRYPT_ROUNDS);
+}
+
+async function verifyTrackingPin(pin: string, data: Record<string, unknown>): Promise<boolean> {
+  const hash = coerceString(data.pinHash) ?? coerceString(data.publicPinHash) ?? "";
+  if (!hash) return false;
+  if (isBcryptHash(hash)) {
+    return bcrypt.compare(pin, hash);
+  }
+  return legacyPinHashFromDoc(pin, data) === hash;
 }
 
 function trackingAttemptDocId(trackingNo: string): string {
   return trackingNo.toUpperCase().replace(/[^A-Z0-9_-]/g, "_");
 }
 
-function contextUid(context: functions.https.CallableContext): string {
+function contextUid(context: TrackingLookupContext): string {
   return context.auth?.uid?.trim() || "anon";
 }
 
-function contextIpHash(context: functions.https.CallableContext): string {
+function contextIpHash(context: TrackingLookupContext): string {
   const raw = context.rawRequest?.ip ?? "unknown";
   return sha256(raw).substring(0, 16);
 }
@@ -491,7 +699,7 @@ function parseFailCount(data: Record<string, unknown>): number {
 
 function buildAttemptRefs(
   trackingNo: string,
-  context: functions.https.CallableContext
+  context: TrackingLookupContext
 ): admin.firestore.DocumentReference[] {
   const uid = contextUid(context);
   const ipHash = contextIpHash(context);
@@ -513,7 +721,7 @@ function createTrackingSessionToken(): string {
 async function issueTrackingSession(
   docId: string,
   trackingNo: string,
-  context: functions.https.CallableContext
+  context: TrackingLookupContext
 ): Promise<{token: string; expiresAtMs: number}> {
   const token = createTrackingSessionToken();
   const tokenHash = trackingSessionHash(token);
@@ -537,7 +745,7 @@ type TrackingSessionResolution = {
 
 async function resolveTrackingSession(
   token: string,
-  context: functions.https.CallableContext
+  context: TrackingLookupContext
 ): Promise<TrackingSessionResolution> {
   const ref = db.collection("dts_track_sessions").doc(trackingSessionHash(token));
   const snap = await ref.get();
@@ -584,19 +792,62 @@ function buildSanitizedTrackingResult(
   const status = (dataRow.status ?? "RECEIVED").toString();
   return {
     trackingNo,
+    trackingNumber: trackingNo,
     title,
     status,
+    updatedAt,
     lastUpdated: updatedAt,
     currentOfficeName,
     instructions: dtsInstructions(status),
   };
 }
 
+function sanitizeTrackingTimelineEntry(
+  row: Record<string, unknown>
+): Record<string, unknown> | null {
+  const notePublic = coerceString(row.notePublic) ?? coerceString(row.notes);
+  const actionType = coerceString(row.actionType) ?? coerceString(row.type) ?? "Update";
+  const officeName =
+    coerceString(row.officeName) ??
+    coerceString(row.toOfficeName) ??
+    coerceString(row.toOfficeId) ??
+    coerceString(row.fromOfficeName) ??
+    coerceString(row.fromOfficeId) ??
+    "";
+  const timestamp = row.createdAt instanceof admin.firestore.Timestamp
+    ? row.createdAt.toMillis()
+    : (row.timestamp instanceof admin.firestore.Timestamp
+      ? row.timestamp.toMillis()
+      : null);
+
+  if (!notePublic && !actionType) return null;
+  return {
+    timestamp,
+    actionType,
+    officeName,
+    notePublic: notePublic ?? "",
+  };
+}
+
+async function loadPublicTrackingTimeline(
+  docRef: admin.firestore.DocumentReference,
+  limitRows = 20
+): Promise<Record<string, unknown>[]> {
+  const timelineSnap = await docRef
+    .collection("timeline")
+    .orderBy("createdAt", "desc")
+    .limit(Math.max(1, Math.min(50, limitRows)))
+    .get();
+  return timelineSnap.docs
+    .map((item) => sanitizeTrackingTimelineEntry(item.data() ?? {}))
+    .filter((item): item is Record<string, unknown> => item != null);
+}
+
 async function verifyPinWithRateLimit(
   trackingNo: string,
   pin: string,
   data: Record<string, unknown>,
-  context: functions.https.CallableContext
+  context: TrackingLookupContext
 ): Promise<void> {
   const attemptRefs = buildAttemptRefs(trackingNo, context);
   const now = new Date();
@@ -617,8 +868,7 @@ async function verifyPinWithRateLimit(
     );
   }
 
-  const hash = coerceString(data.publicPinHash) ?? "";
-  const valid = hash.length > 0 && pinHashFromDoc(pin, data) === hash;
+  const valid = await verifyTrackingPin(pin, data);
   if (valid) {
     const batch = db.batch();
     for (const ref of attemptRefs) {
@@ -774,6 +1024,517 @@ export const getServerTime = functions.https.onCall(async (_data, context) => {
   };
 });
 
+async function queryCount(queryRef: FirebaseFirestore.Query): Promise<number> {
+  const snap = await queryRef.count().get();
+  return Number(snap.data().count ?? 0);
+}
+
+async function bestCount(candidates: FirebaseFirestore.Query[]): Promise<number> {
+  if (candidates.length === 0) {
+    return 0;
+  }
+
+  let best = 0;
+  for (const queryRef of candidates) {
+    const count = await queryCount(queryRef);
+    if (count > best) {
+      best = count;
+    }
+  }
+  return best;
+}
+
+/**
+ * =========================
+ * ADMIN DASHBOARD SUMMARY
+ * =========================
+ * Server-side scoped counts so admin UI does not depend on client-side
+ * Firestore aggregation permissions.
+ */
+export const adminDashboardSummary = functions.https.onCall(async (_data, context) => {
+  const actor = await requireStaffContext(context);
+
+  const postsRef = db.collection("posts");
+  const reportsRef = db.collection("reports");
+  const dtsRef = db.collection("dts_documents");
+  const usersRef = db.collection("users");
+
+  const isSuperAdmin = actor.role === "super_admin";
+  const scopedOfficeId = coerceString(actor.officeId);
+
+  let announcementsCount = 0;
+  if (isSuperAdmin) {
+    announcementsCount = await queryCount(postsRef);
+  } else {
+    const postCandidates: FirebaseFirestore.Query[] = [];
+    if (scopedOfficeId) {
+      postCandidates.push(postsRef.where("officeId", "==", scopedOfficeId));
+    }
+    postCandidates.push(postsRef.where("createdByUid", "==", actor.uid));
+    postCandidates.push(postsRef.where("status", "==", "published"));
+    announcementsCount = await bestCount(postCandidates);
+  }
+
+  let reportsCount = 0;
+  if (isSuperAdmin) {
+    reportsCount = await queryCount(reportsRef);
+  } else {
+    const reportCandidates: FirebaseFirestore.Query[] = [];
+    if (scopedOfficeId) {
+      reportCandidates.push(reportsRef.where("officeId", "==", scopedOfficeId));
+      reportCandidates.push(reportsRef.where("assignedOfficeId", "==", scopedOfficeId));
+      reportCandidates.push(reportsRef.where("currentOfficeId", "==", scopedOfficeId));
+    }
+    reportCandidates.push(reportsRef.where("assignedToUid", "==", actor.uid));
+    reportCandidates.push(reportsRef.where("createdByUid", "==", actor.uid));
+    reportsCount = await bestCount(reportCandidates);
+  }
+
+  let dtsCount = 0;
+  if (isSuperAdmin) {
+    dtsCount = await queryCount(dtsRef);
+  } else {
+    const dtsCandidates: FirebaseFirestore.Query[] = [];
+    if (scopedOfficeId) {
+      dtsCandidates.push(dtsRef.where("currentOfficeId", "==", scopedOfficeId));
+    }
+    dtsCandidates.push(dtsRef.where("currentCustodianUid", "==", actor.uid));
+    dtsCandidates.push(dtsRef.where("createdByUid", "==", actor.uid));
+    dtsCount = await bestCount(dtsCandidates);
+  }
+
+  let usersCount: number | null = null;
+  if (isSuperAdmin) {
+    usersCount = await queryCount(usersRef);
+  }
+
+  return {
+    role: actor.role,
+    officeId: scopedOfficeId,
+    counts: {
+      announcements: announcementsCount,
+      reports: reportsCount,
+      dtsDocuments: dtsCount,
+      users: usersCount,
+    },
+    notes: {
+      announcementsSource: "posts",
+    },
+  };
+});
+
+async function mergeQueryDocs(
+  target: Map<string, FirebaseFirestore.DocumentData>,
+  queryRef: FirebaseFirestore.Query,
+  listLimit: number
+): Promise<void> {
+  const snapshot = await queryRef.limit(listLimit).get();
+  snapshot.docs.forEach((doc) => {
+    if (!target.has(doc.id)) {
+      target.set(doc.id, doc.data() ?? {});
+    }
+  });
+}
+
+export const adminListReportsScoped = functions.https.onCall(async (data, context) => {
+  const actor = await requireStaffContext(context);
+  const rawLimit = typeof data?.limit === "number" ? Math.floor(data.limit) : 250;
+  const listLimit = Math.max(20, Math.min(500, rawLimit));
+
+  const reportsRef = db.collection("reports");
+  const rows = new Map<string, FirebaseFirestore.DocumentData>();
+  const queries: FirebaseFirestore.Query[] = [];
+
+  if (actor.role === "super_admin") {
+    queries.push(reportsRef);
+  } else {
+    if (actor.officeId) {
+      queries.push(reportsRef.where("officeId", "==", actor.officeId));
+      queries.push(reportsRef.where("assignedOfficeId", "==", actor.officeId));
+      queries.push(reportsRef.where("currentOfficeId", "==", actor.officeId));
+    }
+    queries.push(reportsRef.where("assignedToUid", "==", actor.uid));
+    queries.push(reportsRef.where("createdByUid", "==", actor.uid));
+  }
+
+  for (const queryRef of queries) {
+    await mergeQueryDocs(rows, queryRef, listLimit);
+  }
+
+  const items = Array.from(rows.entries())
+    .map(([id, row]) => serializeReportRow(id, row))
+    .sort((a, b) => {
+      const aTime = parseEpochMs((a.updatedAt as unknown) ?? a.createdAt);
+      const bTime = parseEpochMs((b.updatedAt as unknown) ?? b.createdAt);
+      return bTime - aTime;
+    })
+    .slice(0, listLimit);
+
+  return {
+    items,
+    scope: {
+      role: actor.role,
+      officeId: actor.officeId ?? null,
+    },
+  };
+});
+
+export const adminListReportAssignees = functions.https.onCall(async (_data, context) => {
+  const actor = await requireStaffContext(context);
+
+  const usersRef = db.collection("users");
+  let usersQuery: FirebaseFirestore.Query;
+  if (actor.role === "super_admin") {
+    usersQuery = usersRef
+      .where("role", "in", ["super_admin", "admin", "office_admin", "moderator"])
+      .limit(300);
+  } else if (actor.officeId) {
+    usersQuery = usersRef
+      .where("officeId", "==", actor.officeId)
+      .where("role", "in", ["admin", "office_admin", "moderator"])
+      .limit(300);
+  } else {
+    usersQuery = usersRef
+      .where(admin.firestore.FieldPath.documentId(), "==", actor.uid)
+      .limit(1);
+  }
+
+  const snapshot = await usersQuery.get();
+  const items = snapshot.docs
+    .map((doc) => {
+      const row = doc.data() ?? {};
+      return {
+        uid: doc.id,
+        displayName:
+          coerceString(row.displayName) ??
+          coerceString(row.name) ??
+          coerceString(row.email) ??
+          doc.id,
+        email: coerceString(row.email) ?? "",
+        role: normalizeRole(row.role),
+        officeId: coerceString(row.officeId) ?? "",
+        isActive: coerceBool(row.isActive, true),
+      };
+    })
+    .filter((row) => row.isActive)
+    .sort((a, b) => a.displayName.localeCompare(b.displayName));
+
+  return {
+    items,
+    scope: {
+      role: actor.role,
+      officeId: actor.officeId ?? null,
+    },
+  };
+});
+
+function reportInActorScope(actor: StaffContext, row: Record<string, unknown>): boolean {
+  if (actor.role === "super_admin") return true;
+  const actorOfficeId = coerceString(actor.officeId);
+  if (coerceString(row.assignedToUid) === actor.uid) return true;
+  if (coerceString(row.createdByUid) === actor.uid) return true;
+  if (!actorOfficeId) return false;
+  return [
+    coerceString(row.officeId),
+    coerceString(row.assignedOfficeId),
+    coerceString(row.currentOfficeId),
+  ].some((value) => value != null && value === actorOfficeId);
+}
+
+function reportActorMeta(actor: StaffContext, context: CallableContextLike) {
+  return {
+    lastActionByUid: actor.uid,
+    lastActionByName: actorDisplayName(actor),
+    lastActionByEmail:
+      coerceString(actor.profileData.email) ??
+      coerceString(context.auth?.token.email) ??
+      "",
+    lastActionByRole: actor.role,
+    lastActionAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+}
+
+function normalizeReportStatusInput(raw: unknown): string {
+  const normalized = String(raw ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_");
+  const allowed = new Set([
+    "submitted",
+    "in_review",
+    "assigned",
+    "in_progress",
+    "resolved",
+    "closed",
+    "rejected",
+  ]);
+  if (!allowed.has(normalized)) {
+    throw new functions.https.HttpsError("invalid-argument", "Invalid report status.");
+  }
+  return normalized;
+}
+
+async function adminWriteAuditLogHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const payload = (data && typeof data === "object")
+    ? (data as Record<string, unknown>)
+    : {};
+  const actor = await requireStaffContext(context);
+  const action = coerceString(payload.action);
+  const entityType = coerceString(payload.entityType);
+  const entityId = coerceString(payload.entityId);
+  if (!action || !entityType || !entityId) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "action, entityType, and entityId are required."
+    );
+  }
+  const officeId = coerceString(payload.officeId) ?? actor.officeId ?? null;
+  const before = payload.before && typeof payload.before === "object" ? payload.before : null;
+  const after = payload.after && typeof payload.after === "object" ? payload.after : null;
+  await addAuditLog({
+    action,
+    entityType,
+    entityId,
+    officeId,
+    before,
+    after,
+    actorUid: actor.uid,
+    actorName: actorDisplayName(actor),
+    actorRole: actor.role,
+    actorOfficeId: actor.officeId ?? null,
+    actorEmail:
+      coerceString(actor.profileData.email) ??
+      coerceString(context.auth?.token.email) ??
+      null,
+    ip: context.rawRequest?.ip ?? null,
+    userAgent: context.rawRequest?.headers?.["user-agent"] ?? null,
+    timestamp: admin.firestore.FieldValue.serverTimestamp(),
+  });
+  return {success: true};
+}
+
+export const adminWriteAuditLog = functions.https.onCall((data, context) =>
+  adminWriteAuditLogHandler(data, context as CallableContextLike)
+);
+
+export const adminWriteAuditLogV2 = onCallV2({region: "us-central1"}, async (request) => {
+  try {
+    return await adminWriteAuditLogHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+async function adminUpdateReportStatusHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const payload = (data && typeof data === "object")
+    ? (data as Record<string, unknown>)
+    : {};
+  const actor = await requireStaffContext(context);
+  const reportId = coerceString(payload.reportId);
+  if (!reportId) {
+    throw new functions.https.HttpsError("invalid-argument", "reportId is required.");
+  }
+  const nextStatus = normalizeReportStatusInput(payload.status);
+
+  const reportRef = db.collection("reports").doc(reportId);
+  const actorMeta = reportActorMeta(actor, context);
+  let previousStatus = "submitted";
+
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(reportRef);
+    if (!snap.exists) {
+      throw new functions.https.HttpsError("not-found", "Report not found.");
+    }
+    const row = (snap.data() ?? {}) as Record<string, unknown>;
+    previousStatus = normalizeReportStatusInput(row.status ?? "submitted");
+
+    const canUpdate =
+      actor.role === "super_admin" ||
+      (actor.role === "admin" && reportInActorScope(actor, row)) ||
+      (actor.role === "moderator" && coerceString(row.assignedToUid) === actor.uid);
+    if (!canUpdate) {
+      throw new functions.https.HttpsError(
+        "permission-denied",
+        "You are not allowed to update this report."
+      );
+    }
+
+    tx.set(
+      reportRef,
+      {
+        status: nextStatus,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        ...actorMeta,
+      },
+      {merge: true}
+    );
+    tx.set(reportRef.collection("history").doc(), {
+      type: "status_updated",
+      fromStatus: previousStatus,
+      toStatus: nextStatus,
+      message: `Status changed from ${previousStatus} to ${nextStatus}.`,
+      byUid: actor.uid,
+      byName: actorMeta.lastActionByName,
+      byRole: actor.role,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  });
+
+  await addAuditLog({
+    action: "report_status_updated",
+    entityType: "report",
+    entityId: reportId,
+    reportId,
+    officeId: actor.officeId ?? null,
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorOfficeId: actor.officeId ?? null,
+    actorName: actorMeta.lastActionByName,
+    before: {status: previousStatus},
+    after: {status: nextStatus},
+    message: `Status changed from ${previousStatus} to ${nextStatus}.`,
+  });
+
+  return {success: true, reportId, status: nextStatus};
+}
+
+export const adminUpdateReportStatus = functions.https.onCall((data, context) =>
+  adminUpdateReportStatusHandler(data, context as CallableContextLike)
+);
+
+export const adminUpdateReportStatusV2 = onCallV2({region: "us-central1"}, async (request) => {
+  try {
+    return await adminUpdateReportStatusHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+async function adminAssignReportHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const payload = (data && typeof data === "object")
+    ? (data as Record<string, unknown>)
+    : {};
+  const actor = await requireStaffContext(context);
+  if (!(actor.role === "super_admin" || actor.role === "admin")) {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "Only admin and super admin can assign reports."
+    );
+  }
+  const reportId = coerceString(payload.reportId);
+  if (!reportId) {
+    throw new functions.https.HttpsError("invalid-argument", "reportId is required.");
+  }
+  const assigneeUid = coerceString(payload.assigneeUid);
+  const reportRef = db.collection("reports").doc(reportId);
+  const actorMeta = reportActorMeta(actor, context);
+
+  let beforeAssignedUid: string | null = null;
+  let assignedToName: string | null = null;
+  let assignedOfficeId: string | null = null;
+
+  if (assigneeUid) {
+    const targetProfile = await getUserProfile(assigneeUid);
+    if (targetProfile.role === "resident") {
+      throw new functions.https.HttpsError("invalid-argument", "Assignee must be a staff account.");
+    }
+    if (!targetProfile.isActive) {
+      throw new functions.https.HttpsError("failed-precondition", "Assignee account is inactive.");
+    }
+    if (actor.role !== "super_admin" && actor.officeId && targetProfile.officeId !== actor.officeId) {
+      throw new functions.https.HttpsError(
+        "permission-denied",
+        "Admin can only assign staff within the same office."
+      );
+    }
+    assignedOfficeId = targetProfile.officeId ?? null;
+    assignedToName =
+      coerceString(targetProfile.data.displayName) ??
+      coerceString(targetProfile.data.email) ??
+      assigneeUid;
+  }
+
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(reportRef);
+    if (!snap.exists) {
+      throw new functions.https.HttpsError("not-found", "Report not found.");
+    }
+    const row = (snap.data() ?? {}) as Record<string, unknown>;
+    if (!reportInActorScope(actor, row)) {
+      throw new functions.https.HttpsError(
+        "permission-denied",
+        "You are not allowed to assign this report."
+      );
+    }
+    beforeAssignedUid = coerceString(row.assignedToUid);
+
+    tx.set(
+      reportRef,
+      {
+        assignedToUid: assigneeUid ?? null,
+        assignedToName: assigneeUid ? assignedToName : null,
+        assignedOfficeId: assigneeUid ? assignedOfficeId : null,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        ...actorMeta,
+      },
+      {merge: true}
+    );
+    tx.set(reportRef.collection("history").doc(), {
+      type: assigneeUid ? "assigned" : "unassigned",
+      assignedToUid: assigneeUid ?? null,
+      assignedToName: assigneeUid ? assignedToName : null,
+      message: assigneeUid ? `Report assigned to ${assignedToName}.` : "Report unassigned.",
+      byUid: actor.uid,
+      byName: actorMeta.lastActionByName,
+      byRole: actor.role,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  });
+
+  await addAuditLog({
+    action: assigneeUid ? "report_assigned" : "report_unassigned",
+    entityType: "report",
+    entityId: reportId,
+    reportId,
+    officeId: actor.officeId ?? null,
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorOfficeId: actor.officeId ?? null,
+    actorName: actorMeta.lastActionByName,
+    before: {assignedToUid: beforeAssignedUid},
+    after: {assignedToUid: assigneeUid ?? null},
+    message: assigneeUid ? `Assigned to ${assignedToName}.` : "Report unassigned.",
+  });
+
+  return {
+    success: true,
+    reportId,
+    assignedToUid: assigneeUid ?? null,
+    assignedToName: assigneeUid ? assignedToName : null,
+  };
+}
+
+export const adminAssignReport = functions.https.onCall((data, context) =>
+  adminAssignReportHandler(data, context as CallableContextLike)
+);
+
+export const adminAssignReportV2 = onCallV2({region: "us-central1"}, async (request) => {
+  try {
+    return await adminAssignReportHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
 /**
  * =========================
  * OPS RUNTIME HEALTH
@@ -798,10 +1559,15 @@ export const opsRuntimeHealth = functions.https.onCall(async (data, context) => 
 
   const expectedBuild = coerceString(data?.expectedBuild);
   const requiredCallables: string[] = [
+    "adminUpdateReportStatus",
+    "adminAssignReport",
+    "adminWriteAuditLog",
+    "dtsCreateTrackingRecord",
     "dtsInitiateTransfer",
     "dtsConfirmReceipt",
     "dtsRejectTransfer",
     "dtsUpdateStatus",
+    "setTrackingPin",
     "dtsTrackByTrackingNo",
     "dtsTrackByToken",
     "exportDtsQrZip",
@@ -851,17 +1617,17 @@ export const setUserRole = functions.https.onCall(async (data, context) => {
     );
   }
 
-  const needsOffice = nextRole === "office_admin" || nextRole === "moderator";
+  const needsOffice = nextRole === "admin" || nextRole === "moderator";
   let officeId = coerceString(data?.officeId) ?? targetProfile.officeId;
   let officeName = coerceString(data?.officeName) ?? targetProfile.officeName;
   const isActive =
     typeof data?.isActive === "boolean" ? data.isActive : targetProfile.isActive;
 
   if (needsOffice && !officeId) {
-    throw new functions.https.HttpsError(
-      "invalid-argument",
-      "officeId is required for office_admin or moderator."
-    );
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "officeId is required for admin or moderator."
+      );
   }
 
   if (!needsOffice) {
@@ -880,6 +1646,7 @@ export const setUserRole = functions.https.onCall(async (data, context) => {
     officeName,
     isActive,
   });
+  await admin.auth().revokeRefreshTokens(uid);
 
   // keep Firestore display role in-sync (critical for dropdowns / UI)
   await db.collection("users").doc(uid).set(
@@ -898,6 +1665,440 @@ export const setUserRole = functions.https.onCall(async (data, context) => {
 
 /**
  * =========================
+ * USER MANAGEMENT (super_admin only)
+ * =========================
+ */
+export const adminListUsers = functions.https.onCall(async (data, context) => {
+  const actor = await requireSuperAdminContext(context);
+  const includeResidents = coerceBool(data?.includeResidents, false);
+  const rawLimit = typeof data?.limit === "number" ? Math.floor(data.limit) : 200;
+  const listLimit = Math.max(20, Math.min(500, rawLimit));
+
+  const source = db.collection("users");
+  const usersQuery = includeResidents
+    ? source.limit(listLimit)
+    : source
+      .where("role", "in", ["super_admin", "admin", "office_admin", "moderator"])
+      .limit(listLimit);
+
+  const usersSnapshot = await usersQuery.get();
+  const userDocs = usersSnapshot.docs.filter((item) => {
+    const row = item.data() ?? {};
+    return !coerceBool(row.isDeleted, false);
+  });
+
+  const authLookups = await Promise.all(
+    userDocs.map(async (item) => {
+      try {
+        const authUser = await admin.auth().getUser(item.id);
+        return { uid: item.id, authUser };
+      } catch (error) {
+        if (isAuthUserNotFound(error)) {
+          return { uid: item.id, authUser: null };
+        }
+        throw error;
+      }
+    })
+  );
+  const authByUid = new Map<string, admin.auth.UserRecord | null>(
+    authLookups.map((row) => [row.uid, row.authUser])
+  );
+
+  const rolePriority: Record<NormalizedRole, number> = {
+    super_admin: 100,
+    admin: 80,
+    moderator: 60,
+    resident: 10,
+  };
+
+  const items = userDocs
+    .map((item) => {
+      const row = item.data() ?? {};
+      const role = normalizeRole(row.role);
+      const authUser = authByUid.get(item.id);
+      const email = coerceString(row.email) ?? coerceString(authUser?.email) ?? "";
+      const displayName =
+        coerceString(row.displayName) ??
+        coerceString(authUser?.displayName) ??
+        coerceString(authUser?.email) ??
+        item.id;
+      const isActive = coerceBool(
+        row.isActive,
+        authUser ? !authUser.disabled : true
+      );
+      const disabled = authUser ? authUser.disabled : !isActive;
+
+      return {
+        uid: item.id,
+        email,
+        displayName,
+        role,
+        roleLabel: roleDisplayLabel(role),
+        officeId: coerceString(row.officeId),
+        officeName: coerceString(row.officeName),
+        isActive,
+        disabled,
+        createdAt:
+          toIsoString(row.createdAt) ??
+          toIsoString(authUser?.metadata.creationTime),
+        updatedAt: toIsoString(row.updatedAt),
+        lastSignInAt:
+          toIsoString(authUser?.metadata.lastSignInTime) ??
+          toIsoString(row.lastLoginAt),
+        providerIds: authUser?.providerData?.map((provider) => provider.providerId) ?? [],
+      };
+    })
+    .sort((a, b) => {
+      const left = rolePriority[a.role] ?? 0;
+      const right = rolePriority[b.role] ?? 0;
+      if (left !== right) return right - left;
+      return a.email.localeCompare(b.email);
+    });
+
+  const roles = USER_MANAGEMENT_ROLES.map((role) => ({
+    value: role,
+    label: roleDisplayLabel(role),
+  }));
+
+  return {
+    success: true,
+    currentUid: actor.uid,
+    minimumPasswordLength: USER_MIN_PASSWORD_LENGTH,
+    roles,
+    items,
+  };
+});
+
+export const adminCreateUser = functions.https.onCall(async (data, context) => {
+  const actor = await requireSuperAdminContext(context);
+  const actorName = actorDisplayName(actor);
+  const email = coerceString(data?.email);
+  const password = coerceString(data?.password);
+  const displayName = coerceString(data?.displayName);
+  const role = normalizeRole(data?.role);
+  const isActive =
+    typeof data?.isActive === "boolean" ? data.isActive : true;
+
+  if (!email || !password) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "email and password are required."
+    );
+  }
+  if (password.length < USER_MIN_PASSWORD_LENGTH) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      `Password must be at least ${USER_MIN_PASSWORD_LENGTH} characters.`
+    );
+  }
+  if (!USER_MANAGEMENT_ROLES.includes(role)) {
+    throw new functions.https.HttpsError("invalid-argument", "Invalid role.");
+  }
+
+  const office = await resolveManagedOffice(
+    role,
+    coerceString(data?.officeId),
+    coerceString(data?.officeName),
+    null,
+    null
+  );
+
+  const created = await admin.auth().createUser({
+    email,
+    password,
+    displayName: displayName ?? undefined,
+    disabled: !isActive,
+  });
+
+  await admin.auth().setCustomUserClaims(created.uid, {
+    role,
+    officeId: office.officeId,
+    officeName: office.officeName,
+    isActive,
+  });
+  await admin.auth().revokeRefreshTokens(created.uid);
+
+  await db.collection("users").doc(created.uid).set(
+    {
+      uid: created.uid,
+      email,
+      displayName: displayName ?? email,
+      role,
+      officeId: office.officeId,
+      officeName: office.officeName,
+      isActive,
+      isDeleted: false,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
+  await addAuditLog({
+    action: "user_created",
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorOfficeId: actor.officeId ?? null,
+    actorName,
+    entityType: "user",
+    entityId: created.uid,
+    targetUid: created.uid,
+    targetEmail: email,
+    targetRole: role,
+    officeId: office.officeId,
+    message: `User ${email} created as ${roleDisplayLabel(role)}.`,
+  });
+
+  return { success: true, uid: created.uid };
+});
+
+export const adminUpdateUser = functions.https.onCall(async (data, context) => {
+  const actor = await requireSuperAdminContext(context);
+  const actorName = actorDisplayName(actor);
+  const uid = coerceString(data?.uid);
+  if (!uid) {
+    throw new functions.https.HttpsError("invalid-argument", "uid is required.");
+  }
+
+  const targetProfile = await getUserProfile(uid);
+  const targetData = targetProfile.data as Record<string, unknown>;
+  const role = data?.role != null ? normalizeRole(data.role) : targetProfile.role;
+  const requestedOfficeId = Object.prototype.hasOwnProperty.call(data ?? {}, "officeId")
+    ? coerceString(data?.officeId)
+    : targetProfile.officeId;
+  const requestedOfficeName = Object.prototype.hasOwnProperty.call(data ?? {}, "officeName")
+    ? coerceString(data?.officeName)
+    : targetProfile.officeName;
+  const office = await resolveManagedOffice(
+    role,
+    requestedOfficeId,
+    requestedOfficeName,
+    targetProfile.officeId,
+    targetProfile.officeName
+  );
+  const isActive =
+    typeof data?.isActive === "boolean" ? data.isActive : targetProfile.isActive;
+
+  if (uid === actor.uid && role !== "super_admin") {
+    throw new functions.https.HttpsError(
+      "failed-precondition",
+      "You cannot downgrade your own super_admin role."
+    );
+  }
+  if (uid === actor.uid && !isActive) {
+    throw new functions.https.HttpsError(
+      "failed-precondition",
+      "You cannot suspend your own account."
+    );
+  }
+
+  const displayName =
+    coerceString(data?.displayName) ??
+    coerceString(targetData.displayName);
+  const email =
+    coerceString(data?.email) ??
+    coerceString(targetData.email);
+
+  await admin.auth().updateUser(uid, {
+    displayName: displayName ?? undefined,
+    email: email ?? undefined,
+    disabled: !isActive,
+  });
+
+  await admin.auth().setCustomUserClaims(uid, {
+    role,
+    officeId: office.officeId,
+    officeName: office.officeName,
+    isActive,
+  });
+  await admin.auth().revokeRefreshTokens(uid);
+
+  await db.collection("users").doc(uid).set(
+    {
+      email: email ?? targetData.email ?? null,
+      displayName: displayName ?? targetData.displayName ?? null,
+      role,
+      officeId: office.officeId,
+      officeName: office.officeName,
+      isActive,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
+  await addAuditLog({
+    action: "user_updated",
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorOfficeId: actor.officeId ?? null,
+    actorName,
+    entityType: "user",
+    entityId: uid,
+    targetUid: uid,
+    targetRole: role,
+    officeId: office.officeId,
+    message: `User ${uid} updated as ${roleDisplayLabel(role)}.`,
+  });
+
+  return { success: true };
+});
+
+export const adminSetUserSuspension = functions.https.onCall(async (data, context) => {
+  const actor = await requireSuperAdminContext(context);
+  const actorName = actorDisplayName(actor);
+  const uid = coerceString(data?.uid);
+  if (!uid || typeof data?.suspended !== "boolean") {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "uid and suspended are required."
+    );
+  }
+  if (uid === actor.uid && data.suspended) {
+    throw new functions.https.HttpsError(
+      "failed-precondition",
+      "You cannot suspend your own account."
+    );
+  }
+
+  const targetProfile = await getUserProfile(uid);
+  const isActive = !data.suspended;
+
+  await admin.auth().updateUser(uid, { disabled: data.suspended });
+  await admin.auth().setCustomUserClaims(uid, {
+    role: targetProfile.role,
+    officeId: targetProfile.officeId,
+    officeName: targetProfile.officeName,
+    isActive,
+  });
+  await admin.auth().revokeRefreshTokens(uid);
+
+  await db.collection("users").doc(uid).set(
+    {
+      isActive,
+      suspendedAt: data.suspended
+        ? admin.firestore.FieldValue.serverTimestamp()
+        : null,
+      suspendedByUid: data.suspended ? actor.uid : null,
+      suspendedByName: data.suspended ? actorName : null,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
+  await addAuditLog({
+    action: data.suspended ? "user_suspended" : "user_reactivated",
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorOfficeId: actor.officeId ?? null,
+    actorName,
+    entityType: "user",
+    entityId: uid,
+    targetUid: uid,
+    message: data.suspended
+      ? `User ${uid} suspended.`
+      : `User ${uid} reactivated.`,
+  });
+
+  return { success: true };
+});
+
+export const adminResetUserPassword = functions.https.onCall(async (data, context) => {
+  const actor = await requireSuperAdminContext(context);
+  const actorName = actorDisplayName(actor);
+  const uid = coerceString(data?.uid);
+  const newPassword = coerceString(data?.newPassword);
+  if (!uid || !newPassword) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "uid and newPassword are required."
+    );
+  }
+  if (newPassword.length < USER_MIN_PASSWORD_LENGTH) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      `Password must be at least ${USER_MIN_PASSWORD_LENGTH} characters.`
+    );
+  }
+
+  await admin.auth().updateUser(uid, { password: newPassword });
+  await admin.auth().revokeRefreshTokens(uid);
+
+  await db.collection("users").doc(uid).set(
+    {
+      passwordResetAt: admin.firestore.FieldValue.serverTimestamp(),
+      passwordResetByUid: actor.uid,
+      passwordResetByName: actorName,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
+  await addAuditLog({
+    action: "user_password_reset",
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorOfficeId: actor.officeId ?? null,
+    actorName,
+    entityType: "user",
+    entityId: uid,
+    targetUid: uid,
+    message: `Password reset for user ${uid}.`,
+  });
+
+  return { success: true };
+});
+
+export const adminDeleteUser = functions.https.onCall(async (data, context) => {
+  const actor = await requireSuperAdminContext(context);
+  const actorName = actorDisplayName(actor);
+  const uid = coerceString(data?.uid);
+  if (!uid) {
+    throw new functions.https.HttpsError("invalid-argument", "uid is required.");
+  }
+  if (uid === actor.uid) {
+    throw new functions.https.HttpsError(
+      "failed-precondition",
+      "You cannot delete your own account."
+    );
+  }
+
+  try {
+    await admin.auth().deleteUser(uid);
+  } catch (error) {
+    if (!isAuthUserNotFound(error)) {
+      throw error;
+    }
+  }
+
+  await db.collection("users").doc(uid).set(
+    {
+      isDeleted: true,
+      isActive: false,
+      deletedAt: admin.firestore.FieldValue.serverTimestamp(),
+      deletedByUid: actor.uid,
+      deletedByName: actorName,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
+  await addAuditLog({
+    action: "user_deleted",
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorOfficeId: actor.officeId ?? null,
+    actorName,
+    entityType: "user",
+    entityId: uid,
+    targetUid: uid,
+    message: `User ${uid} deleted.`,
+  });
+
+  return { success: true };
+});
+
+/**
+ * =========================
  * SYNC USER CLAIMS
  * =========================
  * Keep auth custom claims in sync with Firestore user profile.
@@ -908,6 +2109,9 @@ export const onUserWrite = functions.firestore
     const uid = context.params.uid as string;
     if (!change.after.exists) {
       await admin.auth().setCustomUserClaims(uid, {});
+      await admin.auth().revokeRefreshTokens(uid).catch((error) => {
+        console.warn("onUserWrite: revokeRefreshTokens failed", error);
+      });
       return;
     }
 
@@ -928,11 +2132,13 @@ export const onUserWrite = functions.firestore
       officeName,
       isActive,
     });
+    await admin.auth().revokeRefreshTokens(uid);
 
-    if (data.role === "admin") {
+    const storedRoleRaw = coerceString(data.role);
+    if (storedRoleRaw && normalizeRole(storedRoleRaw) !== storedRoleRaw) {
       await change.after.ref.set(
         {
-          role: "super_admin",
+          role,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         },
         { merge: true }
@@ -1187,14 +2393,14 @@ export const onReportNotify = functions.firestore
       if (reportOfficeId) {
         const officeSnap = await db
           .collection("users")
-          .where("role", "==", "office_admin")
+          .where("role", "in", ["admin", "office_admin"])
           .where("officeId", "==", reportOfficeId)
           .get();
         officeAdminUids = officeSnap.docs.map((d) => d.id);
       } else {
         const officeSnap = await db
           .collection("users")
-          .where("role", "==", "office_admin")
+          .where("role", "in", ["admin", "office_admin"])
           .get();
         officeAdminUids = officeSnap.docs.map((d) => d.id);
       }
@@ -1374,11 +2580,13 @@ export const onReportNotify = functions.firestore
  * Notify residents when an announcement is published.
  */
 export const onAnnouncementNotify = functions.firestore
-  .document("announcements/{announcementId}")
+  .document("posts/{postId}")
   .onWrite(async (change, context) => {
     const before = change.before.exists ? change.before.data() : null;
     const after = change.after.exists ? change.after.data() : null;
     if (!after) return;
+    const postType = String(after.type ?? "announcement").trim().toLowerCase();
+    if (postType !== "announcement") return;
 
     const beforeStatus = (before?.status ?? null) as string | null;
     const afterStatus = (after.status ?? "draft") as string;
@@ -1387,7 +2595,7 @@ export const onAnnouncementNotify = functions.firestore
 
     const title = (after.title ?? "Announcement") as string;
     const category = (after.category ?? "") as string;
-    const announcementId = context.params.announcementId as string;
+    const postId = context.params.postId as string;
 
     const body = category ? `${title} - ${category}` : title;
     const residentUids = await getResidentUids();
@@ -1396,7 +2604,7 @@ export const onAnnouncementNotify = functions.firestore
       title: "New announcement",
       body,
       type: "announcement_published",
-      announcementId,
+      announcementId: postId,
     });
   });
 
@@ -1406,11 +2614,14 @@ export const onAnnouncementNotify = functions.firestore
  * =========================
  */
 export const onAnnouncementAudit = functions.firestore
-  .document("announcements/{announcementId}")
+  .document("posts/{postId}")
   .onWrite(async (change, context) => {
     const before = change.before.exists ? change.before.data() : null;
     const after = change.after.exists ? change.after.data() : null;
-    const announcementId = context.params.announcementId as string;
+    const postId = context.params.postId as string;
+    const typeSource = (after ?? before ?? {}) as Record<string, unknown>;
+    const postType = String(typeSource.type ?? "announcement").trim().toLowerCase();
+    if (postType !== "announcement") return;
 
     if (!before && after) {
       const title = (after.title ?? "Announcement") as string;
@@ -1421,7 +2632,8 @@ export const onAnnouncementAudit = functions.firestore
 
       await addAuditLog({
         action: "announcement_created",
-        announcementId,
+        announcementId: postId,
+        postId,
         announcementTitle: title,
         announcementCategory: category,
         status,
@@ -1441,7 +2653,8 @@ export const onAnnouncementAudit = functions.firestore
 
       await addAuditLog({
         action: "announcement_deleted",
-        announcementId,
+        announcementId: postId,
+        postId,
         announcementTitle: title,
         announcementCategory: category,
         status,
@@ -1465,7 +2678,8 @@ export const onAnnouncementAudit = functions.firestore
     if (statusChanged && afterStatus === "published") {
       await addAuditLog({
         action: "announcement_published",
-        announcementId,
+        announcementId: postId,
+        postId,
         announcementTitle: title,
         announcementCategory: category,
         status: afterStatus,
@@ -1479,7 +2693,8 @@ export const onAnnouncementAudit = functions.firestore
     if (statusChanged && beforeStatus === "published" && afterStatus !== "published") {
       await addAuditLog({
         action: "announcement_unpublished",
-        announcementId,
+        announcementId: postId,
+        postId,
         announcementTitle: title,
         announcementCategory: category,
         status: afterStatus,
@@ -1492,7 +2707,8 @@ export const onAnnouncementAudit = functions.firestore
 
     await addAuditLog({
       action: "announcement_updated",
-      announcementId,
+      announcementId: postId,
+      postId,
       announcementTitle: title,
       announcementCategory: category,
       status: afterStatus,
@@ -1509,10 +2725,10 @@ export const onAnnouncementAudit = functions.firestore
  * Count unique viewers.
  */
 export const onAnnouncementView = functions.firestore
-  .document("announcements/{announcementId}/views/{uid}")
+  .document("posts/{postId}/views/{uid}")
   .onCreate(async (_snap, context) => {
-    const announcementId = context.params.announcementId as string;
-    await db.doc(`announcements/${announcementId}`).set(
+    const postId = context.params.postId as string;
+    await db.doc(`posts/${postId}`).set(
       {
         views: admin.firestore.FieldValue.increment(1),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -1752,7 +2968,7 @@ export const onDtsTimelineNotify = functions.firestore
           .get();
         for (const doc of officeStaffSnap.docs) {
           const role = normalizeRole(doc.data().role);
-          if (role === "office_admin" || role === "moderator") {
+          if (role === "admin" || role === "moderator") {
             recipients.add(doc.id);
           }
         }
@@ -1778,6 +2994,170 @@ export const onDtsTimelineNotify = functions.firestore
  * =========================
  * All transition-critical state changes are enforced server-side.
  */
+async function dtsCreateTrackingRecordHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const payload = (data && typeof data === "object")
+    ? (data as Record<string, unknown>)
+    : {};
+  const actor = await requireStaffContext(context);
+  const trackingNo = coerceString(payload.trackingNo) ?? coerceString(payload.trackingNumber);
+  const pin = coerceString(payload.pin);
+  const title = coerceString(payload.title) ?? "";
+  const docType = coerceString(payload.docType) ?? "GENERAL";
+  const requestedOfficeId = coerceString(payload.officeId);
+  const requestedOfficeName = coerceString(payload.officeName);
+  const requestedQrCode = coerceString(payload.qrCode);
+
+  if (!trackingNo || !pin) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "trackingNo/trackingNumber and pin are required."
+    );
+  }
+  if (pin.length < 4) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "PIN must be at least 4 characters."
+    );
+  }
+
+  const officeId =
+    actor.role === "super_admin"
+      ? requestedOfficeId
+      : (actor.officeId ?? requestedOfficeId);
+  if (!officeId) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "officeId is required to create tracking records."
+    );
+  }
+  const officeName =
+    requestedOfficeName ??
+    actor.officeName ??
+    coerceString((await db.collection("offices").doc(officeId).get()).data()?.name) ??
+    officeId;
+
+  const duplicateSnap = await db
+    .collection("dts_documents")
+    .where("trackingNo", "==", trackingNo)
+    .limit(1)
+    .get();
+  if (!duplicateSnap.empty) {
+    throw new functions.https.HttpsError(
+      "already-exists",
+      "Tracking number already exists."
+    );
+  }
+
+  const pinHash = await hashTrackingPin(pin);
+  const actorName = actorDisplayName(actor);
+  const docRef = db.collection("dts_documents").doc();
+  const qrRef = requestedQrCode
+    ? db.collection("dts_qr_codes").doc(requestedQrCode)
+    : null;
+
+  await db.runTransaction(async (tx) => {
+    let resolvedQrCode: string | null = requestedQrCode;
+    if (qrRef) {
+      const qrSnap = await tx.get(qrRef);
+      if (!qrSnap.exists || coerceString(qrSnap.data()?.status) !== "unused") {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          "Requested QR code is not available."
+        );
+      }
+    } else {
+      const qrCandidates = await tx.get(
+        db.collection("dts_qr_codes").where("status", "==", "unused").limit(1)
+      );
+      if (!qrCandidates.empty) {
+        resolvedQrCode = qrCandidates.docs[0].id;
+      }
+    }
+
+    tx.set(docRef, {
+      qrCode: resolvedQrCode ?? null,
+      trackingNo,
+      title,
+      docType,
+      status: "RECEIVED",
+      currentOfficeId: officeId,
+      currentOfficeName: officeName,
+      currentCustodianUid: actor.uid,
+      pendingTransfer: null,
+      pinHash,
+      publicPinHash: pinHash,
+      pinHashAlgo: "bcrypt",
+      publicPinSalt: admin.firestore.FieldValue.delete(),
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdByUid: actor.uid,
+      createdByName: actorName,
+      submittedByUid: actor.uid,
+    });
+
+    tx.set(docRef.collection("timeline").doc(), {
+      type: "STATUS_CHANGED",
+      actionType: "received",
+      byUid: actor.uid,
+      byName: actorName,
+      status: "RECEIVED",
+      notePublic: "Document received.",
+      notes: `Document logged as received by ${actorName}.`,
+      officeName,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    if (resolvedQrCode) {
+      tx.set(db.collection("dts_qr_index").doc(resolvedQrCode), {
+        docId: docRef.id,
+        trackingNo,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      tx.set(
+        db.collection("dts_qr_codes").doc(resolvedQrCode),
+        {
+          status: "used",
+          docId: docRef.id,
+          usedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        {merge: true}
+      );
+    }
+  });
+
+  await addAuditLog({
+    action: "tracking_created",
+    entityType: "dts_documents",
+    entityId: docRef.id,
+    dtsDocId: docRef.id,
+    dtsTrackingNo: trackingNo,
+    officeId,
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorOfficeId: actor.officeId ?? null,
+    actorOfficeName: actor.officeName ?? null,
+    actorName,
+    message: "Tracking record created.",
+  });
+
+  return {success: true, id: docRef.id, trackingNo};
+}
+
+export const dtsCreateTrackingRecord = functions.https.onCall((data, context) =>
+  dtsCreateTrackingRecordHandler(data, context as CallableContextLike)
+);
+
+export const dtsCreateTrackingRecordV2 = onCallV2({region: "us-central1"}, async (request) => {
+  try {
+    return await dtsCreateTrackingRecordHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
 export const dtsInitiateTransfer = functions.https.onCall(
   async (data, context) => {
     const actor = await requireStaffContext(context);
@@ -2381,13 +3761,134 @@ export const dtsAuditAttachmentAccess = functions.https.onCall(
 
 /**
  * =========================
+ * DTS TRACKING PIN RESET
+ * =========================
+ * Server-side reset so PIN is never stored in plaintext and audit is guaranteed.
+ */
+async function setTrackingPinHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const payload = (data && typeof data === "object")
+    ? (data as Record<string, unknown>)
+    : {};
+  const actor = await requireStaffContext(context);
+  if (!(actor.role === "super_admin" || actor.role === "admin")) {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "Only admin and super admin can reset tracking PIN."
+    );
+  }
+
+  const trackingId = coerceString(payload.trackingId) ?? coerceString(payload.docId);
+  const newPin = coerceString(payload.newPin);
+  if (!trackingId || !newPin) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "trackingId and newPin are required."
+    );
+  }
+  if (newPin.length < 4) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "PIN must be at least 4 characters."
+    );
+  }
+
+  const docRef = db.collection("dts_documents").doc(trackingId);
+  const docSnap = await docRef.get();
+  if (!docSnap.exists) {
+    throw new functions.https.HttpsError("not-found", "Document not found.");
+  }
+  const row = docSnap.data() ?? {};
+  if (actor.role !== "super_admin" && !canOperateOnDtsDoc(actor, row)) {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "You cannot reset PIN for this document."
+    );
+  }
+
+  const pinHash = await hashTrackingPin(newPin);
+  await docRef.set(
+    {
+      pinHash,
+      publicPinHash: pinHash,
+      pinHashAlgo: "bcrypt",
+      publicPinSalt: admin.firestore.FieldValue.delete(),
+      pinUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      pinUpdatedByUid: actor.uid,
+      pinUpdatedByName: actorDisplayName(actor),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    {merge: true}
+  );
+
+  await addAuditLog({
+    action: "tracking_pin_reset",
+    entityType: "dts_documents",
+    entityId: trackingId,
+    dtsDocId: trackingId,
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorOfficeId: actor.officeId ?? null,
+    actorOfficeName: actor.officeName ?? null,
+    actorName: actorDisplayName(actor),
+    message: "Tracking PIN reset.",
+  });
+
+  return {success: true};
+}
+
+export const setTrackingPin = functions.https.onCall((data, context) =>
+  setTrackingPinHandler(data, context as CallableContextLike)
+);
+
+export const setTrackingPinV2 = onCallV2({region: "us-central1"}, async (request) => {
+  try {
+    return await setTrackingPinHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+/**
+ * =========================
  * DTS TRACKING LOOKUP
  * =========================
  * Lookup by trackingNo + PIN and return a sanitized payload.
  */
+async function lookupDtsByTrackingNo(
+  trackingNo: string,
+  pin: string,
+  context: TrackingLookupContext
+): Promise<Record<string, unknown>> {
+  const snap = await db
+    .collection("dts_documents")
+    .where("trackingNo", "==", trackingNo)
+    .limit(1)
+    .get();
+
+  if (snap.empty) {
+    throw new functions.https.HttpsError("not-found", "Document not found.");
+  }
+
+  const doc = snap.docs[0];
+  const dataRow = doc.data() ?? {};
+  await verifyPinWithRateLimit(trackingNo, pin, dataRow, context);
+  const session = await issueTrackingSession(doc.id, trackingNo, context);
+  const sanitized = buildSanitizedTrackingResult(trackingNo, dataRow);
+  const timeline = await loadPublicTrackingTimeline(doc.ref);
+  return {
+    ...sanitized,
+    timeline,
+    sessionToken: session.token,
+    sessionExpiresAt: session.expiresAtMs,
+  };
+}
+
 export const dtsTrackByTrackingNo = functions.https.onCall(
   async (data, context) => {
-    const trackingNo = coerceString(data?.trackingNo);
+    const trackingNo = coerceString(data?.trackingNo) ?? coerceString(data?.trackingNumber);
     const pin = coerceString(data?.pin);
 
     if (!trackingNo || !pin) {
@@ -2397,28 +3898,54 @@ export const dtsTrackByTrackingNo = functions.https.onCall(
       );
     }
 
-    const snap = await db
-      .collection("dts_documents")
-      .where("trackingNo", "==", trackingNo)
-      .limit(1)
-      .get();
-
-    if (snap.empty) {
-      throw new functions.https.HttpsError("not-found", "Document not found.");
-    }
-
-    const doc = snap.docs[0];
-    const dataRow = doc.data() ?? {};
-    await verifyPinWithRateLimit(trackingNo, pin, dataRow, context);
-    const session = await issueTrackingSession(doc.id, trackingNo, context);
-    const sanitized = buildSanitizedTrackingResult(trackingNo, dataRow);
-    return {
-      ...sanitized,
-      sessionToken: session.token,
-      sessionExpiresAt: session.expiresAtMs,
-    };
+    return lookupDtsByTrackingNo(trackingNo, pin, context);
   }
 );
+
+async function handleTrackLookupHttpRequest(
+  req: functions.https.Request,
+  res: functions.Response<unknown>
+) {
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+  if (req.method === "OPTIONS") {
+    res.status(204).send("");
+    return;
+  }
+  if (req.method !== "POST") {
+    res.status(405).json({ error: "Method not allowed." });
+    return;
+  }
+
+  const trackingNumber = coerceString(req.body?.trackingNumber);
+  const pin = coerceString(req.body?.pin);
+  if (!trackingNumber || !pin) {
+    res.status(400).json({ error: "trackingNumber and pin are required." });
+    return;
+  }
+
+  try {
+    const payload = await lookupDtsByTrackingNo(trackingNumber, pin, {
+      auth: null,
+      rawRequest: req,
+    });
+    res.status(200).json(payload);
+  } catch (error) {
+    const httpsError = error as functions.https.HttpsError;
+    const code = String(httpsError?.code ?? "internal");
+    const message = String(httpsError?.message ?? "Tracking lookup failed.");
+    const statusCode =
+      code === "invalid-argument" ? 400 :
+      code === "not-found" ? 404 :
+      code === "resource-exhausted" ? 429 :
+      code === "permission-denied" ? 403 : 500;
+    res.status(statusCode).json({ error: message, code });
+  }
+}
+
+export const trackLookup = functions.https.onRequest(handleTrackLookupHttpRequest);
+export const trackLookupV2 = onRequestV2({region: "us-central1"}, handleTrackLookupHttpRequest);
 
 /**
  * =========================
@@ -2462,8 +3989,10 @@ export const dtsTrackByQrAndPin = functions.https.onCall(
     await verifyPinWithRateLimit(trackingNo, pin, row, context);
     const session = await issueTrackingSession(docId, trackingNo, context);
     const sanitized = buildSanitizedTrackingResult(trackingNo, row);
+    const timeline = await loadPublicTrackingTimeline(docSnap.ref);
     return {
       ...sanitized,
+      timeline,
       qrCode,
       sessionToken: session.token,
       sessionExpiresAt: session.expiresAtMs,
@@ -2507,8 +4036,10 @@ export const dtsTrackByToken = functions.https.onCall(
     const nextSession = await issueTrackingSession(docId, trackingNo, context);
     await session.ref.delete();
     const sanitized = buildSanitizedTrackingResult(trackingNo, row);
+    const timeline = await loadPublicTrackingTimeline(docSnap.ref);
     return {
       ...sanitized,
+      timeline,
       sessionToken: nextSession.token,
       sessionExpiresAt: nextSession.expiresAtMs,
     };
@@ -2845,3 +4376,8 @@ export const exportDtsQrZip = functions.https.onCall(
     };
   }
 );
+
+/**
+ * MySQL mirror is intentionally disabled for now.
+ * Firestore remains the sole active datastore for app + website.
+ */

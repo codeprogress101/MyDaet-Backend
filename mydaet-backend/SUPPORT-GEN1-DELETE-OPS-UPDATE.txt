@@ -1,0 +1,22 @@
+Case update for Firebase Support (mydaet, us-central1):
+
+We disabled MySQL mirror in source and attempted to delete remaining Gen1 mirror functions, but delete operations are now stuck again.
+
+Pending operations (done:false):
+- projects/mydaet/locations/us-central1/operations/operation-1771575319227-64b3d05986e58-b6af2199-f8360fb4
+  target: projects/mydaet/locations/us-central1/functions/mirrorPostsToMysql
+- projects/mydaet/locations/us-central1/operations/operation-1771575658057-64b3d19ca8f31-3fd8760d-4d4cef68
+  target: projects/mydaet/locations/us-central1/functions/mirrorPublicDocsToMysql
+- projects/mydaet/locations/us-central1/operations/operation-1771575658212-64b3d19cced2a-42acbaa7-29c2fc82
+  target: projects/mydaet/locations/us-central1/functions/mirrorDocTrackingTimelineToMysql
+- projects/mydaet/locations/us-central1/operations/operation-1771575657991-64b3d19c98bd1-9d88a705-a35ba8f6
+  target: projects/mydaet/locations/us-central1/functions/mirrorJobsToMysql
+- projects/mydaet/locations/us-central1/operations/operation-1771575658641-64b3d19d3769f-09ee8c9d-e07ef0f4
+  target: projects/mydaet/locations/us-central1/functions/mirrorDocTrackingToMysql
+- projects/mydaet/locations/us-central1/operations/operation-1771575318862-64b3d0592dba2-5510c272-2cbc6e0b
+  target: projects/mydaet/locations/us-central1/functions/pingTemp
+- projects/mydaet/locations/us-central1/operations/operation-1771575318954-64b3d059442fe-0f30c1fe-6d57c95c
+  target: projects/mydaet/locations/us-central1/functions/trackLookup
+
+Request:
+Please clear these stuck Gen1 delete operations and remove backend lock so deletion/deploy can proceed.

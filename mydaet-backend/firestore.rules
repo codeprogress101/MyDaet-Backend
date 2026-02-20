@@ -41,14 +41,59 @@ service cloud.firestore {
             : null);
     }
 
+    function roleString() {
+      return roleRaw() is string
+        ? roleRaw()
+        : "";
+    }
+
+    function roleMatches(pattern) {
+      return roleString() != "" && roleString().matches(pattern);
+    }
+
+    function hasSuperAdminFlag() {
+      return request.auth != null && (
+        request.auth.token.superAdmin == true
+        || request.auth.token.isSuperAdmin == true
+        || request.auth.token.super_admin == true
+      );
+    }
+
+    function hasOfficeAdminFlag() {
+      return request.auth != null && (
+        request.auth.token.officeAdmin == true
+        || request.auth.token.office_admin == true
+        || request.auth.token.isOfficeAdmin == true
+      );
+    }
+
+    function hasModeratorFlag() {
+      return request.auth != null && (
+        request.auth.token.moderator == true
+        || request.auth.token.isModerator == true
+        || request.auth.token.clerk == true
+      );
+    }
+
     function role() {
-      return roleRaw() in ["admin", "super_admin", "superAdmin", "superadmin", "SUPER_ADMIN", "SUPERADMIN"]
+      return (
+        hasSuperAdminFlag()
+        || roleMatches("^[\\s]*[sS][uU][pP][eE][rR][ _-]?[aA][dD][mM][iI][nN][\\s]*$")
+      )
         ? "super_admin"
-        : (roleRaw() in ["office_admin", "officeAdmin", "officeadmin", "OFFICE_ADMIN"]
-            ? "office_admin"
-            : (roleRaw() in ["moderator", "MODERATOR"]
+        : (
+          hasOfficeAdminFlag()
+          || roleMatches("^[\\s]*[aA][dD][mM][iI][nN][\\s]*$")
+          || roleMatches("^[\\s]*[oO][fF][fF][iI][cC][eE][ _-]?[aA][dD][mM][iI][nN][\\s]*$")
+        )
+            ? "admin"
+            : (
+              hasModeratorFlag()
+              || roleMatches("^[\\s]*[mM][oO][dD][eE][rR][aA][tT][oO][rR][\\s]*$")
+              || roleMatches("^[\\s]*[cC][lL][eE][rR][kK][\\s]*$")
+            )
                 ? "moderator"
-                : "resident"));
+                : "resident";
     }
 
     function officeId() {
@@ -84,7 +129,7 @@ service cloud.firestore {
     }
 
     function isOfficeAdmin() {
-      return role() == "office_admin";
+      return role() == "admin";
     }
 
     function isModerator() {
@@ -100,7 +145,7 @@ service cloud.firestore {
     }
 
     function isSuperAdminByDoc() {
-      return hasUserData() && userDoc().data.role in ["super_admin", "admin"];
+      return hasUserData() && userDoc().data.role in ["super_admin"];
     }
 
     function isStaffByDoc() {
@@ -232,6 +277,12 @@ service cloud.firestore {
         || (isOfficeAdmin() && officeId() != null && targetOfficeId != null && targetOfficeId != "" && officeId() == targetOfficeId);
     }
 
+    function postOfficeAllowed(targetOfficeId) {
+      return targetOfficeId == null
+        || targetOfficeId == ""
+        || officeMatches(targetOfficeId);
+    }
+
     /** -------------------------
      * USERS
      * /users/{uid}
@@ -245,12 +296,12 @@ service cloud.firestore {
         && (!("isActive" in request.resource.data) || request.resource.data.isActive == true);
 
       allow read: if signedInUser() && isOwner(uid);
-      allow read: if signedInUser() && tokenRole() in ["super_admin", "superAdmin", "superadmin", "admin", "SUPER_ADMIN", "SUPERADMIN"];
+      allow read: if signedInUser() && isSuperAdmin();
       allow read: if signedInUser()
-        && tokenRole() in ["office_admin", "officeAdmin", "officeadmin", "OFFICE_ADMIN"]
-        && tokenOfficeId() != null
-        && resource.data.officeId == tokenOfficeId()
-        && resource.data.role in ["resident", "moderator", "office_admin"];
+        && isOfficeAdmin()
+        && officeId() != null
+        && resource.data.officeId == officeId()
+        && resource.data.role in ["resident", "moderator", "admin", "office_admin"];
 
       allow update: if activeUser() && (
         (
@@ -262,7 +313,7 @@ service cloud.firestore {
           isSuperAdmin()
           && (resource.data.role != "super_admin" || request.resource.data.role == "super_admin")
           && (
-            request.resource.data.role in ["office_admin", "moderator"]
+            request.resource.data.role in ["admin", "office_admin", "moderator"]
               ? (request.resource.data.officeId != null && request.resource.data.officeId != "")
               : true
           )
@@ -339,9 +390,7 @@ service cloud.firestore {
       // Update:
       // - Resident can edit ONLY their own report content BEFORE it is handled
       //   and CANNOT change workflow fields (status/assignedToUid/createdByUid)
-      // - SuperAdmin can update any
-      // - Office admin can update within office scope
-      // - Assigned moderator can update status only
+      // - Staff workflow updates are enforced through callable functions (server-side).
       allow update: if activeUser() && (
         (
           resource.data.createdByUid == request.auth.uid
@@ -364,29 +413,6 @@ service cloud.firestore {
               "archivedByName",
               "archivedByRole"
             ])
-        )
-        || isSuperAdmin()
-        || (
-          isOfficeAdmin()
-          && officeAllowed(resource.data)
-          && request.resource.data.officeId == resource.data.officeId
-        )
-        || (
-          isModerator()
-          && resource.data.assignedToUid == request.auth.uid
-          && request.resource.data.diff(resource.data).changedKeys()
-            .hasOnly([
-              "status",
-              "updatedAt",
-              "lastActionByUid",
-              "lastActionByEmail",
-              "lastActionByName",
-              "lastActionByRole",
-              "lastActionAt"
-            ])
-          && request.resource.data.lastActionByUid == request.auth.uid
-          && request.resource.data.lastActionByRole == roleRaw()
-          && request.resource.data.lastActionByEmail == request.auth.token.email
         )
       );
 
@@ -527,17 +553,41 @@ service cloud.firestore {
       allow read: if resource.data.status == "published"
         || (signedInUser() && isStaff());
 
-      allow create: if activeUser() && isStaff()
-        && request.resource.data.createdByUid == request.auth.uid
-        && request.resource.data.status in ["draft", "published"];
-
-      allow update, delete: if activeUser() && isStaff();
+      allow create, update, delete: if false;
 
       match /views/{viewerUid} {
         allow read: if signedInUser() && (isOwner(viewerUid) || isSuperAdmin());
         allow create, update: if signedInUser() && request.auth.uid == viewerUid;
         allow delete: if false;
       }
+    }
+
+    /** -------------------------
+     * POSTS
+     * /posts/{postId}
+     * ------------------------- */
+    match /posts/{postId} {
+      allow read: if resource.data.status == "published"
+        || (signedInUser() && isStaff());
+
+      allow create: if activeUser() && isStaff()
+        && request.resource.data.type in ["announcement", "news"]
+        && canWritePublishedState(request.resource.data.status)
+        && postOfficeAllowed(request.resource.data.officeId)
+        && (
+          isSuperAdmin()
+          || request.resource.data.createdByUid == request.auth.uid
+        );
+
+      allow update, delete: if activeUser() && isStaff()
+        && request.resource.data.type in ["announcement", "news"]
+        && canWritePublishedState(request.resource.data.status)
+        && postOfficeAllowed(request.resource.data.officeId)
+        && (
+          isSuperAdmin()
+          || (isOfficeAdmin() && postOfficeAllowed(resource.data.officeId))
+          || request.resource.data.createdByUid == resource.data.createdByUid
+        );
     }
 
     /** -------------------------
