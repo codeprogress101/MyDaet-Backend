@@ -1,73 +1,146 @@
-# MyDaet Backend
+# MyDaet Backend (Firestore Primary)
 
-Firestore is the source of truth for app + website.  
-MySQL mirror is disabled for now (Firestore-only mode).
+Firebase project: `mydaet`  
+Primary region: `us-central1`
 
-## Environment Variables
+Firestore is the source of truth for web + app.  
+MySQL mirror is currently disabled.
 
-Set in Cloud Functions runtime:
+## Setup
 
-- Firebase default runtime variables only.
-
-MySQL-related variables are not required while mirror mode is disabled.
-
-## Deploy
+1. Install dependencies:
 
 ```bash
 cd C:\Users\ADMIN\MyDaet-Backend\mydaet-backend\functions
 npm install
+```
+
+2. Build functions:
+
+```bash
 npm run build
+```
+
+3. Select Firebase project:
+
+```bash
 cd ..
+firebase use mydaet
+```
+
+## Deploy
+
+Deploy rules first, then functions:
+
+```bash
+firebase deploy --only firestore:rules,storage
+firebase deploy --only functions
+```
+
+One-shot deploy (optional):
+
+```bash
 firebase deploy --only functions,firestore:rules,storage
 ```
 
-## Office Constants
+## Runtime Environment
 
-- `SANGGUNIANG_BAYAN`
-- `OFFICE_OF_THE_MAYOR`
-- Plus office IDs defined in `offices/{officeId}`
+No secrets are stored in source control.
 
-## Role Matrix
+Optional runtime config:
 
-- `resident`: public/report submitter; no staff admin actions
-- `moderator`: draft/edit scoped records, report status updates when assigned, DTS operations in scope
-- `admin`: office-scoped publishing, assignment, tracking PIN reset, audit visibility in-office
-- `super_admin`: global access including user management
+- `TRACK_LOOKUP_ALLOWED_ORIGINS`  
+  Comma-separated allowlist for HTTP `trackLookup` CORS.  
+  If empty, the endpoint allows all origins.
 
-Legacy `office_admin` is normalized to `admin` server-side.
+## Role + Claims Model
+
+Custom claims and `users/{uid}` profile must stay aligned.
+
+Roles:
+
+- `resident`
+- `moderator`
+- `admin`
+- `super_admin`
+
+Legacy `office_admin` is normalized as `admin`.
+
+After changing role/office claims:
+
+1. Update claims (Admin SDK / staff tools).
+2. Re-save matching profile fields in `users/{uid}`.
+3. User must sign out/sign in to refresh ID token claims.
+
+## Access Matrix (Summary)
+
+- Public:
+  - Read only published `posts`, `public_docs`, `jobs`
+  - No write access
+- Staff (`moderator`, `admin`, `super_admin`):
+  - Office-scoped writes based on rules + callable checks
+- Residents:
+  - No direct read access to DTS tracking documents
+  - Tracking lookup only through server function + PIN
 
 ## Tracking SOP (Public vs Internal)
 
-Public tracking output only includes:
+Public tracking response fields:
 
 - `trackingNumber`
-- `title` (suppressed for confidential records)
+- `title` (may be suppressed for confidential docs)
 - `status`
 - `currentOfficeName`
 - `updatedAt`
-- timeline: `timestamp`, `actionType`, `officeName`, `notePublic`
+- `timeline[]` with:
+  - `timestamp`
+  - `actionType`
+  - `officeName`
+  - `notePublic`
 
-Never exposed:
+Never exposed by public lookup:
 
 - `pinHash` / `publicPinHash`
 - internal notes
 - actor emails
-- submitter PII (unless explicitly approved)
+- submitter PII
 
-## MySQL Mirror
+## Troubleshooting
 
-Mirror jobs are currently disabled by request.  
-No Firestore->MySQL sync triggers are active in the deployed source.
+### Permission denied
 
-## Tests
+Check all of the following:
+
+1. User has correct claim role and active status.
+2. User profile in `users/{uid}` has matching `role`, `officeId`, `officeName`.
+3. User has refreshed token after claim changes (re-login).
+4. Action is office-scoped correctly (docs/jobs/posts/report workflows).
+
+### Wrong region / callable not found
+
+Use `us-central1` in all clients:
+
+- React `VITE_FIREBASE_FUNCTIONS_REGION=us-central1`
+- Direct function URLs should include `/us-central1/`
+
+### Missing env (web)
+
+If web shows Firebase config missing:
+
+1. Fill required `VITE_FIREBASE_*` values.
+2. Restart local dev server after `.env` changes.
+
+## Emulator / Rules Checks
+
+Rules compile test:
 
 ```bash
 cd C:\Users\ADMIN\MyDaet-Backend\mydaet-backend\functions
 npm run test:rules
 ```
 
-Coverage includes:
+Functions build test:
 
-- report read access by role
-- audit log write denial from client
-- user self-update constraints
+```bash
+npm run build
+```

@@ -185,23 +185,36 @@ service firebase.storage {
       return activeUser() && (
         isSuperAdmin()
         || dtsOfficeAllowed(docId)
-        || dtsDoc(docId).data.submittedByUid == request.auth.uid
       );
     }
 
+    function validImageUpload(maxMb) {
+      return request.resource != null
+        && request.resource.size < maxMb * 1024 * 1024
+        && request.resource.contentType != null
+        && request.resource.contentType.matches("image/.*");
+    }
+
+    function validPdfUpload(maxMb) {
+      return request.resource != null
+        && request.resource.size < maxMb * 1024 * 1024
+        && request.resource.contentType != null
+        && request.resource.contentType.matches("application/pdf.*");
+    }
+
     match /ads/{adId}/{fileName} {
-      allow read: if activeUser();
-      allow write: if activeUser() && isStaff();
+      allow read: if true;
+      allow write: if activeUser() && isStaff() && validImageUpload(10);
     }
 
     match /announcements/{announcementId}/{fileName} {
-      allow read: if activeUser();
+      allow read: if true;
       allow write: if false;
     }
 
     match /posts/{postId}/{fileName} {
-      allow read: if activeUser();
-      allow write: if activeUser() && isStaff();
+      allow read: if true;
+      allow write: if activeUser() && isStaff() && validImageUpload(10);
     }
 
     match /public_docs/{docType}/pdf/{filePath=**} {
@@ -209,10 +222,7 @@ service firebase.storage {
       allow write: if activeUser()
         && isStaff()
         && docType in ["ordinance", "resolution", "executive_order", "public_hearing", "generic"]
-        && request.resource != null
-        && request.resource.size < 25 * 1024 * 1024
-        && request.resource.contentType != null
-        && request.resource.contentType.matches("application/pdf.*");
+        && validPdfUpload(25);
     }
 
     match /reports/{uid}/{reportId}/{fileName} {
@@ -229,12 +239,14 @@ service firebase.storage {
 
     match /dts/{docId}/cover/{fileName} {
       allow read: if canReadDts(docId);
-      allow write: if activeUser() && isStaff() && dtsOfficeAllowed(docId);
+      allow write: if activeUser() && isStaff() && dtsOfficeAllowed(docId) && validImageUpload(10);
     }
 
     match /dts/{docId}/attachments/{fileName} {
       allow read: if canReadDts(docId);
-      allow write: if activeUser() && isStaff() && dtsOfficeAllowed(docId);
+      allow write: if activeUser() && isStaff() && dtsOfficeAllowed(docId)
+        && request.resource != null
+        && request.resource.size < 25 * 1024 * 1024;
     }
 
     match /dts_qr_codes/{fileName} {

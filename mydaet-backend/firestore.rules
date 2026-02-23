@@ -13,18 +13,6 @@ service cloud.firestore {
       return signedIn();
     }
 
-    function tokenRole() {
-      return (request.auth != null && request.auth.token.role != null)
-        ? request.auth.token.role
-        : null;
-    }
-
-    function tokenOfficeId() {
-      return (request.auth != null && request.auth.token.officeId != null)
-        ? request.auth.token.officeId
-        : null;
-    }
-
     function userDoc() {
       return get(/databases/$(database)/documents/users/$(request.auth.uid));
     }
@@ -215,7 +203,6 @@ service cloud.firestore {
         isSuperAdmin()
         || isSuperAdminByDoc()
         || dtsOfficeAllowed(data)
-        || (isResident() && data.submittedByUid == request.auth.uid)
       );
     }
 
@@ -229,6 +216,10 @@ service cloud.firestore {
 
     function validLifecycleStatus(statusValue) {
       return statusValue in ["draft", "published", "archived"];
+    }
+
+    function isPublishedStatus(statusValue) {
+      return statusValue in ["published", "Published", "PUBLISHED"];
     }
 
     function canWritePublishedState(statusValue) {
@@ -281,6 +272,69 @@ service cloud.firestore {
       return targetOfficeId == null
         || targetOfficeId == ""
         || officeMatches(targetOfficeId);
+    }
+
+    function validPostShape(data) {
+      return data.keys().hasAll([
+        "type",
+        "title",
+        "body",
+        "status",
+        "createdByUid",
+        "createdAt",
+        "updatedAt"
+      ])
+      && data.type in ["announcement", "news"]
+      && hasNonEmptyString(data, "title")
+      && hasNonEmptyString(data, "body")
+      && data.createdByUid is string
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp
+      && validLifecycleStatus(data.status);
+    }
+
+    function validPublicDocShape(data) {
+      return data.keys().hasAll([
+        "docType",
+        "docNo",
+        "title",
+        "summary",
+        "officeId",
+        "status",
+        "createdByUid",
+        "createdAt",
+        "updatedAt"
+      ])
+      && data.docType in ["ordinance", "resolution", "executive_order", "public_hearing"]
+      && hasNonEmptyString(data, "docNo")
+      && hasNonEmptyString(data, "title")
+      && data.summary is string
+      && hasNonEmptyString(data, "officeId")
+      && data.createdByUid is string
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp
+      && validLifecycleStatus(data.status);
+    }
+
+    function validJobShape(data) {
+      return data.keys().hasAll([
+        "title",
+        "officeId",
+        "employmentType",
+        "description",
+        "status",
+        "createdByUid",
+        "createdAt",
+        "updatedAt"
+      ])
+      && hasNonEmptyString(data, "title")
+      && hasNonEmptyString(data, "officeId")
+      && hasNonEmptyString(data, "employmentType")
+      && hasNonEmptyString(data, "description")
+      && data.createdByUid is string
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp
+      && validLifecycleStatus(data.status);
     }
 
     /** -------------------------
@@ -550,7 +604,7 @@ service cloud.firestore {
      * /announcements/{announcementId}
      * ------------------------- */
     match /announcements/{announcementId} {
-      allow read: if resource.data.status == "published"
+      allow read: if isPublishedStatus(resource.data.status)
         || (signedInUser() && isStaff());
 
       allow create, update, delete: if false;
@@ -567,11 +621,11 @@ service cloud.firestore {
      * /posts/{postId}
      * ------------------------- */
     match /posts/{postId} {
-      allow read: if resource.data.status == "published"
+      allow read: if isPublishedStatus(resource.data.status)
         || (signedInUser() && isStaff());
 
       allow create: if activeUser() && isStaff()
-        && request.resource.data.type in ["announcement", "news"]
+        && validPostShape(request.resource.data)
         && canWritePublishedState(request.resource.data.status)
         && postOfficeAllowed(request.resource.data.officeId)
         && (
@@ -580,7 +634,7 @@ service cloud.firestore {
         );
 
       allow update, delete: if activeUser() && isStaff()
-        && request.resource.data.type in ["announcement", "news"]
+        && validPostShape(request.resource.data)
         && canWritePublishedState(request.resource.data.status)
         && postOfficeAllowed(request.resource.data.officeId)
         && (
@@ -595,19 +649,19 @@ service cloud.firestore {
      * /public_docs/{docId}
      * ------------------------- */
     match /public_docs/{docId} {
-      allow read: if resource.data.status == "published"
+      allow read: if isPublishedStatus(resource.data.status)
         || (signedInUser() && isStaff());
 
       allow create: if activeUser()
         && isStaff()
-        && request.resource.data.docType in ["ordinance", "resolution", "executive_order", "public_hearing"]
+        && validPublicDocShape(request.resource.data)
         && canWritePublishedState(request.resource.data.status)
         && docTypeOfficeAllowed(request.resource.data.docType, request.resource.data.officeId)
         && request.resource.data.createdByUid == request.auth.uid;
 
       allow update: if activeUser()
         && isStaff()
-        && request.resource.data.docType in ["ordinance", "resolution", "executive_order", "public_hearing"]
+        && validPublicDocShape(request.resource.data)
         && canWritePublishedState(request.resource.data.status)
         && docTypeOfficeAllowed(request.resource.data.docType, request.resource.data.officeId)
         && request.resource.data.createdByUid == resource.data.createdByUid;
@@ -620,17 +674,19 @@ service cloud.firestore {
      * /jobs/{jobId}
      * ------------------------- */
     match /jobs/{jobId} {
-      allow read: if resource.data.status == "published"
+      allow read: if isPublishedStatus(resource.data.status)
         || (signedInUser() && isStaff());
 
       allow create: if activeUser()
         && (isSuperAdmin() || isOfficeAdmin())
+        && validJobShape(request.resource.data)
         && canWritePublishedState(request.resource.data.status)
         && jobOfficeAllowed(request.resource.data.officeId)
         && request.resource.data.createdByUid == request.auth.uid;
 
       allow update: if activeUser()
         && (isSuperAdmin() || isOfficeAdmin())
+        && validJobShape(request.resource.data)
         && canWritePublishedState(request.resource.data.status)
         && jobOfficeAllowed(request.resource.data.officeId)
         && request.resource.data.createdByUid == resource.data.createdByUid;

@@ -13,6 +13,16 @@ import {
 
 admin.initializeApp();
 const db = admin.firestore();
+const REGION = "us-central1";
+const regionalFunctions = functions.region(REGION);
+const TRACKING_NO_REGEX = /^[A-Z0-9][A-Z0-9._-]{3,63}$/;
+const TRACKING_PIN_REGEX = /^[A-Za-z0-9@#$%^&*()_+\-=]{4,32}$/;
+const TRACK_LOOKUP_ALLOWED_ORIGINS = String(process.env.TRACK_LOOKUP_ALLOWED_ORIGINS ?? "")
+  .split(",")
+  .map((value) => value.trim())
+  .filter((value) => value.length > 0);
+const POST_COLLECTIONS = ["posts", "announcements"] as const;
+const PUBLISHED_STATUS_VARIANTS = ["published", "Published", "PUBLISHED"] as const;
 
 /**
  * Role definitions
@@ -643,6 +653,64 @@ type TrackingLookupContext = {
   rawRequest?: { ip?: string | null } | null;
 };
 
+function normalizeTrackingNo(raw: unknown): string {
+  return String(raw ?? "").trim().toUpperCase();
+}
+
+function normalizeTrackingPin(raw: unknown): string {
+  return String(raw ?? "").trim();
+}
+
+function validateTrackingLookupInput(
+  trackingNoRaw: unknown,
+  pinRaw: unknown
+): {trackingNo: string; pin: string} {
+  const trackingNo = normalizeTrackingNo(trackingNoRaw);
+  const pin = normalizeTrackingPin(pinRaw);
+  if (!trackingNo || !pin) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "trackingNo and pin are required."
+    );
+  }
+  if (!TRACKING_NO_REGEX.test(trackingNo)) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "Invalid tracking number format."
+    );
+  }
+  if (!TRACKING_PIN_REGEX.test(pin)) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "Invalid PIN format."
+    );
+  }
+  return {trackingNo, pin};
+}
+
+function isAllowedCorsOrigin(origin: string): boolean {
+  if (TRACK_LOOKUP_ALLOWED_ORIGINS.length === 0) return true;
+  return TRACK_LOOKUP_ALLOWED_ORIGINS.includes(origin);
+}
+
+function applyTrackLookupCors(
+  req: functions.https.Request,
+  res: functions.Response<unknown>
+): boolean {
+  const origin = String(req.headers.origin ?? "").trim();
+  if (!origin) {
+    res.set("Access-Control-Allow-Origin", "*");
+  } else if (isAllowedCorsOrigin(origin)) {
+    res.set("Access-Control-Allow-Origin", origin);
+    res.set("Vary", "Origin");
+  } else {
+    return false;
+  }
+  res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+  return true;
+}
+
 function legacyPinHashFromDoc(pin: string, data: Record<string, unknown>): string {
   const salt = coerceString(data.publicPinSalt);
   return salt ? sha256(`${pin}:${salt}`) : sha256(pin);
@@ -805,7 +873,7 @@ function buildSanitizedTrackingResult(
 function sanitizeTrackingTimelineEntry(
   row: Record<string, unknown>
 ): Record<string, unknown> | null {
-  const notePublic = coerceString(row.notePublic) ?? coerceString(row.notes);
+  const notePublic = coerceString(row.notePublic);
   const actionType = coerceString(row.actionType) ?? coerceString(row.type) ?? "Update";
   const officeName =
     coerceString(row.officeName) ??
@@ -1054,7 +1122,6 @@ async function bestCount(candidates: FirebaseFirestore.Query[]): Promise<number>
 export const adminDashboardSummary = functions.https.onCall(async (_data, context) => {
   const actor = await requireStaffContext(context);
 
-  const postsRef = db.collection("posts");
   const reportsRef = db.collection("reports");
   const dtsRef = db.collection("dts_documents");
   const usersRef = db.collection("users");
@@ -1063,16 +1130,22 @@ export const adminDashboardSummary = functions.https.onCall(async (_data, contex
   const scopedOfficeId = coerceString(actor.officeId);
 
   let announcementsCount = 0;
-  if (isSuperAdmin) {
-    announcementsCount = await queryCount(postsRef);
-  } else {
+  for (const collectionName of POST_COLLECTIONS) {
+    const postsRef = db.collection(collectionName);
+    if (isSuperAdmin) {
+      announcementsCount += await queryCount(postsRef);
+      continue;
+    }
+
     const postCandidates: FirebaseFirestore.Query[] = [];
     if (scopedOfficeId) {
       postCandidates.push(postsRef.where("officeId", "==", scopedOfficeId));
     }
     postCandidates.push(postsRef.where("createdByUid", "==", actor.uid));
-    postCandidates.push(postsRef.where("status", "==", "published"));
-    announcementsCount = await bestCount(postCandidates);
+    for (const statusValue of PUBLISHED_STATUS_VARIANTS) {
+      postCandidates.push(postsRef.where("status", "==", statusValue));
+    }
+    announcementsCount += await bestCount(postCandidates);
   }
 
   let reportsCount = 0;
@@ -1118,7 +1191,7 @@ export const adminDashboardSummary = functions.https.onCall(async (_data, contex
       users: usersCount,
     },
     notes: {
-      announcementsSource: "posts",
+      announcementsSource: POST_COLLECTIONS.join("+"),
     },
   };
 });
@@ -1316,11 +1389,11 @@ async function adminWriteAuditLogHandler(
   return {success: true};
 }
 
-export const adminWriteAuditLog = functions.https.onCall((data, context) =>
+export const adminWriteAuditLog = regionalFunctions.https.onCall((data, context) =>
   adminWriteAuditLogHandler(data, context as CallableContextLike)
 );
 
-export const adminWriteAuditLogV2 = onCallV2({region: "us-central1"}, async (request) => {
+export const adminWriteAuditLogV2 = onCallV2({region: REGION}, async (request) => {
   try {
     return await adminWriteAuditLogHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -1404,11 +1477,11 @@ async function adminUpdateReportStatusHandler(
   return {success: true, reportId, status: nextStatus};
 }
 
-export const adminUpdateReportStatus = functions.https.onCall((data, context) =>
+export const adminUpdateReportStatus = regionalFunctions.https.onCall((data, context) =>
   adminUpdateReportStatusHandler(data, context as CallableContextLike)
 );
 
-export const adminUpdateReportStatusV2 = onCallV2({region: "us-central1"}, async (request) => {
+export const adminUpdateReportStatusV2 = onCallV2({region: REGION}, async (request) => {
   try {
     return await adminUpdateReportStatusHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -1523,11 +1596,11 @@ async function adminAssignReportHandler(
   };
 }
 
-export const adminAssignReport = functions.https.onCall((data, context) =>
+export const adminAssignReport = regionalFunctions.https.onCall((data, context) =>
   adminAssignReportHandler(data, context as CallableContextLike)
 );
 
-export const adminAssignReportV2 = onCallV2({region: "us-central1"}, async (request) => {
+export const adminAssignReportV2 = onCallV2({region: REGION}, async (request) => {
   try {
     return await adminAssignReportHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -3146,11 +3219,11 @@ async function dtsCreateTrackingRecordHandler(
   return {success: true, id: docRef.id, trackingNo};
 }
 
-export const dtsCreateTrackingRecord = functions.https.onCall((data, context) =>
+export const dtsCreateTrackingRecord = regionalFunctions.https.onCall((data, context) =>
   dtsCreateTrackingRecordHandler(data, context as CallableContextLike)
 );
 
-export const dtsCreateTrackingRecordV2 = onCallV2({region: "us-central1"}, async (request) => {
+export const dtsCreateTrackingRecordV2 = onCallV2({region: REGION}, async (request) => {
   try {
     return await dtsCreateTrackingRecordHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -3839,11 +3912,11 @@ async function setTrackingPinHandler(
   return {success: true};
 }
 
-export const setTrackingPin = functions.https.onCall((data, context) =>
+export const setTrackingPin = regionalFunctions.https.onCall((data, context) =>
   setTrackingPinHandler(data, context as CallableContextLike)
 );
 
-export const setTrackingPinV2 = onCallV2({region: "us-central1"}, async (request) => {
+export const setTrackingPinV2 = onCallV2({region: REGION}, async (request) => {
   try {
     return await setTrackingPinHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -3886,18 +3959,13 @@ async function lookupDtsByTrackingNo(
   };
 }
 
-export const dtsTrackByTrackingNo = functions.https.onCall(
+export const dtsTrackByTrackingNo = regionalFunctions.https.onCall(
   async (data, context) => {
-    const trackingNo = coerceString(data?.trackingNo) ?? coerceString(data?.trackingNumber);
-    const pin = coerceString(data?.pin);
-
-    if (!trackingNo || !pin) {
-      throw new functions.https.HttpsError(
-        "invalid-argument",
-        "trackingNo and pin are required."
-      );
-    }
-
+    const {trackingNo, pin} = validateTrackingLookupInput(
+      (data as Record<string, unknown> | undefined)?.trackingNo ??
+      (data as Record<string, unknown> | undefined)?.trackingNumber,
+      (data as Record<string, unknown> | undefined)?.pin
+    );
     return lookupDtsByTrackingNo(trackingNo, pin, context);
   }
 );
@@ -3906,9 +3974,18 @@ async function handleTrackLookupHttpRequest(
   req: functions.https.Request,
   res: functions.Response<unknown>
 ) {
-  res.set("Access-Control-Allow-Origin", "*");
-  res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+  const corsAllowed = applyTrackLookupCors(req, res);
+  if (!corsAllowed) {
+    functions.logger.warn("trackLookup blocked by CORS policy.", {
+      code: "cors-blocked",
+      origin: String(req.headers.origin ?? ""),
+      ipHash: contextIpHash({rawRequest: req}),
+      region: REGION,
+    });
+    res.status(403).json({error: "Origin not allowed.", code: "permission-denied"});
+    return;
+  }
+
   if (req.method === "OPTIONS") {
     res.status(204).send("");
     return;
@@ -3918,15 +3995,12 @@ async function handleTrackLookupHttpRequest(
     return;
   }
 
-  const trackingNumber = coerceString(req.body?.trackingNumber);
-  const pin = coerceString(req.body?.pin);
-  if (!trackingNumber || !pin) {
-    res.status(400).json({ error: "trackingNumber and pin are required." });
-    return;
-  }
-
   try {
-    const payload = await lookupDtsByTrackingNo(trackingNumber, pin, {
+    const {trackingNo, pin} = validateTrackingLookupInput(
+      req.body?.trackingNumber ?? req.body?.trackingNo,
+      req.body?.pin
+    );
+    const payload = await lookupDtsByTrackingNo(trackingNo, pin, {
       auth: null,
       rawRequest: req,
     });
@@ -3940,12 +4014,18 @@ async function handleTrackLookupHttpRequest(
       code === "not-found" ? 404 :
       code === "resource-exhausted" ? 429 :
       code === "permission-denied" ? 403 : 500;
+    functions.logger.warn("trackLookup request failed.", {
+      code,
+      statusCode,
+      ipHash: contextIpHash({rawRequest: req}),
+      region: REGION,
+    });
     res.status(statusCode).json({ error: message, code });
   }
 }
 
-export const trackLookup = functions.https.onRequest(handleTrackLookupHttpRequest);
-export const trackLookupV2 = onRequestV2({region: "us-central1"}, handleTrackLookupHttpRequest);
+export const trackLookup = regionalFunctions.https.onRequest(handleTrackLookupHttpRequest);
+export const trackLookupV2 = onRequestV2({region: REGION}, handleTrackLookupHttpRequest);
 
 /**
  * =========================
@@ -3956,11 +4036,17 @@ export const trackLookupV2 = onRequestV2({region: "us-central1"}, handleTrackLoo
 export const dtsTrackByQrAndPin = functions.https.onCall(
   async (data, context) => {
     const qrCode = coerceString(data?.qrCode);
-    const pin = coerceString(data?.pin);
+    const pin = normalizeTrackingPin(data?.pin);
     if (!qrCode || !pin) {
       throw new functions.https.HttpsError(
         "invalid-argument",
         "qrCode and pin are required."
+      );
+    }
+    if (!TRACKING_PIN_REGEX.test(pin)) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "Invalid PIN format."
       );
     }
 
@@ -4381,3 +4467,9 @@ export const exportDtsQrZip = functions.https.onCall(
  * MySQL mirror is intentionally disabled for now.
  * Firestore remains the sole active datastore for app + website.
  */
+export const retryMysqlMirrorQueue = regionalFunctions.pubsub
+  .schedule("every 5 minutes")
+  .onRun(async () => {
+    functions.logger.info("retryMysqlMirrorQueue noop: MySQL mirror is disabled.");
+    return null;
+  });
