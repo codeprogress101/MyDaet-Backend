@@ -23,6 +23,18 @@ const TRACK_LOOKUP_ALLOWED_ORIGINS = String(process.env.TRACK_LOOKUP_ALLOWED_ORI
   .filter((value) => value.length > 0);
 const POST_COLLECTIONS = ["posts", "announcements"] as const;
 const PUBLISHED_STATUS_VARIANTS = ["published", "Published", "PUBLISHED"] as const;
+const SYSTEM_SETTINGS_FEATURE_KEYS = [
+  "tourism",
+  "announcements",
+  "news",
+  "jobs",
+  "directory",
+  "documentTracking",
+  "reports",
+  "transparency",
+] as const;
+type SystemFeatureKey = typeof SYSTEM_SETTINGS_FEATURE_KEYS[number];
+type SystemFeatureFlags = Record<SystemFeatureKey, boolean>;
 
 /**
  * Role definitions
@@ -299,6 +311,143 @@ async function addAuditLog(entry: Record<string, unknown>): Promise<void> {
     ...entry,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
   });
+}
+
+function defaultSystemFeatureFlags(enabled: boolean): SystemFeatureFlags {
+  return SYSTEM_SETTINGS_FEATURE_KEYS.reduce((acc, key) => {
+    acc[key] = enabled;
+    return acc;
+  }, {} as SystemFeatureFlags);
+}
+
+function normalizeSystemFeatureFlags(
+  raw: unknown,
+  fallbackEnabled: boolean
+): SystemFeatureFlags {
+  const base = defaultSystemFeatureFlags(fallbackEnabled);
+  if (!raw || typeof raw !== "object") {
+    return base;
+  }
+
+  const source = raw as Record<string, unknown>;
+  for (const key of SYSTEM_SETTINGS_FEATURE_KEYS) {
+    if (key in source) {
+      base[key] = Boolean(source[key]);
+    }
+  }
+
+  return base;
+}
+
+type SystemSettingsShape = {
+  maintenance: {
+    enabled: boolean;
+    message: string;
+  };
+  readOnly: boolean;
+  features: SystemFeatureFlags;
+};
+
+function normalizeStoredSystemSettings(
+  raw: unknown,
+  fallbackEnabled: boolean
+): SystemSettingsShape {
+  const source = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const maintenanceRaw =
+    source.maintenance && typeof source.maintenance === "object"
+      ? (source.maintenance as Record<string, unknown>)
+      : {};
+  return {
+    maintenance: {
+      enabled: Boolean(maintenanceRaw.enabled),
+      message: String(maintenanceRaw.message ?? ""),
+    },
+    readOnly: Boolean(source.readOnly),
+    features: normalizeSystemFeatureFlags(source.features, fallbackEnabled),
+  };
+}
+
+function systemSettingsMergePatch(
+  current: SystemSettingsShape,
+  rawPatch: unknown
+): SystemSettingsShape {
+  const patch = rawPatch && typeof rawPatch === "object"
+    ? (rawPatch as Record<string, unknown>)
+    : {};
+  const maintenancePatch =
+    patch.maintenance && typeof patch.maintenance === "object"
+      ? (patch.maintenance as Record<string, unknown>)
+      : {};
+  const featuresPatch =
+    patch.features && typeof patch.features === "object"
+      ? (patch.features as Record<string, unknown>)
+      : {};
+
+  const nextFeatures = {
+    ...current.features,
+  };
+  for (const key of SYSTEM_SETTINGS_FEATURE_KEYS) {
+    if (key in featuresPatch) {
+      nextFeatures[key] = Boolean(featuresPatch[key]);
+    }
+  }
+
+  return {
+    maintenance: {
+      enabled:
+        typeof maintenancePatch.enabled === "boolean"
+          ? maintenancePatch.enabled
+          : current.maintenance.enabled,
+      message:
+        typeof maintenancePatch.message === "string"
+          ? maintenancePatch.message.trim()
+          : current.maintenance.message,
+    },
+    readOnly: typeof patch.readOnly === "boolean" ? patch.readOnly : current.readOnly,
+    features: nextFeatures,
+  };
+}
+
+async function addDualSettingsAuditLog(entry: Record<string, unknown>): Promise<void> {
+  const base = {
+    ...entry,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+
+  await Promise.all([
+    db.collection("auditLogs").add(base),
+    db.collection("audit_logs").add(base),
+  ]);
+}
+
+async function getEffectiveSystemSettings(): Promise<SystemSettingsShape> {
+  const snapshot = await db.collection("system").doc("settings").get();
+  if (!snapshot.exists) {
+    return normalizeStoredSystemSettings(null, true);
+  }
+  return normalizeStoredSystemSettings(snapshot.data(), true);
+}
+
+async function requireFeatureEnabled(featureKey: SystemFeatureKey): Promise<SystemSettingsShape> {
+  const settings = await getEffectiveSystemSettings();
+  if (!settings.features[featureKey]) {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      `${featureKey} feature is currently disabled by Command Center.`
+    );
+  }
+  return settings;
+}
+
+async function requireFeatureWritable(featureKey: SystemFeatureKey): Promise<SystemSettingsShape> {
+  const settings = await requireFeatureEnabled(featureKey);
+  if (settings.readOnly) {
+    throw new functions.https.HttpsError(
+      "failed-precondition",
+      "System is in read-only mode. Feature write operations are temporarily blocked."
+    );
+  }
+  return settings;
 }
 
 function announcementActor(data: Record<string, unknown> | null) {
@@ -1032,7 +1181,14 @@ function formatEventTime(date: Date): string {
 export const onAuthUserCreated = functions.auth.user().onCreate(async (user) => {
   const uid = user.uid;
 
-  await db.collection("users").doc(uid).set(
+  const ref = db.collection("users").doc(uid);
+  const snapshot = await ref.get();
+  if (snapshot.exists && snapshot.data()?.role) {
+    // avoid overwriting role/office when already provisioned via admin flow
+    return;
+  }
+
+  await ref.set(
     {
       uid,
       email: user.email ?? null,
@@ -1211,6 +1367,7 @@ async function mergeQueryDocs(
 
 export const adminListReportsScoped = functions.https.onCall(async (data, context) => {
   const actor = await requireStaffContext(context);
+  await requireFeatureEnabled("reports");
   const rawLimit = typeof data?.limit === "number" ? Math.floor(data.limit) : 250;
   const listLimit = Math.max(20, Math.min(500, rawLimit));
 
@@ -1254,6 +1411,7 @@ export const adminListReportsScoped = functions.https.onCall(async (data, contex
 
 export const adminListReportAssignees = functions.https.onCall(async (_data, context) => {
   const actor = await requireStaffContext(context);
+  await requireFeatureEnabled("reports");
 
   const usersRef = db.collection("users");
   let usersQuery: FirebaseFirestore.Query;
@@ -1347,6 +1505,20 @@ function normalizeReportStatusInput(raw: unknown): string {
   return normalized;
 }
 
+function isQueueEligibleReport(row: Record<string, unknown>): boolean {
+  const assignedToUid = coerceString(row.assignedToUid);
+  if (assignedToUid) {
+    return false;
+  }
+  let status = "submitted";
+  try {
+    status = normalizeReportStatusInput(row.status ?? "submitted");
+  } catch {
+    return false;
+  }
+  return status === "submitted" || status === "in_review";
+}
+
 async function adminWriteAuditLogHandler(
   data: unknown,
   context: CallableContextLike
@@ -1401,6 +1573,111 @@ export const adminWriteAuditLogV2 = onCallV2({region: REGION}, async (request) =
   }
 });
 
+async function adminUpdateSettingsHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const actor = await requireSuperAdminContext(context);
+  const payload = data && typeof data === "object"
+    ? (data as Record<string, unknown>)
+    : {};
+  const patch = payload.settings && typeof payload.settings === "object"
+    ? payload.settings
+    : payload;
+
+  const reason = coerceString(payload.reason);
+  if (reason && reason.length > 500) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "reason must be 500 characters or fewer."
+    );
+  }
+
+  const settingsRef = db.collection("system").doc("settings");
+  const actorName = actorDisplayName(actor);
+  const actorEmail =
+    coerceString(actor.profileData.email) ??
+    coerceString(context.auth?.token.email) ??
+    null;
+
+  let beforeState = normalizeStoredSystemSettings(null, true);
+  let afterState = beforeState;
+
+  await db.runTransaction(async (tx) => {
+    const currentSnapshot = await tx.get(settingsRef);
+    beforeState = currentSnapshot.exists
+      ? normalizeStoredSystemSettings(currentSnapshot.data(), true)
+      : normalizeStoredSystemSettings(null, true);
+    afterState = systemSettingsMergePatch(beforeState, patch);
+
+    tx.set(
+      settingsRef,
+      {
+        maintenance: afterState.maintenance,
+        readOnly: afterState.readOnly,
+        features: afterState.features,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedBy: {
+          uid: actor.uid,
+          role: actor.role,
+          name: actorName,
+          email: actorEmail,
+        },
+      },
+      {merge: true}
+    );
+  });
+
+  const responseUpdatedAt = new Date().toISOString();
+  const responseSettings = {
+    ...afterState,
+    updatedAt: responseUpdatedAt,
+    updatedBy: {
+      uid: actor.uid,
+      role: actor.role,
+      name: actorName,
+      email: actorEmail,
+    },
+  };
+
+  await addDualSettingsAuditLog({
+    action: "system_settings_updated",
+    entityType: "system",
+    entityId: "settings",
+    path: "system/settings",
+    officeId: actor.officeId ?? null,
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorOfficeId: actor.officeId ?? null,
+    actorOfficeName: actor.officeName ?? null,
+    actorName,
+    actorEmail,
+    reason: reason ?? null,
+    before: beforeState,
+    after: responseSettings,
+    message: "System settings updated from Command Center.",
+    timestamp: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  return {
+    success: true,
+    settings: responseSettings,
+    updatedAt: responseUpdatedAt,
+  };
+}
+
+export const adminUpdateSettings = regionalFunctions.https.onCall((data, context) =>
+  adminUpdateSettingsHandler(data, context as CallableContextLike)
+);
+
+export const adminUpdateSettingsV2 = onCallV2({region: REGION}, async (request) => {
+  try {
+    return await adminUpdateSettingsHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
 async function adminUpdateReportStatusHandler(
   data: unknown,
   context: CallableContextLike
@@ -1409,6 +1686,7 @@ async function adminUpdateReportStatusHandler(
     ? (data as Record<string, unknown>)
     : {};
   const actor = await requireStaffContext(context);
+  await requireFeatureWritable("reports");
   const reportId = coerceString(payload.reportId);
   if (!reportId) {
     throw new functions.https.HttpsError("invalid-argument", "reportId is required.");
@@ -1497,6 +1775,7 @@ async function adminAssignReportHandler(
     ? (data as Record<string, unknown>)
     : {};
   const actor = await requireStaffContext(context);
+  await requireFeatureWritable("reports");
   if (!(actor.role === "super_admin" || actor.role === "admin")) {
     throw new functions.https.HttpsError(
       "permission-denied",
@@ -1512,6 +1791,8 @@ async function adminAssignReportHandler(
   const actorMeta = reportActorMeta(actor, context);
 
   let beforeAssignedUid: string | null = null;
+  let beforeStatus = "submitted";
+  let afterStatus = "submitted";
   let assignedToName: string | null = null;
   let assignedOfficeId: string | null = null;
 
@@ -1549,6 +1830,11 @@ async function adminAssignReportHandler(
       );
     }
     beforeAssignedUid = coerceString(row.assignedToUid);
+    beforeStatus = normalizeReportStatusInput(row.status ?? "submitted");
+    const shouldAutoAssignStatus = Boolean(assigneeUid) &&
+      (beforeStatus === "submitted" || beforeStatus === "in_review");
+    const shouldReturnToQueue = !assigneeUid && beforeStatus === "assigned";
+    afterStatus = shouldAutoAssignStatus ? "assigned" : (shouldReturnToQueue ? "in_review" : beforeStatus);
 
     tx.set(
       reportRef,
@@ -1556,16 +1842,24 @@ async function adminAssignReportHandler(
         assignedToUid: assigneeUid ?? null,
         assignedToName: assigneeUid ? assignedToName : null,
         assignedOfficeId: assigneeUid ? assignedOfficeId : null,
+        status: afterStatus,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         ...actorMeta,
       },
       {merge: true}
     );
+    const statusMessage = afterStatus !== beforeStatus
+      ? ` Status changed from ${beforeStatus} to ${afterStatus}.`
+      : "";
     tx.set(reportRef.collection("history").doc(), {
       type: assigneeUid ? "assigned" : "unassigned",
       assignedToUid: assigneeUid ?? null,
       assignedToName: assigneeUid ? assignedToName : null,
-      message: assigneeUid ? `Report assigned to ${assignedToName}.` : "Report unassigned.",
+      fromStatus: beforeStatus,
+      toStatus: afterStatus,
+      message: assigneeUid
+        ? `Report assigned to ${assignedToName}.${statusMessage}`
+        : `Report unassigned.${statusMessage}`,
       byUid: actor.uid,
       byName: actorMeta.lastActionByName,
       byRole: actor.role,
@@ -1583,9 +1877,11 @@ async function adminAssignReportHandler(
     actorRole: actor.role,
     actorOfficeId: actor.officeId ?? null,
     actorName: actorMeta.lastActionByName,
-    before: {assignedToUid: beforeAssignedUid},
-    after: {assignedToUid: assigneeUid ?? null},
-    message: assigneeUid ? `Assigned to ${assignedToName}.` : "Report unassigned.",
+    before: {assignedToUid: beforeAssignedUid, status: beforeStatus},
+    after: {assignedToUid: assigneeUid ?? null, status: afterStatus},
+    message: assigneeUid
+      ? `Assigned to ${assignedToName}.`
+      : "Report unassigned.",
   });
 
   return {
@@ -1593,6 +1889,7 @@ async function adminAssignReportHandler(
     reportId,
     assignedToUid: assigneeUid ?? null,
     assignedToName: assigneeUid ? assignedToName : null,
+    status: afterStatus,
   };
 }
 
@@ -1603,6 +1900,274 @@ export const adminAssignReport = regionalFunctions.https.onCall((data, context) 
 export const adminAssignReportV2 = onCallV2({region: REGION}, async (request) => {
   try {
     return await adminAssignReportHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+async function adminClaimNextReportHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const payload = (data && typeof data === "object")
+    ? (data as Record<string, unknown>)
+    : {};
+  const actor = await requireStaffContext(context);
+  await requireFeatureWritable("reports");
+  if (!(actor.role === "super_admin" || actor.role === "admin")) {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "Only admin and super admin can claim reports from queue."
+    );
+  }
+
+  const requestedOfficeId = coerceString(payload.officeId);
+  const scopeOfficeId = actor.role === "super_admin" ? requestedOfficeId : actor.officeId;
+  if (actor.role !== "super_admin" && !scopeOfficeId) {
+    throw new functions.https.HttpsError(
+      "failed-precondition",
+      "Admin account must have an office assignment."
+    );
+  }
+
+  const queueStatuses = ["submitted", "in_review"];
+  let claimQuery: FirebaseFirestore.Query = db
+    .collection("reports")
+    .where("assignedToUid", "==", null)
+    .where("status", "in", queueStatuses);
+
+  if (scopeOfficeId) {
+    claimQuery = claimQuery.where("officeId", "==", scopeOfficeId);
+  }
+  claimQuery = claimQuery.orderBy("createdAt", "asc").limit(10);
+
+  const candidates = await claimQuery.get();
+  if (candidates.empty) {
+    throw new functions.https.HttpsError("not-found", "No available reports in queue.");
+  }
+
+  const actorMeta = reportActorMeta(actor, context);
+  for (const candidate of candidates.docs) {
+    const claimResult = await db.runTransaction(async (tx) => {
+      const reportRef = db.collection("reports").doc(candidate.id);
+      const snap = await tx.get(reportRef);
+      if (!snap.exists) {
+        return null;
+      }
+
+      const row = (snap.data() ?? {}) as Record<string, unknown>;
+      if (!isQueueEligibleReport(row)) {
+        return null;
+      }
+      if (scopeOfficeId && coerceString(row.officeId) !== scopeOfficeId) {
+        return null;
+      }
+      if (!reportInActorScope(actor, row)) {
+        return null;
+      }
+
+      const previousStatus = normalizeReportStatusInput(row.status ?? "submitted");
+      const beforeAssignedToUid = coerceString(row.assignedToUid);
+      const assignedName = actorDisplayName(actor);
+      const resolvedAssignedOfficeId = actor.officeId ?? coerceString(row.officeId) ?? null;
+
+      tx.set(
+        reportRef,
+        {
+          assignedToUid: actor.uid,
+          assignedToName: assignedName,
+          assignedOfficeId: resolvedAssignedOfficeId,
+          status: "assigned",
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          ...actorMeta,
+        },
+        {merge: true}
+      );
+      tx.set(reportRef.collection("history").doc(), {
+        type: "assigned",
+        fromStatus: previousStatus,
+        toStatus: "assigned",
+        assignedToUid: actor.uid,
+        assignedToName: assignedName,
+        message: "Claimed from queue",
+        byUid: actor.uid,
+        byName: actorMeta.lastActionByName,
+        byRole: actor.role,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      return {
+        reportId: reportRef.id,
+        officeId: coerceString(row.officeId) ?? null,
+        beforeAssignedToUid,
+        beforeStatus: previousStatus,
+      };
+    });
+
+    if (claimResult) {
+      await addAuditLog({
+        action: "report_claimed_from_queue",
+        entityType: "report",
+        entityId: claimResult.reportId,
+        reportId: claimResult.reportId,
+        officeId: claimResult.officeId,
+        actorUid: actor.uid,
+        actorRole: actor.role,
+        actorOfficeId: actor.officeId ?? null,
+        actorName: actorMeta.lastActionByName,
+        before: {
+          assignedToUid: claimResult.beforeAssignedToUid,
+          status: claimResult.beforeStatus,
+        },
+        after: {
+          assignedToUid: actor.uid,
+          status: "assigned",
+        },
+        message: "Claimed from queue",
+      });
+
+      return {
+        success: true,
+        reportId: claimResult.reportId,
+        assignedToUid: actor.uid,
+        status: "assigned",
+        officeId: claimResult.officeId,
+      };
+    }
+  }
+
+  throw new functions.https.HttpsError("not-found", "No available reports in queue.");
+}
+
+export const adminClaimNextReport = regionalFunctions.https.onCall((data, context) =>
+  adminClaimNextReportHandler(data, context as CallableContextLike)
+);
+
+export const adminClaimNextReportV2 = onCallV2({region: REGION}, async (request) => {
+  try {
+    return await adminClaimNextReportHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+async function adminRequeueReportHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const payload = (data && typeof data === "object")
+    ? (data as Record<string, unknown>)
+    : {};
+  const actor = await requireStaffContext(context);
+  await requireFeatureWritable("reports");
+  if (!(actor.role === "super_admin" || actor.role === "admin")) {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "Only admin and super admin can requeue reports."
+    );
+  }
+
+  const reportId = coerceString(payload.reportId);
+  if (!reportId) {
+    throw new functions.https.HttpsError("invalid-argument", "reportId is required.");
+  }
+  const reason = coerceString(payload.reason);
+  const reportRef = db.collection("reports").doc(reportId);
+  const actorMeta = reportActorMeta(actor, context);
+
+  const result = await db.runTransaction(async (tx) => {
+    const snap = await tx.get(reportRef);
+    if (!snap.exists) {
+      throw new functions.https.HttpsError("not-found", "Report not found.");
+    }
+    const row = (snap.data() ?? {}) as Record<string, unknown>;
+    if (!reportInActorScope(actor, row)) {
+      throw new functions.https.HttpsError(
+        "permission-denied",
+        "You are not allowed to manage this report."
+      );
+    }
+
+    const previousStatus = normalizeReportStatusInput(row.status ?? "submitted");
+    const nextStatus = previousStatus === "assigned" ? "in_review" : previousStatus;
+    const beforeAssignedToUid = coerceString(row.assignedToUid);
+    const beforeAssignedToName = coerceString(row.assignedToName);
+    const beforeAssignedOfficeId = coerceString(row.assignedOfficeId);
+
+    tx.set(
+      reportRef,
+      {
+        assignedToUid: null,
+        assignedToName: null,
+        assignedOfficeId: null,
+        status: nextStatus,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        ...actorMeta,
+      },
+      {merge: true}
+    );
+    tx.set(reportRef.collection("history").doc(), {
+      type: "requeued",
+      fromStatus: previousStatus,
+      toStatus: nextStatus,
+      message: reason ? `Requeued to queue: ${reason}` : "Requeued to queue",
+      byUid: actor.uid,
+      byName: actorMeta.lastActionByName,
+      byRole: actor.role,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    return {
+      reportId,
+      officeId: coerceString(row.officeId) ?? null,
+      previousStatus,
+      nextStatus,
+      beforeAssignedToUid,
+      beforeAssignedToName,
+      beforeAssignedOfficeId,
+    };
+  });
+
+  await addAuditLog({
+    action: "report_requeued",
+    entityType: "report",
+    entityId: result.reportId,
+    reportId: result.reportId,
+    officeId: result.officeId,
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorOfficeId: actor.officeId ?? null,
+    actorName: actorMeta.lastActionByName,
+    before: {
+      assignedToUid: result.beforeAssignedToUid,
+      assignedToName: result.beforeAssignedToName,
+      assignedOfficeId: result.beforeAssignedOfficeId,
+      status: result.previousStatus,
+    },
+    after: {
+      assignedToUid: null,
+      assignedToName: null,
+      assignedOfficeId: null,
+      status: result.nextStatus,
+    },
+    message: reason ? `Requeued report. Reason: ${reason}` : "Requeued report.",
+  });
+
+  return {
+    success: true,
+    reportId: result.reportId,
+    assignedToUid: null,
+    status: result.nextStatus,
+  };
+}
+
+export const adminRequeueReport = regionalFunctions.https.onCall((data, context) =>
+  adminRequeueReportHandler(data, context as CallableContextLike)
+);
+
+export const adminRequeueReportV2 = onCallV2({region: REGION}, async (request) => {
+  try {
+    return await adminRequeueReportHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
     throw normalizeCallableErrorForV2(error);
   }
@@ -1632,8 +2197,11 @@ export const opsRuntimeHealth = functions.https.onCall(async (data, context) => 
 
   const expectedBuild = coerceString(data?.expectedBuild);
   const requiredCallables: string[] = [
+    "adminUpdateSettings",
     "adminUpdateReportStatus",
     "adminAssignReport",
+    "adminClaimNextReport",
+    "adminRequeueReport",
     "adminWriteAuditLog",
     "dtsCreateTrackingRecord",
     "dtsInitiateTransfer",
@@ -3075,6 +3643,7 @@ async function dtsCreateTrackingRecordHandler(
     ? (data as Record<string, unknown>)
     : {};
   const actor = await requireStaffContext(context);
+  await requireFeatureWritable("documentTracking");
   const trackingNo = coerceString(payload.trackingNo) ?? coerceString(payload.trackingNumber);
   const pin = coerceString(payload.pin);
   const title = coerceString(payload.title) ?? "";
@@ -3234,6 +3803,7 @@ export const dtsCreateTrackingRecordV2 = onCallV2({region: REGION}, async (reque
 export const dtsInitiateTransfer = functions.https.onCall(
   async (data, context) => {
     const actor = await requireStaffContext(context);
+    await requireFeatureWritable("documentTracking");
     const docId = coerceString(data?.docId);
     const toOfficeId = coerceString(data?.toOfficeId);
     const toOfficeName = coerceString(data?.toOfficeName);
@@ -3331,6 +3901,7 @@ export const dtsInitiateTransfer = functions.https.onCall(
 export const dtsCancelTransfer = functions.https.onCall(
   async (data, context) => {
     const actor = await requireStaffContext(context);
+    await requireFeatureWritable("documentTracking");
     const docId = coerceString(data?.docId);
     if (!docId) {
       throw new functions.https.HttpsError(
@@ -3421,6 +3992,7 @@ export const dtsCancelTransfer = functions.https.onCall(
 export const dtsRejectTransfer = functions.https.onCall(
   async (data, context) => {
     const actor = await requireStaffContext(context);
+    await requireFeatureWritable("documentTracking");
     const docId = coerceString(data?.docId);
     const reason = coerceString(data?.reason);
     const attachments = sanitizeDtsAttachments(data?.attachments);
@@ -3502,6 +4074,7 @@ export const dtsRejectTransfer = functions.https.onCall(
 export const dtsConfirmReceipt = functions.https.onCall(
   async (data, context) => {
     const actor = await requireStaffContext(context);
+    await requireFeatureWritable("documentTracking");
     const docId = coerceString(data?.docId);
     if (!docId) {
       throw new functions.https.HttpsError(
@@ -3586,6 +4159,7 @@ export const dtsConfirmReceipt = functions.https.onCall(
 export const dtsUpdateStatus = functions.https.onCall(
   async (data, context) => {
     const actor = await requireStaffContext(context);
+    await requireFeatureWritable("documentTracking");
     const docId = coerceString(data?.docId);
     const requestedStatus = coerceString(data?.status);
     if (!docId || !requestedStatus) {
@@ -3657,6 +4231,7 @@ export const dtsUpdateStatus = functions.https.onCall(
 export const dtsAddNote = functions.https.onCall(
   async (data, context) => {
     const actor = await requireStaffContext(context);
+    await requireFeatureWritable("documentTracking");
     const docId = coerceString(data?.docId);
     const notes = coerceString(data?.notes) ?? "";
     const attachments = sanitizeDtsAttachments(data?.attachments);
@@ -3715,6 +4290,7 @@ export const dtsAddNote = functions.https.onCall(
 export const dtsSetCoverPhoto = functions.https.onCall(
   async (data, context) => {
     const actor = await requireStaffContext(context);
+    await requireFeatureWritable("documentTracking");
     const docId = coerceString(data?.docId);
     const rawCover = data?.coverPhoto;
     if (!docId || !rawCover || typeof rawCover !== "object") {
@@ -3770,6 +4346,7 @@ export const dtsSetCoverPhoto = functions.https.onCall(
 export const dtsAuditAttachmentAccess = functions.https.onCall(
   async (data, context) => {
     const actor = await requireStaffContext(context);
+    await requireFeatureWritable("documentTracking");
     const docId = coerceString(data?.docId);
     const eventId = coerceString(data?.eventId);
     const action = (coerceString(data?.action) ?? "open").toLowerCase();
@@ -3846,6 +4423,7 @@ async function setTrackingPinHandler(
     ? (data as Record<string, unknown>)
     : {};
   const actor = await requireStaffContext(context);
+  await requireFeatureWritable("documentTracking");
   if (!(actor.role === "super_admin" || actor.role === "admin")) {
     throw new functions.https.HttpsError(
       "permission-denied",
@@ -3935,6 +4513,7 @@ async function lookupDtsByTrackingNo(
   pin: string,
   context: TrackingLookupContext
 ): Promise<Record<string, unknown>> {
+  await requireFeatureEnabled("documentTracking");
   const snap = await db
     .collection("dts_documents")
     .where("trackingNo", "==", trackingNo)
@@ -3996,6 +4575,7 @@ async function handleTrackLookupHttpRequest(
   }
 
   try {
+    await requireFeatureEnabled("documentTracking");
     const {trackingNo, pin} = validateTrackingLookupInput(
       req.body?.trackingNumber ?? req.body?.trackingNo,
       req.body?.pin
@@ -4035,6 +4615,7 @@ export const trackLookupV2 = onRequestV2({region: REGION}, handleTrackLookupHttp
  */
 export const dtsTrackByQrAndPin = functions.https.onCall(
   async (data, context) => {
+    await requireFeatureEnabled("documentTracking");
     const qrCode = coerceString(data?.qrCode);
     const pin = normalizeTrackingPin(data?.pin);
     if (!qrCode || !pin) {
@@ -4094,6 +4675,7 @@ export const dtsTrackByQrAndPin = functions.https.onCall(
  */
 export const dtsTrackByToken = functions.https.onCall(
   async (data, context) => {
+    await requireFeatureEnabled("documentTracking");
     const token = coerceString(data?.sessionToken);
     if (!token) {
       throw new functions.https.HttpsError(
@@ -4140,6 +4722,7 @@ export const dtsTrackByToken = functions.https.onCall(
  */
 export const dtsSaveTrackedDocument = functions.https.onCall(
   async (data, context) => {
+    await requireFeatureWritable("documentTracking");
     if (!context.auth) {
       throw new functions.https.HttpsError("unauthenticated", "Auth required.");
     }
@@ -4242,6 +4825,7 @@ export const dtsSaveTrackedDocument = functions.https.onCall(
  */
 export const dtsUnsaveTrackedDocument = functions.https.onCall(
   async (data, context) => {
+    await requireFeatureWritable("documentTracking");
     if (!context.auth) {
       throw new functions.https.HttpsError("unauthenticated", "Auth required.");
     }
@@ -4294,6 +4878,7 @@ export const dtsUnsaveTrackedDocument = functions.https.onCall(
  */
 export const generateDtsQrCodes = functions.https.onCall(
   async (data, context) => {
+    await requireFeatureWritable("documentTracking");
     if (!context.auth) {
       throw new functions.https.HttpsError("unauthenticated", "Auth required.");
     }
@@ -4376,6 +4961,7 @@ export const generateDtsQrCodes = functions.https.onCall(
  */
 export const exportDtsQrZip = functions.https.onCall(
   async (data, context) => {
+    await requireFeatureWritable("documentTracking");
     if (!context.auth) {
       throw new functions.https.HttpsError("unauthenticated", "Auth required.");
     }

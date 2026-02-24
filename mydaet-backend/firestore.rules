@@ -227,6 +227,44 @@ service cloud.firestore {
         && (isSuperAdmin() || isOfficeAdmin() || statusValue == "draft");
     }
 
+    function systemSettingsPath() {
+      return /databases/$(database)/documents/system/settings;
+    }
+
+    function systemSettingsExists() {
+      return exists(systemSettingsPath());
+    }
+
+    function systemSettingsData() {
+      return systemSettingsExists() ? get(systemSettingsPath()).data : null;
+    }
+
+    function featureEnabled(featureKey) {
+      return !systemSettingsExists()
+        || !(systemSettingsData().features is map)
+        || !(featureKey in systemSettingsData().features)
+        || systemSettingsData().features[featureKey] == true;
+    }
+
+    function systemReadOnly() {
+      return systemSettingsExists()
+        && systemSettingsData().readOnly == true;
+    }
+
+    function canWriteFeatureData() {
+      return !systemReadOnly();
+    }
+
+    function postFeatureEnabled(data) {
+      return data.type == "news"
+        ? featureEnabled("news")
+        : (
+          data.type == "announcement"
+            ? featureEnabled("announcements")
+            : (featureEnabled("announcements") || featureEnabled("news"))
+        );
+    }
+
     function officeMatches(targetOfficeId) {
       return isSuperAdmin()
         || (officeId() != null && targetOfficeId != null && targetOfficeId != "" && officeId() == targetOfficeId);
@@ -392,6 +430,15 @@ service cloud.firestore {
     }
 
     /** -------------------------
+     * SYSTEM SETTINGS
+     * /system/settings
+     * ------------------------- */
+    match /system/{docId} {
+      allow read: if docId == "settings";
+      allow write: if docId == "settings" && activeUser() && isSuperAdmin();
+    }
+
+    /** -------------------------
      * AUDIT LOGS
      * /audit_logs/{id}
      * ------------------------- */
@@ -403,23 +450,31 @@ service cloud.firestore {
       allow write: if false;
     }
 
+    match /auditLogs/{id} {
+      allow read: if signedInUser() && isSuperAdmin();
+      allow write: if false;
+    }
+
     /** -------------------------
      * REPORTS
      * /reports/{reportId}
      * ------------------------- */
 
     match /stats/{docId} {
-      allow read: if signedInUser() && isStaff();
+      allow read: if signedInUser() && isStaff() && featureEnabled("reports");
       allow write: if false;
     }
 
     match /stats/daily/{dayId} {
-      allow read: if signedInUser() && isStaff();
+      allow read: if signedInUser() && isStaff() && featureEnabled("reports");
       allow write: if false;
     }
 
     match /stats/assignees/{uid} {
-      allow read: if signedInUser() && isStaff() && (isSuperAdmin() || request.auth.uid == uid);
+      allow read: if signedInUser()
+        && isStaff()
+        && featureEnabled("reports")
+        && (isSuperAdmin() || request.auth.uid == uid);
       allow write: if false;
     }
 
@@ -428,6 +483,8 @@ service cloud.firestore {
 
       // Resident can create report and must stamp ownership
       allow create: if activeUser()
+        && featureEnabled("reports")
+        && canWriteFeatureData()
         && request.resource.data.createdByUid == request.auth.uid
         && request.resource.data.status == "submitted"
         && hasNonEmptyString(request.resource.data, "officeId")
@@ -436,7 +493,7 @@ service cloud.firestore {
       // Read:
       // - staff (moderator/office admin/super admin) can list and view reports
       // - residents can only read their own reports
-      allow read: if signedInUser() && (
+      allow read: if signedInUser() && featureEnabled("reports") && (
         isStaff()
         || resource.data.createdByUid == request.auth.uid
       );
@@ -445,16 +502,20 @@ service cloud.firestore {
       // - Resident can edit ONLY their own report content BEFORE it is handled
       //   and CANNOT change workflow fields (status/assignedToUid/createdByUid)
       // - Staff workflow updates are enforced through callable functions (server-side).
-      allow update: if activeUser() && (
+      allow update: if activeUser() && featureEnabled("reports") && canWriteFeatureData() && (
         (
           resource.data.createdByUid == request.auth.uid
           && (resource.data.status == "submitted" || resource.data.status == "in_review")
           && request.resource.data.createdByUid == resource.data.createdByUid
           && request.resource.data.assignedToUid == resource.data.assignedToUid
+          && request.resource.data.assignedToName == resource.data.assignedToName
+          && request.resource.data.assignedOfficeId == resource.data.assignedOfficeId
           && request.resource.data.status == resource.data.status
           && !request.resource.data.diff(resource.data).changedKeys()
             .hasAny([
               "officeId",
+              "assignedToName",
+              "assignedOfficeId",
               "lastActionByUid",
               "lastActionByEmail",
               "lastActionByName",
@@ -471,11 +532,11 @@ service cloud.firestore {
       );
 
       // Delete only super admin
-      allow delete: if activeUser() && isSuperAdmin();
+      allow delete: if activeUser() && isSuperAdmin() && featureEnabled("reports") && canWriteFeatureData();
 
       // Optional: messages subcollection
       match /messages/{messageId} {
-        allow read: if signedInUser() && (
+        allow read: if signedInUser() && featureEnabled("reports") && (
           get(/databases/$(database)/documents/reports/$(reportId)).data.createdByUid == request.auth.uid
           || isSuperAdmin()
           || (isOfficeAdmin() && officeAllowed(get(/databases/$(database)/documents/reports/$(reportId)).data))
@@ -485,7 +546,7 @@ service cloud.firestore {
           )
         );
 
-        allow create: if activeUser() && (
+        allow create: if activeUser() && featureEnabled("reports") && canWriteFeatureData() && (
           isSuperAdmin()
           || (isOfficeAdmin() && officeAllowed(get(/databases/$(database)/documents/reports/$(reportId)).data))
           || (
@@ -498,7 +559,7 @@ service cloud.firestore {
       }
 
       match /history/{historyId} {
-        allow read: if signedInUser() && (
+        allow read: if signedInUser() && featureEnabled("reports") && (
           get(/databases/$(database)/documents/reports/$(reportId)).data.createdByUid == request.auth.uid
           || isSuperAdmin()
           || (isOfficeAdmin() && officeAllowed(get(/databases/$(database)/documents/reports/$(reportId)).data))
@@ -518,6 +579,8 @@ service cloud.firestore {
     match /dts_documents/{docId} {
       allow create: if activeUser()
         && isStaff()
+        && featureEnabled("documentTracking")
+        && canWriteFeatureData()
         && hasNonEmptyString(request.resource.data, "qrCode")
         && hasNonEmptyString(request.resource.data, "trackingNo")
         && hasNonEmptyString(request.resource.data, "publicPinHash")
@@ -533,17 +596,19 @@ service cloud.firestore {
           || (officeId() != null && request.resource.data.currentOfficeId == officeId())
         );
 
-      allow read: if dtsCanRead(resource.data);
+      allow read: if featureEnabled("documentTracking") && dtsCanRead(resource.data);
 
       // All state mutations must run through callable functions (server-side checks).
       allow update: if false;
 
-      allow delete: if activeUser() && isSuperAdmin();
+      allow delete: if activeUser() && isSuperAdmin() && featureEnabled("documentTracking") && canWriteFeatureData();
 
       match /timeline/{eventId} {
-        allow read: if signedInUser() && isStaff();
+        allow read: if signedInUser() && isStaff() && featureEnabled("documentTracking");
         allow create: if activeUser()
           && isStaff()
+          && featureEnabled("documentTracking")
+          && canWriteFeatureData()
           && dtsOfficeAllowed(dtsDocById(docId).data)
           && request.resource.data.keys().hasAll(["type", "byUid", "createdAt"])
           && request.resource.data.byUid == request.auth.uid
@@ -553,16 +618,20 @@ service cloud.firestore {
     }
 
     match /dts_qr_index/{qrCode} {
-      allow read: if signedInUser() && isStaff();
+      allow read: if signedInUser() && isStaff() && featureEnabled("documentTracking");
       allow create: if activeUser() && isStaff()
+        && featureEnabled("documentTracking")
+        && canWriteFeatureData()
         && !exists(/databases/$(database)/documents/dts_qr_index/$(qrCode));
       allow update, delete: if false;
     }
 
     match /dts_qr_codes/{qrCode} {
-      allow read: if signedInUser() && isStaff();
+      allow read: if signedInUser() && isStaff() && featureEnabled("documentTracking");
       allow create: if false;
       allow update: if activeUser() && isStaff()
+        && featureEnabled("documentTracking")
+        && canWriteFeatureData()
         && resource.data.status == "unused"
         && request.resource.data.status == "used"
         && request.resource.data.docId != null;
@@ -570,8 +639,11 @@ service cloud.firestore {
     }
 
     match /dts_counters/{year} {
-      allow read: if signedInUser() && isStaff();
-      allow create, update: if activeUser() && isStaff();
+      allow read: if signedInUser() && isStaff() && featureEnabled("documentTracking");
+      allow create, update: if activeUser()
+        && isStaff()
+        && featureEnabled("documentTracking")
+        && canWriteFeatureData();
       allow delete: if false;
     }
 
@@ -604,8 +676,10 @@ service cloud.firestore {
      * /announcements/{announcementId}
      * ------------------------- */
     match /announcements/{announcementId} {
-      allow read: if isPublishedStatus(resource.data.status)
-        || (signedInUser() && isStaff());
+      allow read: if featureEnabled("announcements") && (
+        isPublishedStatus(resource.data.status)
+        || (signedInUser() && isStaff())
+      );
 
       allow create, update, delete: if false;
 
@@ -621,11 +695,15 @@ service cloud.firestore {
      * /posts/{postId}
      * ------------------------- */
     match /posts/{postId} {
-      allow read: if isPublishedStatus(resource.data.status)
-        || (signedInUser() && isStaff());
+      allow read: if postFeatureEnabled(resource.data) && (
+        isPublishedStatus(resource.data.status)
+        || (signedInUser() && isStaff())
+      );
 
       allow create: if activeUser() && isStaff()
+        && canWriteFeatureData()
         && validPostShape(request.resource.data)
+        && postFeatureEnabled(request.resource.data)
         && canWritePublishedState(request.resource.data.status)
         && postOfficeAllowed(request.resource.data.officeId)
         && (
@@ -634,7 +712,9 @@ service cloud.firestore {
         );
 
       allow update, delete: if activeUser() && isStaff()
+        && canWriteFeatureData()
         && validPostShape(request.resource.data)
+        && postFeatureEnabled(request.resource.data)
         && canWritePublishedState(request.resource.data.status)
         && postOfficeAllowed(request.resource.data.officeId)
         && (
@@ -649,11 +729,15 @@ service cloud.firestore {
      * /public_docs/{docId}
      * ------------------------- */
     match /public_docs/{docId} {
-      allow read: if isPublishedStatus(resource.data.status)
-        || (signedInUser() && isStaff());
+      allow read: if featureEnabled("transparency") && (
+        isPublishedStatus(resource.data.status)
+        || (signedInUser() && isStaff())
+      );
 
       allow create: if activeUser()
         && isStaff()
+        && featureEnabled("transparency")
+        && canWriteFeatureData()
         && validPublicDocShape(request.resource.data)
         && canWritePublishedState(request.resource.data.status)
         && docTypeOfficeAllowed(request.resource.data.docType, request.resource.data.officeId)
@@ -661,6 +745,8 @@ service cloud.firestore {
 
       allow update: if activeUser()
         && isStaff()
+        && featureEnabled("transparency")
+        && canWriteFeatureData()
         && validPublicDocShape(request.resource.data)
         && canWritePublishedState(request.resource.data.status)
         && docTypeOfficeAllowed(request.resource.data.docType, request.resource.data.officeId)
@@ -674,11 +760,15 @@ service cloud.firestore {
      * /jobs/{jobId}
      * ------------------------- */
     match /jobs/{jobId} {
-      allow read: if isPublishedStatus(resource.data.status)
-        || (signedInUser() && isStaff());
+      allow read: if featureEnabled("jobs") && (
+        isPublishedStatus(resource.data.status)
+        || (signedInUser() && isStaff())
+      );
 
       allow create: if activeUser()
         && (isSuperAdmin() || isOfficeAdmin())
+        && featureEnabled("jobs")
+        && canWriteFeatureData()
         && validJobShape(request.resource.data)
         && canWritePublishedState(request.resource.data.status)
         && jobOfficeAllowed(request.resource.data.officeId)
@@ -686,6 +776,8 @@ service cloud.firestore {
 
       allow update: if activeUser()
         && (isSuperAdmin() || isOfficeAdmin())
+        && featureEnabled("jobs")
+        && canWriteFeatureData()
         && validJobShape(request.resource.data)
         && canWritePublishedState(request.resource.data.status)
         && jobOfficeAllowed(request.resource.data.officeId)

@@ -66,11 +66,64 @@ Roles:
 
 Legacy `office_admin` is normalized as `admin`.
 
+## Command Center Settings
+
+Global settings document:
+
+- `system/settings`
+
+Shape:
+
+- `maintenance.enabled` (boolean)
+- `maintenance.message` (string)
+- `readOnly` (boolean)
+- `features` map:
+  - `tourism`
+  - `announcements`
+  - `news`
+  - `jobs`
+  - `directory`
+  - `documentTracking`
+  - `reports`
+  - `transparency`
+- `updatedAt` (timestamp)
+- `updatedBy` object (`uid`, `role`, `name`, `email`)
+
+Behavior defaults:
+
+- If `system/settings` does not exist yet, feature access is treated as enabled (open-until-configured).
+- If `readOnly=true`, writes to feature collections are blocked by rules.
+- Only `super_admin` can update `system/settings`.
+
+Callable:
+
+- `adminUpdateSettings` (Gen1)
+- `adminUpdateSettingsV2` (Gen2)
+
+The callable writes settings and creates audit entries in both:
+
+- `auditLogs`
+- `audit_logs` (legacy compatibility)
+
 After changing role/office claims:
 
 1. Update claims (Admin SDK / staff tools).
 2. Re-save matching profile fields in `users/{uid}`.
 3. User must sign out/sign in to refresh ID token claims.
+
+### Set Super Admin Claim
+
+Use the helper script in repo root:
+
+```bash
+cd C:\Users\ADMIN\MyDaet-Backend\mydaet-backend
+node set-super-admin.js
+```
+
+The script updates both:
+
+- Firebase custom claims (`role=super_admin`, `isActive=true`)
+- `users/{uid}` profile role fields
 
 ## Access Matrix (Summary)
 
@@ -122,6 +175,14 @@ Use `us-central1` in all clients:
 
 - React `VITE_FIREBASE_FUNCTIONS_REGION=us-central1`
 - Direct function URLs should include `/us-central1/`
+
+### Command Center updates fail
+
+Check:
+
+1. Caller has `super_admin` claim and active profile.
+2. Callable deploy includes `adminUpdateSettings` and `adminUpdateSettingsV2`.
+3. Firestore rules deploy includes `/system/settings` write allowance for `super_admin`.
 
 ### Missing env (web)
 
