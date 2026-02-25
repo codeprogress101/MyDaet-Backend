@@ -202,6 +202,18 @@ service firebase.storage {
         && request.resource.contentType.matches("application/pdf.*");
     }
 
+    function validAttachmentUpload(maxMb) {
+      return request.resource != null
+        && request.resource.size < maxMb * 1024 * 1024
+        && request.resource.contentType != null
+        && (
+          request.resource.contentType.matches("image/.*")
+          || request.resource.contentType.matches("application/pdf.*")
+          || request.resource.contentType == "application/msword"
+          || request.resource.contentType == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        );
+    }
+
     match /ads/{adId}/{fileName} {
       allow read: if true;
       allow write: if activeUser() && isStaff() && validImageUpload(10);
@@ -225,16 +237,25 @@ service firebase.storage {
         && validPdfUpload(25);
     }
 
+    match /public_docs/{docType}/attachments/{filePath=**} {
+      allow read: if true;
+      allow write: if activeUser()
+        && isStaff()
+        && docType in ["ordinance", "resolution", "executive_order", "public_hearing", "generic"]
+        && validAttachmentUpload(15);
+    }
+
     match /reports/{uid}/{reportId}/{fileName} {
       allow read: if canReadReport(reportId);
       allow write: if activeUser()
         && request.auth.uid == uid
-        && reportDoc(reportId).data.createdByUid == request.auth.uid;
+        && reportDoc(reportId).data.createdByUid == request.auth.uid
+        && validAttachmentUpload(15);
     }
 
     match /report_notes/{reportId}/{messageId}/{fileName} {
       allow read: if canReadReport(reportId);
-      allow write: if canWriteReportNote(reportId);
+      allow write: if canWriteReportNote(reportId) && validAttachmentUpload(15);
     }
 
     match /dts/{docId}/cover/{fileName} {
@@ -245,8 +266,7 @@ service firebase.storage {
     match /dts/{docId}/attachments/{fileName} {
       allow read: if canReadDts(docId);
       allow write: if activeUser() && isStaff() && dtsOfficeAllowed(docId)
-        && request.resource != null
-        && request.resource.size < 25 * 1024 * 1024;
+        && validAttachmentUpload(15);
     }
 
     match /dts_qr_codes/{fileName} {

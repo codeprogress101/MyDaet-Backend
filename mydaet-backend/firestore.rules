@@ -160,6 +160,20 @@ service cloud.firestore {
       return data.keys().hasAny([field]) && data[field] is string && data[field] != "";
     }
 
+    function stringWithin(value, max) {
+      return !(value is string) || value.size() <= max;
+    }
+
+    function fieldWithin(data, field, max) {
+      return !(field in data) || stringWithin(data[field], max);
+    }
+
+    function unchangedOrWithin(field, max) {
+      return !(field in request.resource.data)
+        || request.resource.data[field] == resource.data[field]
+        || stringWithin(request.resource.data[field], max);
+    }
+
     function officeAllowed(data) {
       return !hasOfficeId(data) || (officeId() != null && data.officeId == officeId());
     }
@@ -325,10 +339,33 @@ service cloud.firestore {
       && data.type in ["announcement", "news"]
       && hasNonEmptyString(data, "title")
       && hasNonEmptyString(data, "body")
+      && stringWithin(data.title, 120)
+      && stringWithin(data.body, 5000)
       && data.createdByUid is string
       && data.createdAt is timestamp
       && data.updatedAt is timestamp
       && validLifecycleStatus(data.status);
+    }
+
+    function validPostShapeForUpdate() {
+      return request.resource.data.keys().hasAll([
+        "type",
+        "title",
+        "body",
+        "status",
+        "createdByUid",
+        "createdAt",
+        "updatedAt"
+      ])
+      && request.resource.data.type in ["announcement", "news"]
+      && hasNonEmptyString(request.resource.data, "title")
+      && hasNonEmptyString(request.resource.data, "body")
+      && unchangedOrWithin("title", 120)
+      && unchangedOrWithin("body", 5000)
+      && request.resource.data.createdByUid is string
+      && request.resource.data.createdAt is timestamp
+      && request.resource.data.updatedAt is timestamp
+      && validLifecycleStatus(request.resource.data.status);
     }
 
     function validPublicDocShape(data) {
@@ -347,11 +384,40 @@ service cloud.firestore {
       && hasNonEmptyString(data, "docNo")
       && hasNonEmptyString(data, "title")
       && data.summary is string
+      && stringWithin(data.docNo, 40)
+      && stringWithin(data.title, 120)
+      && stringWithin(data.summary, 500)
       && hasNonEmptyString(data, "officeId")
       && data.createdByUid is string
       && data.createdAt is timestamp
       && data.updatedAt is timestamp
       && validLifecycleStatus(data.status);
+    }
+
+    function validPublicDocShapeForUpdate() {
+      return request.resource.data.keys().hasAll([
+        "docType",
+        "docNo",
+        "title",
+        "summary",
+        "officeId",
+        "status",
+        "createdByUid",
+        "createdAt",
+        "updatedAt"
+      ])
+      && request.resource.data.docType in ["ordinance", "resolution", "executive_order", "public_hearing"]
+      && hasNonEmptyString(request.resource.data, "docNo")
+      && hasNonEmptyString(request.resource.data, "title")
+      && request.resource.data.summary is string
+      && unchangedOrWithin("docNo", 40)
+      && unchangedOrWithin("title", 120)
+      && unchangedOrWithin("summary", 500)
+      && hasNonEmptyString(request.resource.data, "officeId")
+      && request.resource.data.createdByUid is string
+      && request.resource.data.createdAt is timestamp
+      && request.resource.data.updatedAt is timestamp
+      && validLifecycleStatus(request.resource.data.status);
     }
 
     function validJobShape(data) {
@@ -369,10 +435,39 @@ service cloud.firestore {
       && hasNonEmptyString(data, "officeId")
       && hasNonEmptyString(data, "employmentType")
       && hasNonEmptyString(data, "description")
+      && stringWithin(data.title, 120)
+      && stringWithin(data.employmentType, 60)
+      && stringWithin(data.description, 5000)
+      && fieldWithin(data, "qualifications", 1000)
       && data.createdByUid is string
       && data.createdAt is timestamp
       && data.updatedAt is timestamp
       && validLifecycleStatus(data.status);
+    }
+
+    function validJobShapeForUpdate() {
+      return request.resource.data.keys().hasAll([
+        "title",
+        "officeId",
+        "employmentType",
+        "description",
+        "status",
+        "createdByUid",
+        "createdAt",
+        "updatedAt"
+      ])
+      && hasNonEmptyString(request.resource.data, "title")
+      && hasNonEmptyString(request.resource.data, "officeId")
+      && hasNonEmptyString(request.resource.data, "employmentType")
+      && hasNonEmptyString(request.resource.data, "description")
+      && unchangedOrWithin("title", 120)
+      && unchangedOrWithin("employmentType", 60)
+      && unchangedOrWithin("description", 5000)
+      && (("qualifications" in request.resource.data) == false || unchangedOrWithin("qualifications", 1000))
+      && request.resource.data.createdByUid is string
+      && request.resource.data.createdAt is timestamp
+      && request.resource.data.updatedAt is timestamp
+      && validLifecycleStatus(request.resource.data.status);
     }
 
     /** -------------------------
@@ -488,7 +583,12 @@ service cloud.firestore {
         && request.resource.data.createdByUid == request.auth.uid
         && request.resource.data.status == "submitted"
         && hasNonEmptyString(request.resource.data, "officeId")
-        && hasNonEmptyString(request.resource.data, "officeName");
+        && hasNonEmptyString(request.resource.data, "officeName")
+        && fieldWithin(request.resource.data, "title", 120)
+        && fieldWithin(request.resource.data, "description", 2000)
+        && fieldWithin(request.resource.data, "location", 120)
+        && fieldWithin(request.resource.data, "name", 80)
+        && fieldWithin(request.resource.data, "contact", 120);
 
       // Read:
       // - staff (moderator/office admin/super admin) can list and view reports
@@ -511,6 +611,11 @@ service cloud.firestore {
           && request.resource.data.assignedToName == resource.data.assignedToName
           && request.resource.data.assignedOfficeId == resource.data.assignedOfficeId
           && request.resource.data.status == resource.data.status
+          && unchangedOrWithin("title", 120)
+          && unchangedOrWithin("description", 2000)
+          && unchangedOrWithin("location", 120)
+          && unchangedOrWithin("name", 80)
+          && unchangedOrWithin("contact", 120)
           && !request.resource.data.diff(resource.data).changedKeys()
             .hasAny([
               "officeId",
@@ -713,7 +818,7 @@ service cloud.firestore {
 
       allow update, delete: if activeUser() && isStaff()
         && canWriteFeatureData()
-        && validPostShape(request.resource.data)
+        && validPostShapeForUpdate()
         && postFeatureEnabled(request.resource.data)
         && canWritePublishedState(request.resource.data.status)
         && postOfficeAllowed(request.resource.data.officeId)
@@ -747,7 +852,7 @@ service cloud.firestore {
         && isStaff()
         && featureEnabled("transparency")
         && canWriteFeatureData()
-        && validPublicDocShape(request.resource.data)
+        && validPublicDocShapeForUpdate()
         && canWritePublishedState(request.resource.data.status)
         && docTypeOfficeAllowed(request.resource.data.docType, request.resource.data.officeId)
         && request.resource.data.createdByUid == resource.data.createdByUid;
@@ -778,7 +883,7 @@ service cloud.firestore {
         && (isSuperAdmin() || isOfficeAdmin())
         && featureEnabled("jobs")
         && canWriteFeatureData()
-        && validJobShape(request.resource.data)
+        && validJobShapeForUpdate()
         && canWritePublishedState(request.resource.data.status)
         && jobOfficeAllowed(request.resource.data.officeId)
         && request.resource.data.createdByUid == resource.data.createdByUid;
