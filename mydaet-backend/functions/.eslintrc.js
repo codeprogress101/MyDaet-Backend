@@ -42,4 +42,12 @@ module.exports = {
     /* ---- Import rules ---- */
     "import/no-unresolved": "off",
   },
+  overrides: [
+    {
+      files: ["scripts/**/*.js", "tests/**/*.js"],
+      rules: {
+        "@typescript-eslint/no-var-requires": "off",
+      },
+    },
+  ],
 };

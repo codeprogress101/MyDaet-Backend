@@ -3800,7 +3800,7 @@ export const onUserWrite = functions.firestore
  */
 export const onReportWrite = functions.firestore
   .document("reports/{reportId}")
-  .onWrite(async (change, context) => {
+  .onWrite(async (change) => {
     const before = change.before.exists ? change.before.data() : null;
     const after = change.after.exists ? change.after.data() : null;
 
@@ -4393,15 +4393,18 @@ export const cleanupReadNotifications = functions.pubsub
       new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
     );
     let deleted = 0;
-
-    while (true) {
+    let hasMore = true;
+    while (hasMore) {
       const snap = await db
         .collectionGroup("notifications")
         .where("read", "==", true)
         .where("createdAt", "<", cutoff)
         .limit(400)
         .get();
-      if (snap.empty) break;
+      if (snap.empty) {
+        hasMore = false;
+        continue;
+      }
 
       const batch = db.batch();
       for (const doc of snap.docs) {
@@ -4409,7 +4412,7 @@ export const cleanupReadNotifications = functions.pubsub
       }
       await batch.commit();
       deleted += snap.size;
-      if (snap.size < 400) break;
+      hasMore = snap.size === 400;
     }
 
     console.log(`cleanupReadNotifications deleted ${deleted} docs`);
@@ -4428,20 +4431,24 @@ export const cleanupExpiredDtsTrackSessions = functions.pubsub
   .onRun(async () => {
     const now = admin.firestore.Timestamp.now();
     let deleted = 0;
-    while (true) {
+    let hasMore = true;
+    while (hasMore) {
       const snap = await db
         .collection("dts_track_sessions")
         .where("expiresAt", "<=", now)
         .limit(400)
         .get();
-      if (snap.empty) break;
+      if (snap.empty) {
+        hasMore = false;
+        continue;
+      }
       const batch = db.batch();
       for (const doc of snap.docs) {
         batch.delete(doc.ref);
       }
       await batch.commit();
       deleted += snap.size;
-      if (snap.size < 400) break;
+      hasMore = snap.size === 400;
     }
     console.log(`cleanupExpiredDtsTrackSessions deleted ${deleted} docs`);
     return null;
@@ -6040,5 +6047,3 @@ export const exportDtsQrZip = functions.https.onCall(
     };
   }
 );
-
-
