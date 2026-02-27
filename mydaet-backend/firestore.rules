@@ -152,6 +152,39 @@ service cloud.firestore {
         : null;
     }
 
+    function civilRegistryOfficeIds() {
+      return [
+        "OFFICE_OF_THE_CIVIL_REGISTRAR",
+        "MUNICIPAL_LOCAL_CIVIL_REGISTRY_OFFICE",
+        "MUNICIPAL_CIVIL_REGISTRY_OFFICE",
+        "CIVIL_REGISTRY_OFFICE",
+        "MLCRO"
+      ];
+    }
+
+    function civilRegistryOfficeTag(value) {
+      return value != null && (
+        value in civilRegistryOfficeIds()
+        || (value is string && value.matches(".*[cC][iI][vV][iI][lL].*[rR][eE][gG][iI][sS][tT][rR].*"))
+        || (value is string && value.matches(".*[mM][lL][cC][rR][oO].*"))
+      );
+    }
+
+    function canAccessCivilRegistry() {
+      return signedInUser() && (
+        isSuperAdmin()
+        || (
+          (isStaff() || isStaffByDoc())
+          && (
+            civilRegistryOfficeTag(officeId())
+            || civilRegistryOfficeTag(officeIdByDoc())
+            || civilRegistryOfficeTag(officeName())
+            || civilRegistryOfficeTag(officeNameByDoc())
+          )
+        )
+      );
+    }
+
     function hasOfficeId(data) {
       return data.keys().hasAny(["officeId"]) && data.officeId != null && data.officeId != "";
     }
@@ -889,6 +922,26 @@ service cloud.firestore {
         && request.resource.data.createdByUid == resource.data.createdByUid;
 
       allow delete: if false;
+    }
+
+    /** -------------------------
+     * CIVIL REGISTRY REQUESTS
+     * /civil_registry_requests/{requestId}
+     * ------------------------- */
+      match /civil_registry_requests/{requestId} {
+        allow read: if canAccessCivilRegistry()
+          && featureEnabled("civilRegistry");
+        allow create, update, delete: if false;
+
+        match /history/{historyId} {
+          allow read: if canAccessCivilRegistry()
+            && featureEnabled("civilRegistry");
+          allow write: if false;
+        }
+      }
+
+    match /civil_registry_counters/{year} {
+      allow read, write: if false;
     }
 
     /** -------------------------

@@ -123,6 +123,38 @@
         { "fieldPath": "createdByUid", "order": "ASCENDING" },
         { "fieldPath": "updatedAt", "order": "DESCENDING" }
       ]
+    },
+    {
+      "collectionGroup": "civil_registry_requests",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "submittedAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "civil_registry_requests",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "requestType", "order": "ASCENDING" },
+        { "fieldPath": "submittedAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "civil_registry_requests",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "submissionMode", "order": "ASCENDING" },
+        { "fieldPath": "submittedAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "civil_registry_requests",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "officeId", "order": "ASCENDING" },
+        { "fieldPath": "submittedAt", "order": "DESCENDING" }
+      ]
     }
   ],
   "fieldOverrides": []

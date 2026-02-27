@@ -32,6 +32,7 @@ const SYSTEM_SETTINGS_FEATURE_KEYS = [
   "documentTracking",
   "reports",
   "transparency",
+  "civilRegistry",
 ] as const;
 type SystemFeatureKey = typeof SYSTEM_SETTINGS_FEATURE_KEYS[number];
 type SystemFeatureFlags = Record<SystemFeatureKey, boolean>;
@@ -1519,6 +1520,368 @@ function isQueueEligibleReport(row: Record<string, unknown>): boolean {
   return status === "submitted" || status === "in_review";
 }
 
+const CIVIL_REGISTRY_DEFAULT_OFFICE_ID = "OFFICE_OF_THE_CIVIL_REGISTRAR";
+const CIVIL_REGISTRY_ALLOWED_OFFICE_IDS = [
+  CIVIL_REGISTRY_DEFAULT_OFFICE_ID,
+  "MUNICIPAL_LOCAL_CIVIL_REGISTRY_OFFICE",
+  "MUNICIPAL_CIVIL_REGISTRY_OFFICE",
+  "CIVIL_REGISTRY_OFFICE",
+  "MLCRO",
+] as const;
+const CIVIL_REGISTRY_REQUEST_TYPES = [
+  "Birth Certificate",
+  "Marriage Certificate",
+  "Death Certificate",
+] as const;
+const CIVIL_REGISTRY_STATUSES = [
+  "Submitted",
+  "Under Review",
+  "For Compliance",
+  "For Manual Verification",
+  "Approved for Payment",
+  "Paid",
+  "For Processing / Printing",
+  "Ready for Pickup",
+  "Released",
+  "Rejected / No Record Found",
+  "Cancelled",
+] as const;
+
+const CIVIL_REGISTRY_REMARKS_REQUIRED = new Set([
+  "For Compliance",
+  "For Manual Verification",
+  "Rejected / No Record Found",
+  "Cancelled",
+]);
+
+const CIVIL_REGISTRY_ALLOWED_TRANSITIONS: Record<string, Set<string>> = {
+  Submitted: new Set(["Under Review", "Cancelled"]),
+  "Under Review": new Set([
+    "For Compliance",
+    "For Manual Verification",
+    "Approved for Payment",
+    "Rejected / No Record Found",
+    "Cancelled",
+  ]),
+  "For Compliance": new Set(["Under Review", "Cancelled"]),
+  "For Manual Verification": new Set([
+    "Approved for Payment",
+    "Rejected / No Record Found",
+    "Cancelled",
+  ]),
+  "Approved for Payment": new Set(["Paid", "Cancelled"]),
+  Paid: new Set(["For Processing / Printing"]),
+  "For Processing / Printing": new Set(["Ready for Pickup"]),
+  "Ready for Pickup": new Set(["Released"]),
+  Released: new Set([]),
+  "Rejected / No Record Found": new Set([]),
+  Cancelled: new Set([]),
+};
+
+const CIVIL_REGISTRY_PUBLIC_KEYS = [
+  "refNo",
+  "requestType",
+  "status",
+  "submissionMode",
+  "purpose",
+  "submittedAt",
+  "updatedAt",
+  "estimatedReleaseDate",
+] as const;
+
+function normalizeOfficeScopeKey(value: unknown): string {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+}
+
+const CIVIL_REGISTRY_ALLOWED_OFFICE_KEYS = new Set(
+  CIVIL_REGISTRY_ALLOWED_OFFICE_IDS.map((value) => normalizeOfficeScopeKey(value))
+);
+
+function isCivilRegistryOfficeTagged(officeId: unknown, officeName: unknown): boolean {
+  const officeIdKey = normalizeOfficeScopeKey(officeId);
+  if (officeIdKey && CIVIL_REGISTRY_ALLOWED_OFFICE_KEYS.has(officeIdKey)) {
+    return true;
+  }
+
+  const officeNameKey = normalizeOfficeScopeKey(officeName);
+  if (!officeNameKey) {
+    return false;
+  }
+
+  return (
+    officeNameKey.includes("civilregistry") ||
+    officeNameKey.includes("civilregistrar") ||
+    officeNameKey.includes("mlcro")
+  );
+}
+
+async function requireCivilRegistryStaffContext(
+  context: CallableContextLike
+): Promise<StaffContext> {
+  const actor = await requireStaffContext(context);
+  if (actor.role === "super_admin") {
+    return actor;
+  }
+
+  const officeNameFromProfile = coerceString((actor.profileData as Record<string, unknown>)?.officeName);
+  if (!isCivilRegistryOfficeTagged(actor.officeId, actor.officeName ?? officeNameFromProfile)) {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "Civil Registry access is limited to super admin and Municipal Local Civil Registry Office staff."
+    );
+  }
+
+  return actor;
+}
+
+function normalizeCivilRegistryRequestType(raw: unknown): string {
+  const value = String(raw ?? "").trim().toLowerCase();
+  if (value === "birth_certificate" || value === "birth certificate" || value === "birth") {
+    return "Birth Certificate";
+  }
+  if (value === "marriage_certificate" || value === "marriage certificate" || value === "marriage") {
+    return "Marriage Certificate";
+  }
+  if (value === "death_certificate" || value === "death certificate" || value === "death") {
+    return "Death Certificate";
+  }
+  throw new functions.https.HttpsError("invalid-argument", "Invalid civil registry request type.");
+}
+
+function normalizeCivilRegistryStatus(raw: unknown): string {
+  const value = String(raw ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+  for (const status of CIVIL_REGISTRY_STATUSES) {
+    if (status.toLowerCase() === value) {
+      return status;
+    }
+  }
+  if (value === "rejected/no record found" || value === "rejected / no record found") {
+    return "Rejected / No Record Found";
+  }
+  if (value === "for processing/printing" || value === "for processing / printing") {
+    return "For Processing / Printing";
+  }
+  throw new functions.https.HttpsError("invalid-argument", "Invalid civil registry status.");
+}
+
+function normalizeCivilRegistrySubmissionMode(raw: unknown): "online" | "walk-in" {
+  const value = String(raw ?? "").trim().toLowerCase();
+  if (value === "walkin" || value === "walk-in" || value === "walk_in") {
+    return "walk-in";
+  }
+  return "online";
+}
+
+function toLowerTrimmed(value: unknown): string {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+function requiredStringField(value: unknown, label: string): string {
+  const text = String(value ?? "").trim();
+  if (!text) {
+    throw new functions.https.HttpsError("invalid-argument", `${label} is required.`);
+  }
+  return text;
+}
+
+function optionalStringField(value: unknown, max = 500): string | null {
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  if (text.length > max) {
+    throw new functions.https.HttpsError("invalid-argument", `Field exceeds ${max} characters.`);
+  }
+  return text;
+}
+
+function normalizeVerifierLastName(value: unknown): string {
+  const text = String(value ?? "").trim().toLowerCase();
+  if (text.length < 2) {
+    throw new functions.https.HttpsError("invalid-argument", "Verifier last name is required.");
+  }
+  if (text.length > 120) {
+    throw new functions.https.HttpsError("invalid-argument", "Verifier last name is too long.");
+  }
+  return text;
+}
+
+function validateCivilRegistryTransition(fromStatus: string, toStatus: string): void {
+  if (fromStatus === toStatus) return;
+  const allowed = CIVIL_REGISTRY_ALLOWED_TRANSITIONS[fromStatus];
+  if (!allowed || !allowed.has(toStatus)) {
+    throw new functions.https.HttpsError(
+      "failed-precondition",
+      `Invalid civil registry transition: ${fromStatus} -> ${toStatus}.`
+    );
+  }
+}
+
+function remarksRequiredForCivilRegistryStatus(status: string): boolean {
+  return CIVIL_REGISTRY_REMARKS_REQUIRED.has(status);
+}
+
+function civilRegistryActorMeta(actor: StaffContext, context: CallableContextLike) {
+  return {
+    lastActionByUid: actor.uid,
+    lastActionByName: actorDisplayName(actor),
+    lastActionByEmail:
+      coerceString(actor.profileData.email) ??
+      coerceString(context.auth?.token.email) ??
+      "",
+    lastActionByRole: actor.role,
+    lastActionAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+}
+
+function civilRegistryHistoryRef(requestId: string): FirebaseFirestore.CollectionReference {
+  return db.collection("civil_registry_requests").doc(requestId).collection("history");
+}
+
+function sanitizeCivilRegistryPublic(
+  row: Record<string, unknown>
+): Record<string, unknown> {
+  const safe: Record<string, unknown> = {};
+  for (const key of CIVIL_REGISTRY_PUBLIC_KEYS) {
+    safe[key] = row[key] ?? null;
+  }
+  return safe;
+}
+
+function normalizeCivilRegistryDate(value: unknown): string | null {
+  if (!value) return null;
+  const text = String(value).trim();
+  if (!text) return null;
+  const date = new Date(text);
+  if (Number.isNaN(date.getTime())) {
+    throw new functions.https.HttpsError("invalid-argument", "Invalid date value.");
+  }
+  return date.toISOString();
+}
+
+function normalizeCivilRegistryPayload(
+  payload: Record<string, unknown>,
+  submissionMode: "online" | "walk-in"
+): Record<string, unknown> {
+  const normalizedSubmissionMode = normalizeCivilRegistrySubmissionMode(submissionMode);
+  const requestType = normalizeCivilRegistryRequestType(payload.requestType);
+  const purpose = requiredStringField(payload.purpose, "Purpose");
+  const claimantTypeRaw = String(payload.claimantType ?? "").trim().toLowerCase();
+  const claimantType = claimantTypeRaw === "representative" ? "representative" : "self";
+
+  const requesterName = requiredStringField(payload.requesterName, "Requester name");
+  const contactNo = requiredStringField(payload.contactNo, "Contact number");
+  const email = optionalStringField(payload.email, 150);
+  const relationshipToOwner = optionalStringField(payload.relationshipToOwner, 120);
+  const verifierLastName = normalizeVerifierLastName(payload.verifierLastName);
+
+  const details = payload.details && typeof payload.details === "object"
+    ? (payload.details as Record<string, unknown>)
+    : {};
+
+  const birthDetails = {
+    childName: optionalStringField(details.childName, 150),
+    dateOfBirth: normalizeCivilRegistryDate(details.dateOfBirth),
+    placeOfBirth: optionalStringField(details.placeOfBirth, 150),
+    fatherName: optionalStringField(details.fatherName, 150),
+    motherMaidenName: optionalStringField(details.motherMaidenName, 150),
+  };
+  const marriageDetails = {
+    husbandName: optionalStringField(details.husbandName, 150),
+    wifeMaidenName: optionalStringField(details.wifeMaidenName, 150),
+    dateOfMarriage: normalizeCivilRegistryDate(details.dateOfMarriage),
+    placeOfMarriage: optionalStringField(details.placeOfMarriage, 150),
+  };
+  const deathDetails = {
+    deceasedName: optionalStringField(details.deceasedName, 150),
+    dateOfDeath: normalizeCivilRegistryDate(details.dateOfDeath),
+    placeOfDeath: optionalStringField(details.placeOfDeath, 150),
+    relatedPersonName: optionalStringField(details.relatedPersonName, 150),
+  };
+
+  if (requestType === "Birth Certificate") {
+    requiredStringField(birthDetails.childName, "Child name");
+    requiredStringField(birthDetails.dateOfBirth, "Date of birth");
+    requiredStringField(birthDetails.placeOfBirth, "Place of birth");
+    requiredStringField(birthDetails.fatherName, "Father name");
+    requiredStringField(birthDetails.motherMaidenName, "Mother maiden name");
+  } else if (requestType === "Marriage Certificate") {
+    requiredStringField(marriageDetails.husbandName, "Husband name");
+    requiredStringField(marriageDetails.wifeMaidenName, "Wife maiden name");
+    requiredStringField(marriageDetails.dateOfMarriage, "Date of marriage");
+    requiredStringField(marriageDetails.placeOfMarriage, "Place of marriage");
+  } else {
+    requiredStringField(deathDetails.deceasedName, "Deceased name");
+    requiredStringField(deathDetails.dateOfDeath, "Date of death");
+    requiredStringField(deathDetails.placeOfDeath, "Place of death");
+  }
+
+  const representativeRaw = payload.representative && typeof payload.representative === "object"
+    ? (payload.representative as Record<string, unknown>)
+    : {};
+  const representative = {
+    representativeName: optionalStringField(representativeRaw.representativeName, 150),
+    representativeRelationship: optionalStringField(representativeRaw.representativeRelationship, 120),
+    authorizationLetterFlag: Boolean(representativeRaw.authorizationLetterFlag),
+    ownerIdCopyFlag: Boolean(representativeRaw.ownerIdCopyFlag),
+  };
+  if (claimantType === "representative") {
+    requiredStringField(representative.representativeName, "Representative name");
+    requiredStringField(representative.representativeRelationship, "Representative relationship");
+  }
+
+  return {
+    submissionMode: normalizedSubmissionMode,
+    requestType,
+    purpose,
+    claimantType,
+    requester: {
+      name: requesterName,
+      lastNameVerifier: verifierLastName,
+      contactNo,
+      email,
+      relationshipToOwner,
+      claimantType,
+    },
+    details: {
+      birth: birthDetails,
+      marriage: marriageDetails,
+      death: deathDetails,
+    },
+    representative,
+    verifierLastNameNormalized: verifierLastName,
+  };
+}
+
+async function nextCivilRegistryRefNo(tx: FirebaseFirestore.Transaction): Promise<string> {
+  const year = new Date().getFullYear();
+  const counterRef = db.collection("civil_registry_counters").doc(String(year));
+  const counterSnap = await tx.get(counterRef);
+  const currentSeq = Number(counterSnap.data()?.seq ?? 0);
+  const nextSeq = currentSeq + 1;
+  tx.set(counterRef, {
+    seq: nextSeq,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  }, {merge: true});
+  return `CR-${year}-${String(nextSeq).padStart(6, "0")}`;
+}
+
+function civilRegistryRequestListItem(id: string, row: Record<string, unknown>) {
+  return {
+    id,
+    refNo: coerceString(row.refNo) ?? id,
+    requestType: coerceString(row.requestType) ?? "",
+    submissionMode: coerceString(row.submissionMode) ?? "online",
+    status: coerceString(row.status) ?? "Submitted",
+    purpose: coerceString(row.purpose) ?? "",
+    submittedAt: toIsoString(row.submittedAt),
+    updatedAt: toIsoString(row.updatedAt),
+    requesterName: coerceString((row.requester as Record<string, unknown> | undefined)?.name) ?? "",
+    contactNo: coerceString((row.requester as Record<string, unknown> | undefined)?.contactNo) ?? "",
+  };
+}
+
 async function adminWriteAuditLogHandler(
   data: unknown,
   context: CallableContextLike
@@ -1561,11 +1924,7 @@ async function adminWriteAuditLogHandler(
   return {success: true};
 }
 
-export const adminWriteAuditLog = regionalFunctions.https.onCall((data, context) =>
-  adminWriteAuditLogHandler(data, context as CallableContextLike)
-);
-
-export const adminWriteAuditLogV2 = onCallV2({region: REGION}, async (request) => {
+export const adminWriteAuditLog = onCallV2({region: REGION}, async (request) => {
   try {
     return await adminWriteAuditLogHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -1666,11 +2025,7 @@ async function adminUpdateSettingsHandler(
   };
 }
 
-export const adminUpdateSettings = regionalFunctions.https.onCall((data, context) =>
-  adminUpdateSettingsHandler(data, context as CallableContextLike)
-);
-
-export const adminUpdateSettingsV2 = onCallV2({region: REGION}, async (request) => {
+export const adminUpdateSettings = onCallV2({region: REGION}, async (request) => {
   try {
     return await adminUpdateSettingsHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -1755,11 +2110,7 @@ async function adminUpdateReportStatusHandler(
   return {success: true, reportId, status: nextStatus};
 }
 
-export const adminUpdateReportStatus = regionalFunctions.https.onCall((data, context) =>
-  adminUpdateReportStatusHandler(data, context as CallableContextLike)
-);
-
-export const adminUpdateReportStatusV2 = onCallV2({region: REGION}, async (request) => {
+export const adminUpdateReportStatus = onCallV2({region: REGION}, async (request) => {
   try {
     return await adminUpdateReportStatusHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -1893,11 +2244,7 @@ async function adminAssignReportHandler(
   };
 }
 
-export const adminAssignReport = regionalFunctions.https.onCall((data, context) =>
-  adminAssignReportHandler(data, context as CallableContextLike)
-);
-
-export const adminAssignReportV2 = onCallV2({region: REGION}, async (request) => {
+export const adminAssignReport = onCallV2({region: REGION}, async (request) => {
   try {
     return await adminAssignReportHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -2039,11 +2386,7 @@ async function adminClaimNextReportHandler(
   throw new functions.https.HttpsError("not-found", "No available reports in queue.");
 }
 
-export const adminClaimNextReport = regionalFunctions.https.onCall((data, context) =>
-  adminClaimNextReportHandler(data, context as CallableContextLike)
-);
-
-export const adminClaimNextReportV2 = onCallV2({region: REGION}, async (request) => {
+export const adminClaimNextReport = onCallV2({region: REGION}, async (request) => {
   try {
     return await adminClaimNextReportHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -2161,13 +2504,662 @@ async function adminRequeueReportHandler(
   };
 }
 
-export const adminRequeueReport = regionalFunctions.https.onCall((data, context) =>
-  adminRequeueReportHandler(data, context as CallableContextLike)
-);
-
-export const adminRequeueReportV2 = onCallV2({region: REGION}, async (request) => {
+export const adminRequeueReport = onCallV2({region: REGION}, async (request) => {
   try {
     return await adminRequeueReportHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+async function civilRegistrySubmitHandler(
+  data: unknown
+) {
+  await requireFeatureWritable("civilRegistry");
+  const payload = data && typeof data === "object"
+    ? (data as Record<string, unknown>)
+    : {};
+  const normalized = normalizeCivilRegistryPayload(payload, "online");
+  const requestRef = db.collection("civil_registry_requests").doc();
+  let refNo = "";
+
+  await db.runTransaction(async (tx) => {
+    refNo = await nextCivilRegistryRefNo(tx);
+    tx.set(requestRef, {
+      refNo,
+      status: "Submitted",
+      requestType: normalized.requestType,
+      submissionMode: "online",
+      purpose: normalized.purpose,
+      requester: normalized.requester,
+      details: normalized.details,
+      representative: normalized.representative,
+      verifierLastNameNormalized: normalized.verifierLastNameNormalized,
+      officeId: CIVIL_REGISTRY_DEFAULT_OFFICE_ID,
+      submittedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      onsitePaymentOnly: true,
+      noOnlinePayment: true,
+    });
+    tx.set(civilRegistryHistoryRef(requestRef.id).doc(), {
+      oldStatus: null,
+      newStatus: "Submitted",
+      remarks: "Request submitted online.",
+      changedByUid: null,
+      changedByName: "Public Intake",
+      changedByRole: "public",
+      actionType: "submit",
+      changedAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  });
+
+  await addAuditLog({
+    action: "civil_registry_request_submitted",
+    entityType: "civil_registry_request",
+    entityId: requestRef.id,
+    refNo,
+    officeId: CIVIL_REGISTRY_DEFAULT_OFFICE_ID,
+    actorUid: null,
+    actorRole: "public",
+    actorName: "Public Intake",
+    before: null,
+    after: {status: "Submitted", requestType: normalized.requestType},
+    message: "Civil registry request submitted via online intake.",
+    timestamp: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  return {
+    success: true,
+    requestId: requestRef.id,
+    refNo,
+    status: "Submitted",
+    onsitePaymentOnly: true,
+  };
+}
+
+export const civilRegistrySubmit = onCallV2({region: REGION}, async (request) => {
+  try {
+    return await civilRegistrySubmitHandler(request.data);
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+async function civilRegistryCheckStatusHandler(
+  data: unknown
+) {
+  await requireFeatureEnabled("civilRegistry");
+  const payload = data && typeof data === "object"
+    ? (data as Record<string, unknown>)
+    : {};
+
+  const refNo = requiredStringField(payload.refNo, "Reference number").toUpperCase();
+  const verifierLastName = normalizeVerifierLastName(payload.verifierLastName);
+  const snapshot = await db
+    .collection("civil_registry_requests")
+    .where("refNo", "==", refNo)
+    .limit(1)
+    .get();
+
+  if (snapshot.empty) {
+    throw new functions.https.HttpsError("not-found", "Request not found.");
+  }
+
+  const rowDoc = snapshot.docs[0];
+  const row = (rowDoc.data() ?? {}) as Record<string, unknown>;
+  if (toLowerTrimmed(row.verifierLastNameNormalized) !== verifierLastName) {
+    throw new functions.https.HttpsError("not-found", "Request not found.");
+  }
+
+  const historySnapshot = await civilRegistryHistoryRef(rowDoc.id)
+    .orderBy("changedAt", "desc")
+    .limit(25)
+    .get();
+  const timeline = historySnapshot.docs.map((entry) => {
+    const dataRow = (entry.data() ?? {}) as Record<string, unknown>;
+    return {
+      id: entry.id,
+      oldStatus: coerceString(dataRow.oldStatus),
+      newStatus: coerceString(dataRow.newStatus) ?? "",
+      remarks: coerceString(dataRow.remarks),
+      changedAt: toIsoString(dataRow.changedAt),
+      actionType: coerceString(dataRow.actionType) ?? "status",
+    };
+  });
+
+  return {
+    success: true,
+    request: sanitizeCivilRegistryPublic({
+      ...row,
+      refNo,
+    }),
+    timeline,
+    notices: [
+      "Online intake only: no online payment.",
+      "Pay onsite at Municipal Cashier/Treasurer after status is Approved for Payment.",
+      "Release requires valid Official Receipt (OR).",
+    ],
+  };
+}
+
+export const civilRegistryCheckStatus = onCallV2({region: REGION}, async (request) => {
+  try {
+    return await civilRegistryCheckStatusHandler(request.data);
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+async function adminListCivilRegistryRequestsHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  await requireFeatureEnabled("civilRegistry");
+  await requireCivilRegistryStaffContext(context);
+  const payload = data && typeof data === "object"
+    ? (data as Record<string, unknown>)
+    : {};
+  const statusFilter = coerceString(payload.status);
+  const typeFilter = coerceString(payload.requestType);
+  const modeFilter = coerceString(payload.submissionMode);
+  const fromDate = payload.fromDate ? new Date(String(payload.fromDate)) : null;
+  const toDate = payload.toDate ? new Date(String(payload.toDate)) : null;
+  const rawLimit = typeof payload.limit === "number" ? Math.floor(payload.limit) : 250;
+  const listLimit = Math.max(20, Math.min(500, rawLimit));
+
+  const snapshot = await db
+    .collection("civil_registry_requests")
+    .orderBy("submittedAt", "desc")
+    .limit(listLimit)
+    .get();
+
+  let items = snapshot.docs.map((doc) => civilRegistryRequestListItem(doc.id, doc.data() ?? {}));
+  if (statusFilter) {
+    items = items.filter((item) => item.status === statusFilter);
+  }
+  if (typeFilter) {
+    items = items.filter((item) => item.requestType === typeFilter);
+  }
+  if (modeFilter) {
+    items = items.filter((item) => item.submissionMode === modeFilter);
+  }
+  if (fromDate && !Number.isNaN(fromDate.getTime())) {
+    const fromTime = fromDate.getTime();
+    items = items.filter((item) => parseEpochMs(item.submittedAt) >= fromTime);
+  }
+  if (toDate && !Number.isNaN(toDate.getTime())) {
+    const toTime = toDate.getTime() + (24 * 60 * 60 * 1000) - 1;
+    items = items.filter((item) => parseEpochMs(item.submittedAt) <= toTime);
+  }
+
+  return {
+    items,
+    statuses: CIVIL_REGISTRY_STATUSES,
+    requestTypes: CIVIL_REGISTRY_REQUEST_TYPES,
+  };
+}
+
+export const adminListCivilRegistryRequests = onCallV2({region: REGION}, async (request) => {
+  try {
+    return await adminListCivilRegistryRequestsHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+async function adminGetCivilRegistryRequestHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  await requireFeatureEnabled("civilRegistry");
+  await requireCivilRegistryStaffContext(context);
+  const payload = data && typeof data === "object"
+    ? (data as Record<string, unknown>)
+    : {};
+  const requestId = coerceString(payload.requestId);
+  if (!requestId) {
+    throw new functions.https.HttpsError("invalid-argument", "requestId is required.");
+  }
+
+  const requestSnap = await db.collection("civil_registry_requests").doc(requestId).get();
+  if (!requestSnap.exists) {
+    throw new functions.https.HttpsError("not-found", "Civil registry request not found.");
+  }
+  const row = (requestSnap.data() ?? {}) as Record<string, unknown>;
+  const historySnap = await civilRegistryHistoryRef(requestId)
+    .orderBy("changedAt", "desc")
+    .limit(120)
+    .get();
+  const history = historySnap.docs.map((entry) => {
+    const dataRow = (entry.data() ?? {}) as Record<string, unknown>;
+    return {
+      id: entry.id,
+      oldStatus: coerceString(dataRow.oldStatus),
+      newStatus: coerceString(dataRow.newStatus) ?? "",
+      remarks: coerceString(dataRow.remarks),
+      changedByUid: coerceString(dataRow.changedByUid),
+      changedByName: coerceString(dataRow.changedByName),
+      changedByRole: coerceString(dataRow.changedByRole),
+      changedAt: toIsoString(dataRow.changedAt),
+      actionType: coerceString(dataRow.actionType) ?? "status",
+    };
+  });
+
+  return {
+    request: {
+      id: requestSnap.id,
+      ...row,
+      submittedAt: toIsoString(row.submittedAt),
+      updatedAt: toIsoString(row.updatedAt),
+    },
+    history,
+  };
+}
+
+export const adminGetCivilRegistryRequest = onCallV2({region: REGION}, async (request) => {
+  try {
+    return await adminGetCivilRegistryRequestHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+async function adminCreateCivilRegistryWalkInHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const actor = await requireCivilRegistryStaffContext(context);
+  await requireFeatureWritable("civilRegistry");
+  const payload = data && typeof data === "object"
+    ? (data as Record<string, unknown>)
+    : {};
+  const normalized = normalizeCivilRegistryPayload(payload, "walk-in");
+  const requestRef = db.collection("civil_registry_requests").doc();
+  let refNo = "";
+  const actorMeta = civilRegistryActorMeta(actor, context);
+
+  await db.runTransaction(async (tx) => {
+    refNo = await nextCivilRegistryRefNo(tx);
+    tx.set(requestRef, {
+      refNo,
+      status: "Submitted",
+      requestType: normalized.requestType,
+      submissionMode: "walk-in",
+      purpose: normalized.purpose,
+      requester: normalized.requester,
+      details: normalized.details,
+      representative: normalized.representative,
+      verifierLastNameNormalized: normalized.verifierLastNameNormalized,
+      officeId: actor.officeId ?? CIVIL_REGISTRY_DEFAULT_OFFICE_ID,
+      createdByUid: actor.uid,
+      createdByName: actorMeta.lastActionByName,
+      submittedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      onsitePaymentOnly: true,
+      noOnlinePayment: true,
+      ...actorMeta,
+    });
+    tx.set(civilRegistryHistoryRef(requestRef.id).doc(), {
+      oldStatus: null,
+      newStatus: "Submitted",
+      remarks: "Walk-in request encoded by staff.",
+      changedByUid: actor.uid,
+      changedByName: actorMeta.lastActionByName,
+      changedByRole: actor.role,
+      actionType: "walk-in-encode",
+      changedAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  });
+
+  await addAuditLog({
+    action: "civil_registry_walkin_encoded",
+    entityType: "civil_registry_request",
+    entityId: requestRef.id,
+    refNo,
+    officeId: actor.officeId ?? CIVIL_REGISTRY_DEFAULT_OFFICE_ID,
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorName: actorMeta.lastActionByName,
+    before: null,
+    after: {status: "Submitted", requestType: normalized.requestType, submissionMode: "walk-in"},
+    message: "Walk-in civil registry request encoded.",
+    timestamp: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  return {
+    success: true,
+    requestId: requestRef.id,
+    refNo,
+    status: "Submitted",
+  };
+}
+
+export const adminCreateCivilRegistryWalkIn = onCallV2({region: REGION}, async (request) => {
+  try {
+    return await adminCreateCivilRegistryWalkInHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+async function adminUpdateCivilRegistryStatusHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const actor = await requireCivilRegistryStaffContext(context);
+  await requireFeatureWritable("civilRegistry");
+  const payload = data && typeof data === "object"
+    ? (data as Record<string, unknown>)
+    : {};
+  const requestId = coerceString(payload.requestId);
+  const nextStatus = normalizeCivilRegistryStatus(payload.status);
+  const remarks = coerceString(payload.remarks);
+  if (!requestId) {
+    throw new functions.https.HttpsError("invalid-argument", "requestId is required.");
+  }
+  const restrictedStatuses = new Set(["Paid", "Released"]);
+  if (restrictedStatuses.has(nextStatus)) {
+    throw new functions.https.HttpsError(
+      "failed-precondition",
+      `Use dedicated workflow action for status ${nextStatus}.`
+    );
+  }
+  if (remarksRequiredForCivilRegistryStatus(nextStatus) && !remarks) {
+    throw new functions.https.HttpsError("invalid-argument", `Remarks are required for status "${nextStatus}".`);
+  }
+
+  const actorMeta = civilRegistryActorMeta(actor, context);
+  const requestRef = db.collection("civil_registry_requests").doc(requestId);
+  let previousStatus = "Submitted";
+
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(requestRef);
+    if (!snap.exists) {
+      throw new functions.https.HttpsError("not-found", "Civil registry request not found.");
+    }
+    const row = (snap.data() ?? {}) as Record<string, unknown>;
+    previousStatus = normalizeCivilRegistryStatus(row.status ?? "Submitted");
+    validateCivilRegistryTransition(previousStatus, nextStatus);
+    if (nextStatus === "Ready for Pickup" && !coerceString((row.payment as Record<string, unknown> | undefined)?.orNo)) {
+      throw new functions.https.HttpsError("failed-precondition", "Cannot mark ready for pickup without OR/payment record.");
+    }
+
+    const updateData: Record<string, unknown> = {
+      status: nextStatus,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      ...actorMeta,
+    };
+    if (nextStatus === "Ready for Pickup") {
+      updateData.release = {
+        ...(row.release && typeof row.release === "object" ? row.release as Record<string, unknown> : {}),
+        dateReadyForPickup: admin.firestore.FieldValue.serverTimestamp(),
+      };
+    }
+    tx.set(requestRef, updateData, {merge: true});
+    tx.set(civilRegistryHistoryRef(requestId).doc(), {
+      oldStatus: previousStatus,
+      newStatus: nextStatus,
+      remarks: remarks ?? null,
+      changedByUid: actor.uid,
+      changedByName: actorMeta.lastActionByName,
+      changedByRole: actor.role,
+      actionType: "status-update",
+      changedAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  });
+
+  await addAuditLog({
+    action: "civil_registry_status_updated",
+    entityType: "civil_registry_request",
+    entityId: requestId,
+    officeId: actor.officeId ?? CIVIL_REGISTRY_DEFAULT_OFFICE_ID,
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorName: actorMeta.lastActionByName,
+    before: {status: previousStatus},
+    after: {status: nextStatus},
+    message: remarks ?? `Status changed from ${previousStatus} to ${nextStatus}.`,
+    timestamp: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  return {success: true, requestId, status: nextStatus};
+}
+
+export const adminUpdateCivilRegistryStatus = onCallV2({region: REGION}, async (request) => {
+  try {
+    return await adminUpdateCivilRegistryStatusHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+async function adminRecordCivilRegistryPaymentHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const actor = await requireCivilRegistryStaffContext(context);
+  await requireFeatureWritable("civilRegistry");
+  if (!(actor.role === "super_admin" || actor.role === "admin")) {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "Only super admin or admin from Municipal Local Civil Registry Office can record payment."
+    );
+  }
+  const payload = data && typeof data === "object"
+    ? (data as Record<string, unknown>)
+    : {};
+  const requestId = requiredStringField(payload.requestId, "requestId");
+  const orNo = requiredStringField(payload.orNo, "OR number");
+  const amount = Number(payload.amount);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw new functions.https.HttpsError("invalid-argument", "Valid amount is required.");
+  }
+  const datePaidIso = normalizeCivilRegistryDate(payload.datePaid) ?? new Date().toISOString();
+  const cashierName = coerceString(payload.cashierName) ?? actorDisplayName(actor);
+  const actorMeta = civilRegistryActorMeta(actor, context);
+  const requestRef = db.collection("civil_registry_requests").doc(requestId);
+  let previousStatus = "Submitted";
+
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(requestRef);
+    if (!snap.exists) {
+      throw new functions.https.HttpsError("not-found", "Civil registry request not found.");
+    }
+    const row = (snap.data() ?? {}) as Record<string, unknown>;
+    previousStatus = normalizeCivilRegistryStatus(row.status ?? "Submitted");
+    validateCivilRegistryTransition(previousStatus, "Paid");
+
+    tx.set(requestRef, {
+      status: "Paid",
+      payment: {
+        orNo,
+        amount,
+        datePaid: datePaidIso,
+        cashierUid: actor.uid,
+        cashierName,
+        recordedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      ...actorMeta,
+    }, {merge: true});
+    tx.set(civilRegistryHistoryRef(requestId).doc(), {
+      oldStatus: previousStatus,
+      newStatus: "Paid",
+      remarks: `Payment recorded. OR: ${orNo}`,
+      changedByUid: actor.uid,
+      changedByName: cashierName,
+      changedByRole: actor.role,
+      actionType: "payment-recorded",
+      changedAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  });
+
+  await addAuditLog({
+    action: "civil_registry_payment_recorded",
+    entityType: "civil_registry_request",
+    entityId: requestId,
+    officeId: actor.officeId ?? "MUNICIPAL_CASHIER",
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorName: cashierName,
+    before: {status: previousStatus},
+    after: {status: "Paid", orNo, amount},
+    message: `Payment recorded with OR ${orNo}.`,
+    timestamp: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  return {success: true, requestId, status: "Paid"};
+}
+
+export const adminRecordCivilRegistryPayment = onCallV2({region: REGION}, async (request) => {
+  try {
+    return await adminRecordCivilRegistryPaymentHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+async function adminRecordCivilRegistryReleaseHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const actor = await requireCivilRegistryStaffContext(context);
+  await requireFeatureWritable("civilRegistry");
+  const payload = data && typeof data === "object"
+    ? (data as Record<string, unknown>)
+    : {};
+  const requestId = requiredStringField(payload.requestId, "requestId");
+  const claimantName = requiredStringField(payload.claimantName, "Claimant name");
+  const claimantIdPresented = requiredStringField(payload.claimantIdPresented, "ID presented");
+  const releasedByName = coerceString(payload.releasedByName) ?? actorDisplayName(actor);
+  const releaseDateIso = normalizeCivilRegistryDate(payload.dateReleased) ?? new Date().toISOString();
+  const actorMeta = civilRegistryActorMeta(actor, context);
+  const requestRef = db.collection("civil_registry_requests").doc(requestId);
+  let previousStatus = "Submitted";
+  let orNo = "";
+
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(requestRef);
+    if (!snap.exists) {
+      throw new functions.https.HttpsError("not-found", "Civil registry request not found.");
+    }
+    const row = (snap.data() ?? {}) as Record<string, unknown>;
+    previousStatus = normalizeCivilRegistryStatus(row.status ?? "Submitted");
+    validateCivilRegistryTransition(previousStatus, "Released");
+    const payment = row.payment && typeof row.payment === "object"
+      ? (row.payment as Record<string, unknown>)
+      : {};
+    orNo = coerceString(payment.orNo) ?? "";
+    if (!orNo) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "Cannot release request without Official Receipt (OR)."
+      );
+    }
+
+    const existingRelease = row.release && typeof row.release === "object"
+      ? (row.release as Record<string, unknown>)
+      : {};
+    tx.set(requestRef, {
+      status: "Released",
+      release: {
+        ...existingRelease,
+        dateReadyForPickup: existingRelease.dateReadyForPickup ?? null,
+        dateReleased: releaseDateIso,
+        claimantName,
+        claimantIdPresented,
+        releasedByUid: actor.uid,
+        releasedByName,
+        releasedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      ...actorMeta,
+    }, {merge: true});
+    tx.set(civilRegistryHistoryRef(requestId).doc(), {
+      oldStatus: previousStatus,
+      newStatus: "Released",
+      remarks: `Released to ${claimantName}.`,
+      changedByUid: actor.uid,
+      changedByName: releasedByName,
+      changedByRole: actor.role,
+      actionType: "release-recorded",
+      changedAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  });
+
+  await addAuditLog({
+    action: "civil_registry_released",
+    entityType: "civil_registry_request",
+    entityId: requestId,
+    officeId: actor.officeId ?? CIVIL_REGISTRY_DEFAULT_OFFICE_ID,
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorName: releasedByName,
+    before: {status: previousStatus},
+    after: {status: "Released", claimantName, claimantIdPresented, orNo},
+    message: `Civil registry request released to ${claimantName}.`,
+    timestamp: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  return {success: true, requestId, status: "Released"};
+}
+
+export const adminRecordCivilRegistryRelease = onCallV2({region: REGION}, async (request) => {
+  try {
+    return await adminRecordCivilRegistryReleaseHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+async function adminCivilRegistrySummaryHandler(
+  _data: unknown,
+  context: CallableContextLike
+) {
+  await requireFeatureEnabled("civilRegistry");
+  await requireCivilRegistryStaffContext(context);
+  const source = db.collection("civil_registry_requests");
+  const now = new Date();
+  const dayStart = new Date(now);
+  dayStart.setHours(0, 0, 0, 0);
+
+  const totalSubmittedToday = await queryCount(
+    source.where("submittedAt", ">=", admin.firestore.Timestamp.fromDate(dayStart))
+  );
+  const birthCount = await queryCount(source.where("requestType", "==", "Birth Certificate"));
+  const marriageCount = await queryCount(source.where("requestType", "==", "Marriage Certificate"));
+  const deathCount = await queryCount(source.where("requestType", "==", "Death Certificate"));
+  const approvedForPayment = await queryCount(source.where("status", "==", "Approved for Payment"));
+  const paid = await queryCount(source.where("status", "==", "Paid"));
+  const readyForPickup = await queryCount(source.where("status", "==", "Ready for Pickup"));
+  const released = await queryCount(source.where("status", "==", "Released"));
+  const pending = await queryCount(
+    source.where("status", "in", ["Submitted", "Under Review", "For Compliance", "For Manual Verification"])
+  );
+
+  return {
+    totalSubmittedToday,
+    byType: {
+      birth: birthCount,
+      marriage: marriageCount,
+      death: deathCount,
+    },
+    approvedForPayment,
+    paid,
+    readyForPickup,
+    released,
+    pendingComplianceManual: pending,
+  };
+}
+
+export const adminCivilRegistrySummary = onCallV2({region: REGION}, async (request) => {
+  try {
+    return await adminCivilRegistrySummaryHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
     throw normalizeCallableErrorForV2(error);
   }
@@ -2203,6 +3195,15 @@ export const opsRuntimeHealth = functions.https.onCall(async (data, context) => 
     "adminClaimNextReport",
     "adminRequeueReport",
     "adminWriteAuditLog",
+    "civilRegistrySubmit",
+    "civilRegistryCheckStatus",
+    "adminListCivilRegistryRequests",
+    "adminGetCivilRegistryRequest",
+    "adminUpdateCivilRegistryStatus",
+    "adminRecordCivilRegistryPayment",
+    "adminRecordCivilRegistryRelease",
+    "adminCreateCivilRegistryWalkIn",
+    "adminCivilRegistrySummary",
     "dtsCreateTrackingRecord",
     "dtsInitiateTransfer",
     "dtsConfirmReceipt",
@@ -3788,11 +4789,7 @@ async function dtsCreateTrackingRecordHandler(
   return {success: true, id: docRef.id, trackingNo};
 }
 
-export const dtsCreateTrackingRecord = regionalFunctions.https.onCall((data, context) =>
-  dtsCreateTrackingRecordHandler(data, context as CallableContextLike)
-);
-
-export const dtsCreateTrackingRecordV2 = onCallV2({region: REGION}, async (request) => {
+export const dtsCreateTrackingRecord = onCallV2({region: REGION}, async (request) => {
   try {
     return await dtsCreateTrackingRecordHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -4490,11 +5487,7 @@ async function setTrackingPinHandler(
   return {success: true};
 }
 
-export const setTrackingPin = regionalFunctions.https.onCall((data, context) =>
-  setTrackingPinHandler(data, context as CallableContextLike)
-);
-
-export const setTrackingPinV2 = onCallV2({region: REGION}, async (request) => {
+export const setTrackingPin = onCallV2({region: REGION}, async (request) => {
   try {
     return await setTrackingPinHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -4604,8 +5597,7 @@ async function handleTrackLookupHttpRequest(
   }
 }
 
-export const trackLookup = regionalFunctions.https.onRequest(handleTrackLookupHttpRequest);
-export const trackLookupV2 = onRequestV2({region: REGION}, handleTrackLookupHttpRequest);
+export const trackLookup = onRequestV2({region: REGION}, handleTrackLookupHttpRequest);
 
 /**
  * =========================
@@ -5049,13 +6041,4 @@ export const exportDtsQrZip = functions.https.onCall(
   }
 );
 
-/**
- * MySQL mirror is intentionally disabled for now.
- * Firestore remains the sole active datastore for app + website.
- */
-export const retryMysqlMirrorQueue = regionalFunctions.pubsub
-  .schedule("every 5 minutes")
-  .onRun(async () => {
-    functions.logger.info("retryMysqlMirrorQueue noop: MySQL mirror is disabled.");
-    return null;
-  });
+

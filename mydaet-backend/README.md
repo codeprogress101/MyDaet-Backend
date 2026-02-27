@@ -4,7 +4,7 @@ Firebase project: `mydaet`
 Primary region: `us-central1`
 
 Firestore is the source of truth for web + app.  
-MySQL mirror is currently disabled.
+MySQL mirror has been removed.
 
 ## Setup
 
@@ -97,8 +97,7 @@ Behavior defaults:
 
 Callable:
 
-- `adminUpdateSettings` (Gen1)
-- `adminUpdateSettingsV2` (Gen2)
+- `adminUpdateSettings` (Gen2)
 
 The callable writes settings and creates audit entries in both:
 
@@ -181,7 +180,7 @@ Use `us-central1` in all clients:
 Check:
 
 1. Caller has `super_admin` claim and active profile.
-2. Callable deploy includes `adminUpdateSettings` and `adminUpdateSettingsV2`.
+2. Callable deploy includes `adminUpdateSettings`.
 3. Firestore rules deploy includes `/system/settings` write allowance for `super_admin`.
 
 ### Missing env (web)
