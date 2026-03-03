@@ -1,3 +1,9 @@
+/*
+ * Storage rules for MyDaet uploads.
+ * Public emergency reporting uploads are handled by Cloud Functions using the
+ * Admin SDK, so clients are denied direct access to the backend-managed
+ * `reports_public/**` path. This preserves validation and rate-limit checks.
+ */
 rules_version = '2';
 
 service firebase.storage {
@@ -212,6 +218,12 @@ service firebase.storage {
           || request.resource.contentType == "application/msword"
           || request.resource.contentType == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         );
+    }
+
+    match /reports_public/{allPaths=**} {
+      // Public reporting uses HTTP functions so clients cannot bypass
+      // duplicate checks, attachment validation, or abuse throttling.
+      allow read, write: if false;
     }
 
     match /ads/{adId}/{fileName} {

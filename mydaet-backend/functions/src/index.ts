@@ -1,3 +1,11 @@
+/*
+ * Revised 5-role RBAC model for Cloud Functions.
+ * Roles are now distinct across five values: resident, moderator, office_admin, admin, and super_admin.
+ * Office Admin stays office-scoped, while Admin is municipal-wide.
+ * Cloud Functions remain the authoritative RBAC enforcement layer and must stay aligned with Firestore rules.
+ * This pass also hardens report SOP enforcement (claim/assign/status/SLA escalation)
+ * so the admin UI mirrors the workflow but does not become the authority.
+ */
 import * as functions from "firebase-functions/v1";
 import * as admin from "firebase-admin";
 import * as crypto from "crypto";
@@ -21,6 +29,10 @@ const TRACK_LOOKUP_ALLOWED_ORIGINS = String(process.env.TRACK_LOOKUP_ALLOWED_ORI
   .split(",")
   .map((value) => value.trim())
   .filter((value) => value.length > 0);
+const PUBLIC_REPORT_ALLOWED_ORIGINS = String(process.env.PUBLIC_REPORT_ALLOWED_ORIGINS ?? "")
+  .split(",")
+  .map((value) => value.trim())
+  .filter((value) => value.length > 0);
 const POST_COLLECTIONS = ["posts", "announcements"] as const;
 const PUBLISHED_STATUS_VARIANTS = ["published", "Published", "PUBLISHED"] as const;
 const SYSTEM_SETTINGS_FEATURE_KEYS = [
@@ -41,23 +53,32 @@ type SystemFeatureFlags = Record<SystemFeatureKey, boolean>;
  * Role definitions
  */
 type Role = "resident" | "moderator" | "office_admin" | "super_admin" | "admin";
-type NormalizedRole = "resident" | "moderator" | "admin" | "super_admin";
+type NormalizedRole = "resident" | "moderator" | "office_admin" | "admin" | "super_admin";
 const ALLOWED_ROLES: Role[] = [
   "resident",
   "moderator",
-  "admin",
   "office_admin",
+  "admin",
   "super_admin",
 ];
 const USER_MANAGEMENT_ROLES: NormalizedRole[] = [
   "resident",
   "moderator",
+  "office_admin",
   "admin",
   "super_admin",
 ];
 const USER_MIN_PASSWORD_LENGTH = 8;
 
-const OPEN_STATUSES = ["submitted", "in_review", "assigned", "in_progress"] as const;
+// The report workflow follows the LGU SOP:
+// Submission -> Verification -> Assignment -> In Progress -> Resolution -> Closure.
+// `acknowledged` is the explicit acknowledgement checkpoint before full review.
+const OPEN_STATUSES = ["submitted", "acknowledged", "in_review", "assigned", "in_progress"] as const;
+const PUBLIC_REPORT_WRITE_SERVICE = "Public reporting HTTP endpoints";
+const PUBLIC_REPORT_RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000;
+const PUBLIC_REPORT_RATE_LIMIT_MAX_REQUESTS = 5;
+const EMERGENCY_DUPLICATE_WINDOW_MS = 45 * 60 * 1000;
+const EMERGENCY_DUPLICATE_DISTANCE_METERS = 250;
 
 function isOpenStatus(s: string): boolean {
   return (OPEN_STATUSES as readonly string[]).includes(s);
@@ -68,10 +89,14 @@ function normalizeRole(raw: unknown): NormalizedRole {
   const role = String(raw).trim().toLowerCase();
   if (role === "super_admin" || role === "superadmin" || role === "super-admin") return "super_admin";
   if (
-    role === "admin" ||
     role === "office_admin" ||
     role === "officeadmin" ||
     role === "office-admin"
+  ) {
+    return "office_admin";
+  }
+  if (
+    role === "admin"
   ) {
     return "admin";
   }
@@ -150,12 +175,75 @@ async function getUserProfile(uid: string) {
 function roleDisplayLabel(role: NormalizedRole): string {
   if (role === "super_admin") return "Super Admin";
   if (role === "admin") return "Admin";
+  if (role === "office_admin") return "Office Admin";
   if (role === "moderator") return "Moderator";
   return "Resident";
 }
 
 function roleRequiresOffice(role: NormalizedRole): boolean {
-  return role === "admin" || role === "moderator";
+  // Only office-scoped staff roles must carry office metadata.
+  return role === "office_admin" || role === "moderator";
+}
+
+function isMunicipalAdminRole(role: NormalizedRole): boolean {
+  return role === "admin" || role === "super_admin";
+}
+
+function canAssignReportsRole(role: NormalizedRole): boolean {
+  return role === "office_admin" || role === "admin" || role === "super_admin";
+}
+
+function reportTouchesOfficeId(
+  row: Record<string, unknown>,
+  officeId: string | null
+): boolean {
+  if (!officeId) return false;
+  return [
+    coerceString(row.officeId),
+    coerceString(row.assignedOfficeId),
+    coerceString(row.currentOfficeId),
+  ].some((value) => value != null && value === officeId);
+}
+
+function canClaimReportInActorScope(
+  actor: StaffContext,
+  row: Record<string, unknown>
+): boolean {
+  if (actor.role === "super_admin" || actor.role === "admin") {
+    return true;
+  }
+
+  if (actor.role === "moderator") {
+    // Moderators can only claim to themselves from their office queue. Once
+    // claimed, later status updates still require assignedToUid == actor.uid.
+    return reportTouchesOfficeId(row, actor.officeId);
+  }
+
+  if (coerceString(row.assignedToUid) === actor.uid) return true;
+  if (coerceString(row.createdByUid) === actor.uid) return true;
+  return reportTouchesOfficeId(row, actor.officeId);
+}
+
+const REPORT_STATUS_TRANSITIONS: Record<string, string[]> = {
+  submitted: ["acknowledged", "in_review", "assigned", "rejected"],
+  acknowledged: ["in_review", "assigned", "rejected"],
+  in_review: ["assigned", "rejected"],
+  assigned: ["in_progress", "resolved", "rejected", "in_review"],
+  in_progress: ["resolved", "rejected", "in_review"],
+  resolved: ["closed", "in_progress"],
+  closed: [],
+  rejected: [],
+};
+
+function canTransitionReportStatus(
+  previousStatus: string,
+  nextStatus: string
+): boolean {
+  if (previousStatus === nextStatus) {
+    return true;
+  }
+  const allowed = REPORT_STATUS_TRANSITIONS[previousStatus] ?? [];
+  return allowed.includes(nextStatus);
 }
 
 function parseEpochMs(value: unknown): number {
@@ -196,6 +284,8 @@ function serializeReportRow(
   const data = row ?? {};
   return {
     id,
+    // Report list responses intentionally include the stored fields so the admin queue
+    // and the active map can reuse the same payload without another fetch layer.
     ...data,
     createdAt: toIsoString(data.createdAt),
     updatedAt: toIsoString(data.updatedAt),
@@ -307,10 +397,112 @@ async function addHistory(
     });
 }
 
+async function addReportTimeline(
+  reportId: string,
+  entry: Record<string, unknown>
+): Promise<void> {
+  // Report timeline is append-only so each workflow movement stays auditable
+  // even if summary fields on the parent report document change later.
+  await db
+    .collection("reports")
+    .doc(reportId)
+    .collection("timeline")
+    .add({
+      ...entry,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+}
+
 async function addAuditLog(entry: Record<string, unknown>): Promise<void> {
   await db.collection("audit_logs").add({
     ...entry,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+}
+
+async function listActiveUserIdsByQuery(
+  queryRef: FirebaseFirestore.Query
+): Promise<string[]> {
+  const snapshot = await queryRef.get();
+  return snapshot.docs
+    .filter((doc) => coerceBool((doc.data() ?? {}).isActive, true))
+    .map((doc) => doc.id);
+}
+
+async function listReportEscalationRecipients(
+  row: Record<string, unknown>
+): Promise<string[]> {
+  const officeId =
+    coerceString(row.currentOfficeId) ??
+    coerceString(row.officeId) ??
+    coerceString(row.assignedOfficeId);
+  const recipients = new Set<string>();
+
+  const adminUids = await listActiveUserIdsByQuery(
+    db.collection("users").where("role", "in", ["admin", "super_admin"]).limit(200)
+  );
+  adminUids.forEach((uid) => recipients.add(uid));
+
+  if (officeId) {
+    const officeAdminUids = await listActiveUserIdsByQuery(
+      db
+        .collection("users")
+        .where("role", "==", "office_admin")
+        .where("officeId", "==", officeId)
+        .limit(200)
+    );
+    officeAdminUids.forEach((uid) => recipients.add(uid));
+  }
+
+  return Array.from(recipients);
+}
+
+async function recordReportEscalation(
+  reportId: string,
+  row: Record<string, unknown>,
+  stage: "emergency" | "acknowledge" | "verify" | "assign",
+  notes: string
+): Promise<void> {
+  const recipients = await listReportEscalationRecipients(row);
+  const title =
+    coerceString(row.title) ??
+    coerceString(row.subject) ??
+    coerceString(row.concern) ??
+    "Report";
+  let status = "submitted";
+  try {
+    status = normalizeReportStatusInput(row.status ?? "submitted");
+  } catch {
+    status = "submitted";
+  }
+
+  await addReportTimeline(reportId, {
+    type: "ESCALATED",
+    actorUid: null,
+    actorRole: "system",
+    notes,
+    fromStatus: status,
+    toStatus: status,
+  });
+
+  await db.collection("reports").doc(reportId).set(
+    {
+      slaEscalation: {
+        stage,
+        notes,
+        notifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+    },
+    {merge: true}
+  );
+
+  await notifyUsers(recipients, {
+    title: stage === "emergency" ? "Emergency escalation" : "Report SLA escalation",
+    body: `${title} - ${notes}`,
+    type: "report_escalated",
+    reportId,
+    status,
+    assignedToUid: coerceString(row.assignedToUid) ?? "",
   });
 }
 
@@ -449,6 +641,534 @@ async function requireFeatureWritable(featureKey: SystemFeatureKey): Promise<Sys
     );
   }
   return settings;
+}
+
+type PublicReportLane = "issue" | "emergency";
+type PublicReportStatus =
+  "submitted" |
+  "acknowledged" |
+  "in_review" |
+  "assigned" |
+  "in_progress" |
+  "resolved" |
+  "closed" |
+  "rejected";
+type PublicReportPriority = "low" | "medium" | "high" | "critical";
+type EmergencyTypeKey =
+  "road_accident" |
+  "medical" |
+  "fire" |
+  "crime" |
+  "other";
+
+type PublicReportGeo = {
+  lat: number | null;
+  lng: number | null;
+  geohash?: string;
+};
+
+type PublicReportAttachment = {
+  url: string;
+  contentType: string;
+  name: string;
+  path: string;
+};
+
+type PublicReportWriteInput = {
+  reportId?: string;
+  lane: PublicReportLane;
+  title: string;
+  category: string;
+  emergencyType: string | null;
+  barangay: string;
+  landmark: string;
+  description: string;
+  reporterName: string;
+  reporterContact: string;
+  source: "website" | "app";
+  geo: PublicReportGeo;
+  officeId: string;
+  officeName: string;
+  priority: PublicReportPriority;
+  trackingNumber: string;
+  attachments: PublicReportAttachment[];
+  duplicateOf: string | null;
+  duplicateWarning: string | null;
+  sla: {
+    acknowledgeBy: Date;
+    verifyBy: Date;
+    assignBy: Date;
+  };
+};
+
+const PUBLIC_REPORT_DEFAULT_ALLOWED_ORIGINS = [
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "http://localhost:4173",
+  "http://127.0.0.1:4173",
+] as const;
+
+const EMERGENCY_ROUTING_RULES: Record<EmergencyTypeKey, {officeId: string; officeName: string}> = {
+  // TODO: Replace these defaults with the actual LGU office routing table when stable office IDs are finalized.
+  road_accident: {officeId: "MDRRMO", officeName: "Municipal Disaster Risk Reduction and Management Office"},
+  medical: {officeId: "MDRRMO", officeName: "Municipal Disaster Risk Reduction and Management Office"},
+  fire: {officeId: "MDRRMO", officeName: "Municipal Disaster Risk Reduction and Management Office"},
+  crime: {officeId: "MDRRMO", officeName: "Municipal Disaster Risk Reduction and Management Office"},
+  other: {officeId: "MDRRMO", officeName: "Municipal Disaster Risk Reduction and Management Office"},
+};
+
+function getPublicReportAllowedOrigins(): string[] {
+  if (PUBLIC_REPORT_ALLOWED_ORIGINS.length > 0) {
+    return PUBLIC_REPORT_ALLOWED_ORIGINS;
+  }
+  return Array.from(PUBLIC_REPORT_DEFAULT_ALLOWED_ORIGINS);
+}
+
+function isAllowedPublicReportCorsOrigin(origin: string): boolean {
+  const allowedOrigins = getPublicReportAllowedOrigins();
+  if (allowedOrigins.length === 0) return true;
+  return allowedOrigins.includes(origin);
+}
+
+function applyPublicReportCors(
+  req: functions.https.Request,
+  res: functions.Response<unknown>
+): boolean {
+  const origin = String(req.headers.origin ?? "").trim();
+  if (!origin) {
+    // Non-browser clients (for example future mobile apps) may not send Origin.
+    res.set("Access-Control-Allow-Origin", "*");
+  } else if (isAllowedPublicReportCorsOrigin(origin)) {
+    res.set("Access-Control-Allow-Origin", origin);
+    res.set("Vary", "Origin");
+  } else {
+    return false;
+  }
+  res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+  return true;
+}
+
+async function requirePublicReportsWritable(
+  requireEmergencyFlag: boolean
+): Promise<void> {
+  const settingsSnap = await db.collection("system").doc("settings").get();
+  const raw = settingsSnap.exists ? settingsSnap.data() ?? {} : {};
+  const normalized = normalizeStoredSystemSettings(raw, true);
+  const rawFeatures =
+    raw.features && typeof raw.features === "object"
+      ? (raw.features as Record<string, unknown>)
+      : {};
+  const emergencyReportsEnabled = rawFeatures.emergencyReports == null ?
+    true :
+    Boolean(rawFeatures.emergencyReports);
+
+  if (!normalized.features.reports) {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "reports feature is currently disabled by Command Center."
+    );
+  }
+  if (requireEmergencyFlag && !emergencyReportsEnabled) {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "emergencyReports feature is currently disabled by Command Center."
+    );
+  }
+  if (normalized.readOnly) {
+    throw new functions.https.HttpsError(
+      "failed-precondition",
+      "System is in read-only mode. Public report intake is temporarily blocked."
+    );
+  }
+}
+
+function publicReportHttpStatus(error: unknown): {
+  code: string;
+  message: string;
+  statusCode: number;
+} {
+  const httpsError = error as functions.https.HttpsError;
+  const code = String(httpsError?.code ?? "internal");
+  const message = String(httpsError?.message ?? "Public report submission failed.");
+  const statusCode =
+    code === "invalid-argument" ? 400 :
+    code === "resource-exhausted" ? 429 :
+    code === "permission-denied" ? 503 :
+    code === "failed-precondition" ? 503 :
+    code === "not-found" ? 404 : 500;
+  return {code, message, statusCode};
+}
+
+function getRequestIp(req: functions.https.Request): string {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (typeof forwarded === "string" && forwarded.trim()) {
+    return forwarded.split(",")[0].trim();
+  }
+  if (Array.isArray(forwarded) && forwarded[0]) {
+    return String(forwarded[0]).split(",")[0].trim();
+  }
+  return String(req.ip ?? "unknown");
+}
+
+async function enforcePublicReportRateLimit(
+  req: functions.https.Request,
+  lane: PublicReportLane
+): Promise<void> {
+  // This is intentionally lightweight. Production should add App Check, reCAPTCHA,
+  // and a stronger central limiter, but this closes the obvious abuse gap now.
+  const ipHash = sha256(getRequestIp(req)).substring(0, 32);
+  const docId = `${lane}_${ipHash}`;
+  const rateRef = db.collection("public_report_rate_limits").doc(docId);
+  const windowStart = Date.now() - PUBLIC_REPORT_RATE_LIMIT_WINDOW_MS;
+
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(rateRef);
+    const data = snap.exists ? snap.data() ?? {} : {};
+    const lastAttemptMs = parseEpochMs(data.lastAttemptAt);
+    const currentCount =
+      lastAttemptMs >= windowStart ?
+        Math.max(0, Number(data.count ?? 0)) :
+        0;
+
+    if (currentCount >= PUBLIC_REPORT_RATE_LIMIT_MAX_REQUESTS) {
+      throw new functions.https.HttpsError(
+        "resource-exhausted",
+        "Too many submissions from this connection. Please wait a few minutes before trying again."
+      );
+    }
+
+    tx.set(rateRef, {
+      lane,
+      count: currentCount + 1,
+      ipHash,
+      lastAttemptAt: admin.firestore.FieldValue.serverTimestamp(),
+      expiresAt: admin.firestore.Timestamp.fromMillis(
+        Date.now() + PUBLIC_REPORT_RATE_LIMIT_WINDOW_MS
+      ),
+    }, {merge: true});
+  });
+}
+
+function requiredPublicField(value: unknown, label: string, max = 160): string {
+  const text = String(value ?? "").trim();
+  if (!text) {
+    throw new functions.https.HttpsError("invalid-argument", `${label} is required.`);
+  }
+  if (text.length > max) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      `${label} must be ${max} characters or fewer.`
+    );
+  }
+  return text;
+}
+
+function optionalPublicField(value: unknown, max = 2000): string {
+  const text = String(value ?? "").trim();
+  if (!text) return "";
+  if (text.length > max) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      `Field must be ${max} characters or fewer.`
+    );
+  }
+  return text;
+}
+
+function normalizePublicSource(value: unknown): "website" | "app" {
+  const source = String(value ?? "").trim().toLowerCase();
+  return source === "app" ? "app" : "website";
+}
+
+function normalizeEmergencyType(raw: unknown): EmergencyTypeKey {
+  const value = String(raw ?? "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (value === "road" || value === "road_accident" || value === "roadincident") {
+    return "road_accident";
+  }
+  if (value === "medical" || value === "medical_emergency") {
+    return "medical";
+  }
+  if (value === "fire") {
+    return "fire";
+  }
+  if (value === "crime" || value === "crime_security") {
+    return "crime";
+  }
+  return "other";
+}
+
+function emergencyTypeLabel(type: EmergencyTypeKey): string {
+  if (type === "road_accident") return "Road Accident";
+  if (type === "medical") return "Medical Emergency";
+  if (type === "fire") return "Fire Incident";
+  if (type === "crime") return "Crime / Security";
+  return "Other Emergency";
+}
+
+function deriveEmergencyPriority(type: EmergencyTypeKey): PublicReportPriority {
+  if (type === "fire") return "critical";
+  if (type === "medical" || type === "road_accident" || type === "crime") {
+    return "high";
+  }
+  return "medium";
+}
+
+function deriveIssuePriority(category: string): PublicReportPriority {
+  const normalized = String(category).trim().toLowerCase();
+  if (normalized === "public_safety" || normalized === "road_traffic") {
+    return "high";
+  }
+  if (normalized === "solid_waste" || normalized === "environment") {
+    return "medium";
+  }
+  return "low";
+}
+
+function normalizeGeoInput(raw: unknown): PublicReportGeo {
+  const source = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const latValue = Number(source.lat);
+  const lngValue = Number(source.lng);
+  if (!Number.isFinite(latValue) || !Number.isFinite(lngValue)) {
+    return {lat: null, lng: null};
+  }
+  if (latValue < -90 || latValue > 90 || lngValue < -180 || lngValue > 180) {
+    throw new functions.https.HttpsError("invalid-argument", "Invalid map coordinates.");
+  }
+  return {
+    lat: Number(latValue.toFixed(6)),
+    lng: Number(lngValue.toFixed(6)),
+  };
+}
+
+function haversineDistanceMeters(a: PublicReportGeo, b: PublicReportGeo): number {
+  if (a.lat == null || a.lng == null || b.lat == null || b.lng == null) {
+    return Number.POSITIVE_INFINITY;
+  }
+  const toRad = (value: number) => (value * Math.PI) / 180;
+  const earthRadiusMeters = 6371000;
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
+  const lat1 = toRad(a.lat);
+  const lat2 = toRad(b.lat);
+  const arc = Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+  return 2 * earthRadiusMeters * Math.asin(Math.sqrt(arc));
+}
+
+async function detectEmergencyDuplicate(
+  emergencyType: EmergencyTypeKey,
+  barangay: string,
+  geo: PublicReportGeo
+): Promise<{duplicateOf: string | null; duplicateWarning: string | null}> {
+  const thresholdDate = new Date(Date.now() - EMERGENCY_DUPLICATE_WINDOW_MS);
+  const recentSnap = await db
+    .collection("reports")
+    .where("createdAt", ">=", admin.firestore.Timestamp.fromDate(thresholdDate))
+    .orderBy("createdAt", "desc")
+    .limit(50)
+    .get();
+
+  for (const doc of recentSnap.docs) {
+    const row = doc.data() ?? {};
+    if (String(row.lane ?? "") !== "emergency") {
+      continue;
+    }
+    if (String(row.emergencyType ?? "") !== emergencyType) {
+      continue;
+    }
+    if (String(row.barangay ?? "").trim().toLowerCase() !== barangay.toLowerCase()) {
+      continue;
+    }
+    const rowGeo = normalizeGeoInput(row.geo);
+    const distance = haversineDistanceMeters(geo, rowGeo);
+    if (distance <= EMERGENCY_DUPLICATE_DISTANCE_METERS) {
+      return {
+        duplicateOf: doc.id,
+        duplicateWarning:
+          "A similar emergency report was submitted nearby recently. The report was accepted and flagged for staff review.",
+      };
+    }
+  }
+
+  return {duplicateOf: null, duplicateWarning: null};
+}
+
+function buildEmergencySla(now: Date): {
+  acknowledgeBy: Date;
+  verifyBy: Date;
+  assignBy: Date;
+} {
+  // LGU can tune these targets later through a config-backed policy if needed.
+  return {
+    acknowledgeBy: new Date(now.getTime() + (60 * 60 * 1000)),
+    verifyBy: new Date(now.getTime() + (6 * 60 * 60 * 1000)),
+    assignBy: new Date(now.getTime() + (12 * 60 * 60 * 1000)),
+  };
+}
+
+function generatePublicTrackingNumber(prefix: string): string {
+  const year = new Date().getFullYear();
+  const suffix = crypto.randomInt(0, 1000000).toString().padStart(6, "0");
+  return `${prefix}-${year}-${suffix}`;
+}
+
+async function uploadPublicReportAttachment(
+  reportId: string,
+  fileBaseName: string,
+  dataUrl: string
+): Promise<PublicReportAttachment | null> {
+  const trimmed = String(dataUrl ?? "").trim();
+  if (!trimmed) return null;
+  const match = trimmed.match(/^data:([^;]+);base64,(.+)$/);
+  if (!match) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "Attachment must be a valid data URL."
+    );
+  }
+  const contentType = match[1].trim().toLowerCase();
+  if (!contentType.startsWith("image/")) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "Only image attachments are allowed for public reports."
+    );
+  }
+  const buffer = Buffer.from(match[2], "base64");
+  if (buffer.length > (3 * 1024 * 1024)) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "Attachment is too large."
+    );
+  }
+
+  const extension = contentType.split("/")[1] || "jpg";
+  const safeName = fileBaseName.replace(/[^a-z0-9_-]/gi, "_").toLowerCase();
+  const storagePath = `reports_public/${reportId}/${safeName}.${extension}`;
+  const bucket = admin.storage().bucket();
+  const file = bucket.file(storagePath);
+  await file.save(buffer, {
+    resumable: false,
+    metadata: {
+      contentType,
+      cacheControl: "public,max-age=3600",
+    },
+  });
+  const [url] = await file.getSignedUrl({
+    action: "read",
+    expires: "2100-01-01",
+  });
+  return {
+    url,
+    contentType,
+    name: `${safeName}.${extension}`,
+    path: storagePath,
+  };
+}
+
+async function createPublicReportDocument(
+  input: PublicReportWriteInput
+): Promise<{reportId: string; trackingNumber: string}> {
+  const reportRef = input.reportId ?
+    db.collection("reports").doc(input.reportId) :
+    db.collection("reports").doc();
+  const locationAddress = `${input.landmark}, ${input.barangay}`.trim();
+  const now = admin.firestore.FieldValue.serverTimestamp();
+
+  // `officeId` and `currentOfficeId` are written on create so staff scoping works
+  // immediately for queues, dashboards, and the active map.
+  await reportRef.set({
+    lane: input.lane,
+    emergencyType: input.emergencyType,
+    category: input.category,
+    title: input.title,
+    barangay: input.barangay,
+    landmark: input.landmark,
+    location: {
+      address: locationAddress,
+      barangay: input.barangay,
+      landmark: input.landmark,
+    },
+    geo: input.geo,
+    status: "submitted" as PublicReportStatus,
+    priority: input.priority,
+    officeId: input.officeId,
+    officeName: input.officeName,
+    currentOfficeId: input.officeId,
+    assignedOfficeId: null,
+    assignedToUid: null,
+    assignedToName: null,
+    createdByUid: null,
+    createdByName: input.reporterName,
+    createdByEmail: null,
+    source: input.source,
+    reporter: {
+      name: input.reporterName,
+      contact: input.reporterContact,
+    },
+    name: input.reporterName,
+    contact: input.reporterContact,
+    contactNumber: input.reporterContact,
+    description: input.description,
+    attachments: input.attachments,
+    ticketNumber: input.trackingNumber,
+    trackingNumber: input.trackingNumber,
+    duplicateOf: input.duplicateOf,
+    duplicateWarning: input.duplicateWarning,
+    sla: {
+      acknowledgeBy: admin.firestore.Timestamp.fromDate(input.sla.acknowledgeBy),
+      verifyBy: admin.firestore.Timestamp.fromDate(input.sla.verifyBy),
+      assignBy: admin.firestore.Timestamp.fromDate(input.sla.assignBy),
+    },
+    lastActionByUid: null,
+    lastActionByName: PUBLIC_REPORT_WRITE_SERVICE,
+    lastActionByEmail: null,
+    lastActionByRole: "public",
+    lastActionAt: now,
+    createdAt: now,
+    updatedAt: now,
+  });
+
+  return {
+    reportId: reportRef.id,
+    trackingNumber: input.trackingNumber,
+  };
+}
+
+function overdueReportSlaStage(
+  row: Record<string, unknown>,
+  nowMsValue = Date.now()
+): "acknowledge" | "verify" | "assign" | null {
+  let status = "submitted";
+  try {
+    status = normalizeReportStatusInput(row.status ?? "submitted");
+  } catch {
+    status = "submitted";
+  }
+  const assignedToUid = coerceString(row.assignedToUid);
+  const acknowledgeBy = parseEpochMs((row.sla as Record<string, unknown> | undefined)?.acknowledgeBy);
+  const verifyBy = parseEpochMs((row.sla as Record<string, unknown> | undefined)?.verifyBy);
+  const assignBy = parseEpochMs((row.sla as Record<string, unknown> | undefined)?.assignBy);
+
+  if (status === "submitted" && acknowledgeBy > 0 && nowMsValue >= acknowledgeBy) {
+    return "acknowledge";
+  }
+  if (
+    (status === "submitted" || status === "acknowledged") &&
+    verifyBy > 0 &&
+    nowMsValue >= verifyBy
+  ) {
+    return "verify";
+  }
+  if (
+    !assignedToUid &&
+    (status === "submitted" || status === "acknowledged" || status === "in_review") &&
+    assignBy > 0 &&
+    nowMsValue >= assignBy
+  ) {
+    return "assign";
+  }
+  return null;
 }
 
 function announcementActor(data: Record<string, unknown> | null) {
@@ -611,10 +1331,16 @@ async function requireStaffContext(
       "Inactive account."
     );
   }
-  if (!(role === "super_admin" || role === "admin" || role === "moderator")) {
+  if (!(role === "super_admin" || role === "admin" || role === "office_admin" || role === "moderator")) {
     throw new functions.https.HttpsError(
       "permission-denied",
       "Staff access required."
+    );
+  }
+  if (roleRequiresOffice(role) && !officeId) {
+    throw new functions.https.HttpsError(
+      "failed-precondition",
+      "Office-scoped staff accounts must have an office assignment."
     );
   }
 
@@ -659,7 +1385,7 @@ async function resolveManagedOffice(
   if (!officeId) {
       throw new functions.https.HttpsError(
         "invalid-argument",
-        "officeId is required for admin or moderator."
+        "officeId is required for office_admin or moderator."
       );
   }
 
@@ -1254,19 +1980,34 @@ async function queryCount(queryRef: FirebaseFirestore.Query): Promise<number> {
   return Number(snap.data().count ?? 0);
 }
 
-async function bestCount(candidates: FirebaseFirestore.Query[]): Promise<number> {
+async function unionCount(candidates: FirebaseFirestore.Query[]): Promise<number> {
   if (candidates.length === 0) {
     return 0;
   }
 
-  let best = 0;
+  const ids = new Set<string>();
   for (const queryRef of candidates) {
-    const count = await queryCount(queryRef);
-    if (count > best) {
-      best = count;
-    }
+    const snapshot = await queryRef.get();
+    snapshot.docs.forEach((docSnapshot) => {
+      ids.add(docSnapshot.id);
+    });
   }
-  return best;
+  return ids.size;
+}
+
+async function collectQueryRows(
+  candidates: FirebaseFirestore.Query[]
+): Promise<Map<string, FirebaseFirestore.DocumentData>> {
+  const rows = new Map<string, FirebaseFirestore.DocumentData>();
+  for (const queryRef of candidates) {
+    const snapshot = await queryRef.get();
+    snapshot.docs.forEach((docSnapshot) => {
+      if (!rows.has(docSnapshot.id)) {
+        rows.set(docSnapshot.id, docSnapshot.data() ?? {});
+      }
+    });
+  }
+  return rows;
 }
 
 /**
@@ -1284,12 +2025,13 @@ export const adminDashboardSummary = functions.https.onCall(async (_data, contex
   const usersRef = db.collection("users");
 
   const isSuperAdmin = actor.role === "super_admin";
+  const hasMunicipalAdminAccess = isMunicipalAdminRole(actor.role);
   const scopedOfficeId = coerceString(actor.officeId);
 
   let announcementsCount = 0;
   for (const collectionName of POST_COLLECTIONS) {
     const postsRef = db.collection(collectionName);
-    if (isSuperAdmin) {
+    if (hasMunicipalAdminAccess) {
       announcementsCount += await queryCount(postsRef);
       continue;
     }
@@ -1302,12 +2044,14 @@ export const adminDashboardSummary = functions.https.onCall(async (_data, contex
     for (const statusValue of PUBLISHED_STATUS_VARIANTS) {
       postCandidates.push(postsRef.where("status", "==", statusValue));
     }
-    announcementsCount += await bestCount(postCandidates);
+    announcementsCount += await unionCount(postCandidates);
   }
 
   let reportsCount = 0;
-  if (isSuperAdmin) {
-    reportsCount = await queryCount(reportsRef);
+  let reportRows = new Map<string, FirebaseFirestore.DocumentData>();
+  if (hasMunicipalAdminAccess) {
+    reportRows = await collectQueryRows([reportsRef]);
+    reportsCount = reportRows.size;
   } else {
     const reportCandidates: FirebaseFirestore.Query[] = [];
     if (scopedOfficeId) {
@@ -1317,11 +2061,12 @@ export const adminDashboardSummary = functions.https.onCall(async (_data, contex
     }
     reportCandidates.push(reportsRef.where("assignedToUid", "==", actor.uid));
     reportCandidates.push(reportsRef.where("createdByUid", "==", actor.uid));
-    reportsCount = await bestCount(reportCandidates);
+    reportRows = await collectQueryRows(reportCandidates);
+    reportsCount = reportRows.size;
   }
 
   let dtsCount = 0;
-  if (isSuperAdmin) {
+  if (hasMunicipalAdminAccess) {
     dtsCount = await queryCount(dtsRef);
   } else {
     const dtsCandidates: FirebaseFirestore.Query[] = [];
@@ -1330,13 +2075,47 @@ export const adminDashboardSummary = functions.https.onCall(async (_data, contex
     }
     dtsCandidates.push(dtsRef.where("currentCustodianUid", "==", actor.uid));
     dtsCandidates.push(dtsRef.where("createdByUid", "==", actor.uid));
-    dtsCount = await bestCount(dtsCandidates);
+    dtsCount = await unionCount(dtsCandidates);
   }
 
   let usersCount: number | null = null;
   if (isSuperAdmin) {
     usersCount = await queryCount(usersRef);
   }
+
+  const activeDashboardStatuses = new Set([
+    "submitted",
+    "acknowledged",
+    "in_review",
+    "assigned",
+    "in_progress",
+  ]);
+  const reportValues = Array.from(reportRows.values());
+  const visibleActiveReports = reportValues.filter((rawRow) => {
+    const row = (rawRow ?? {}) as Record<string, unknown>;
+    const status = (coerceString(row.status) ?? "").toLowerCase().replace(/\s+/g, "_");
+    return activeDashboardStatuses.has(status);
+  });
+  const myActiveCount = visibleActiveReports.filter(
+    (row) => coerceString((row ?? {}).assignedToUid) === actor.uid
+  ).length;
+  const officeUnassignedCount = scopedOfficeId
+    ? visibleActiveReports.filter((rawRow) => {
+      const row = (rawRow ?? {}) as Record<string, unknown>;
+      const rowOfficeId = coerceString(row.officeId);
+      const rowCurrentOfficeId = coerceString(row.currentOfficeId);
+      const rowAssignedOfficeId = coerceString(row.assignedOfficeId);
+      const inOfficeScope = rowOfficeId === scopedOfficeId
+        || rowCurrentOfficeId === scopedOfficeId
+        || rowAssignedOfficeId === scopedOfficeId;
+      return inOfficeScope && !coerceString(row.assignedToUid);
+    }).length
+    : 0;
+  const emergencyActiveCount = visibleActiveReports.filter((rawRow) => {
+    const row = (rawRow ?? {}) as Record<string, unknown>;
+    const lane = (coerceString(row.lane) ?? "").toLowerCase();
+    return lane === "emergency" || !!coerceString(row.emergencyType);
+  }).length;
 
   return {
     role: actor.role,
@@ -1346,6 +2125,12 @@ export const adminDashboardSummary = functions.https.onCall(async (_data, contex
       reports: reportsCount,
       dtsDocuments: dtsCount,
       users: usersCount,
+    },
+    workload: {
+      myActiveCount,
+      officeUnassignedCount,
+      visibleBacklogCount: visibleActiveReports.length,
+      emergencyActiveCount,
     },
     notes: {
       announcementsSource: POST_COLLECTIONS.join("+"),
@@ -1376,7 +2161,8 @@ export const adminListReportsScoped = functions.https.onCall(async (data, contex
   const rows = new Map<string, FirebaseFirestore.DocumentData>();
   const queries: FirebaseFirestore.Query[] = [];
 
-  if (actor.role === "super_admin") {
+  // Municipal Admin sees all offices; Office Admin and Moderator stay office-scoped.
+  if (isMunicipalAdminRole(actor.role)) {
     queries.push(reportsRef);
   } else {
     if (actor.officeId) {
@@ -1416,7 +2202,7 @@ export const adminListReportAssignees = functions.https.onCall(async (_data, con
 
   const usersRef = db.collection("users");
   let usersQuery: FirebaseFirestore.Query;
-  if (actor.role === "super_admin") {
+  if (isMunicipalAdminRole(actor.role)) {
     usersQuery = usersRef
       .where("role", "in", ["super_admin", "admin", "office_admin", "moderator"])
       .limit(300);
@@ -1461,7 +2247,12 @@ export const adminListReportAssignees = functions.https.onCall(async (_data, con
 });
 
 function reportInActorScope(actor: StaffContext, row: Record<string, unknown>): boolean {
-  if (actor.role === "super_admin") return true;
+  // Super Admin and municipal Admin are municipal-wide for reports.
+  if (actor.role === "super_admin" || actor.role === "admin") return true;
+  // Moderator must claim or own the report before updating status.
+  if (actor.role === "moderator") {
+    return coerceString(row.assignedToUid) === actor.uid;
+  }
   const actorOfficeId = coerceString(actor.officeId);
   if (coerceString(row.assignedToUid) === actor.uid) return true;
   if (coerceString(row.createdByUid) === actor.uid) return true;
@@ -1493,6 +2284,7 @@ function normalizeReportStatusInput(raw: unknown): string {
     .replace(/\s+/g, "_");
   const allowed = new Set([
     "submitted",
+    "acknowledged",
     "in_review",
     "assigned",
     "in_progress",
@@ -1517,7 +2309,7 @@ function isQueueEligibleReport(row: Record<string, unknown>): boolean {
   } catch {
     return false;
   }
-  return status === "submitted" || status === "in_review";
+  return status === "submitted" || status === "acknowledged" || status === "in_review";
 }
 
 const CIVIL_REGISTRY_DEFAULT_OFFICE_ID = "OFFICE_OF_THE_CIVIL_REGISTRAR";
@@ -1622,7 +2414,8 @@ async function requireCivilRegistryStaffContext(
   context: CallableContextLike
 ): Promise<StaffContext> {
   const actor = await requireStaffContext(context);
-  if (actor.role === "super_admin") {
+  // Municipal Admin is municipal-wide and should be able to access Civil Registry tools without a Civil Registry office assignment.
+  if (actor.role === "super_admin" || actor.role === "admin") {
     return actor;
   }
 
@@ -1630,7 +2423,7 @@ async function requireCivilRegistryStaffContext(
   if (!isCivilRegistryOfficeTagged(actor.officeId, actor.officeName ?? officeNameFromProfile)) {
     throw new functions.https.HttpsError(
       "permission-denied",
-      "Civil Registry access is limited to super admin and Municipal Local Civil Registry Office staff."
+      "Civil Registry access is limited to assigned Civil Registry moderators or office admins, municipal admins, and super admins."
     );
   }
 
@@ -2047,6 +2840,13 @@ async function adminUpdateReportStatusHandler(
     throw new functions.https.HttpsError("invalid-argument", "reportId is required.");
   }
   const nextStatus = normalizeReportStatusInput(payload.status);
+  const notes = coerceString(payload.notes);
+  if (notes && notes.length > 1000) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "notes must be 1000 characters or fewer."
+    );
+  }
 
   const reportRef = db.collection("reports").doc(reportId);
   const actorMeta = reportActorMeta(actor, context);
@@ -2062,12 +2862,21 @@ async function adminUpdateReportStatusHandler(
 
     const canUpdate =
       actor.role === "super_admin" ||
-      (actor.role === "admin" && reportInActorScope(actor, row)) ||
+      actor.role === "admin" ||
+      (actor.role === "office_admin" && reportInActorScope(actor, row)) ||
       (actor.role === "moderator" && coerceString(row.assignedToUid) === actor.uid);
     if (!canUpdate) {
       throw new functions.https.HttpsError(
         "permission-denied",
         "You are not allowed to update this report."
+      );
+    }
+    // Server-side status transitions keep the SOP order enforceable even if the
+    // client UI is bypassed or stale.
+    if (!canTransitionReportStatus(previousStatus, nextStatus)) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        `Invalid status transition from ${previousStatus} to ${nextStatus}.`
       );
     }
 
@@ -2107,12 +2916,120 @@ async function adminUpdateReportStatusHandler(
     message: `Status changed from ${previousStatus} to ${nextStatus}.`,
   });
 
+  if (notes) {
+    // Status notes are appended as their own timeline entry so operators can
+    // explain progress updates without mutating or overwriting earlier history.
+    await addReportTimeline(reportId, {
+      type: "NOTE",
+      actorUid: actor.uid,
+      actorRole: actor.role,
+      notes,
+      fromStatus: nextStatus,
+      toStatus: nextStatus,
+    });
+  }
+
   return {success: true, reportId, status: nextStatus};
 }
 
 export const adminUpdateReportStatus = onCallV2({region: REGION}, async (request) => {
   try {
     return await adminUpdateReportStatusHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+async function staffClaimReportHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const payload = (data && typeof data === "object")
+    ? (data as Record<string, unknown>)
+    : {};
+  const actor = await requireStaffContext(context);
+  await requireFeatureWritable("reports");
+
+  const reportId = coerceString(payload.reportId);
+  if (!reportId) {
+    throw new functions.https.HttpsError("invalid-argument", "reportId is required.");
+  }
+
+  const reportRef = db.collection("reports").doc(reportId);
+  const actorMeta = reportActorMeta(actor, context);
+  let previousStatus = "submitted";
+  let officeId: string | null = null;
+
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(reportRef);
+    if (!snap.exists) {
+      throw new functions.https.HttpsError("not-found", "Report not found.");
+    }
+    const row = (snap.data() ?? {}) as Record<string, unknown>;
+    if (!canClaimReportInActorScope(actor, row)) {
+      throw new functions.https.HttpsError(
+        "permission-denied",
+        "You are not allowed to claim this report."
+      );
+    }
+
+    const currentAssignee = coerceString(row.assignedToUid);
+    if (currentAssignee && currentAssignee !== actor.uid) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "This report is already assigned to another staff member."
+      );
+    }
+
+    previousStatus = normalizeReportStatusInput(row.status ?? "submitted");
+    officeId = coerceString(row.officeId) ?? coerceString(row.currentOfficeId);
+    const nextStatus =
+      previousStatus === "submitted" ||
+      previousStatus === "acknowledged" ||
+      previousStatus === "in_review"
+        ? "assigned"
+        : previousStatus;
+
+    tx.set(
+      reportRef,
+      {
+        assignedToUid: actor.uid,
+        assignedToName: actorDisplayName(actor),
+        assignedOfficeId: actor.officeId ?? coerceString(row.officeId) ?? coerceString(row.currentOfficeId) ?? null,
+        status: nextStatus,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        ...actorMeta,
+      },
+      {merge: true}
+    );
+  });
+
+  await addAuditLog({
+    action: "report_claimed",
+    entityType: "report",
+    entityId: reportId,
+    reportId,
+    officeId,
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorOfficeId: actor.officeId ?? null,
+    actorName: actorMeta.lastActionByName,
+    before: {status: previousStatus},
+    after: {status: previousStatus === "submitted" || previousStatus === "acknowledged" || previousStatus === "in_review" ? "assigned" : previousStatus, assignedToUid: actor.uid},
+    message: "Claimed to self.",
+  });
+
+  return {
+    success: true,
+    reportId,
+    assignedToUid: actor.uid,
+    assignedToName: actorDisplayName(actor),
+  };
+}
+
+export const staffClaimReport = onCallV2({region: REGION}, async (request) => {
+  try {
+    return await staffClaimReportHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
     throw normalizeCallableErrorForV2(error);
   }
@@ -2127,10 +3044,10 @@ async function adminAssignReportHandler(
     : {};
   const actor = await requireStaffContext(context);
   await requireFeatureWritable("reports");
-  if (!(actor.role === "super_admin" || actor.role === "admin")) {
+  if (!canAssignReportsRole(actor.role)) {
     throw new functions.https.HttpsError(
       "permission-denied",
-      "Only admin and super admin can assign reports."
+      "Only office_admin, admin, and super_admin can assign reports."
     );
   }
   const reportId = coerceString(payload.reportId);
@@ -2155,10 +3072,11 @@ async function adminAssignReportHandler(
     if (!targetProfile.isActive) {
       throw new functions.https.HttpsError("failed-precondition", "Assignee account is inactive.");
     }
-    if (actor.role !== "super_admin" && actor.officeId && targetProfile.officeId !== actor.officeId) {
+    // Office Admin can assign only inside the same office; municipal Admin can assign cross-office.
+    if (actor.role === "office_admin" && actor.officeId && targetProfile.officeId !== actor.officeId) {
       throw new functions.https.HttpsError(
         "permission-denied",
-        "Admin can only assign staff within the same office."
+        "Office Admin can only assign staff within the same office."
       );
     }
     assignedOfficeId = targetProfile.officeId ?? null;
@@ -2183,7 +3101,7 @@ async function adminAssignReportHandler(
     beforeAssignedUid = coerceString(row.assignedToUid);
     beforeStatus = normalizeReportStatusInput(row.status ?? "submitted");
     const shouldAutoAssignStatus = Boolean(assigneeUid) &&
-      (beforeStatus === "submitted" || beforeStatus === "in_review");
+      (beforeStatus === "submitted" || beforeStatus === "acknowledged" || beforeStatus === "in_review");
     const shouldReturnToQueue = !assigneeUid && beforeStatus === "assigned";
     afterStatus = shouldAutoAssignStatus ? "assigned" : (shouldReturnToQueue ? "in_review" : beforeStatus);
 
@@ -2261,23 +3179,23 @@ async function adminClaimNextReportHandler(
     : {};
   const actor = await requireStaffContext(context);
   await requireFeatureWritable("reports");
-  if (!(actor.role === "super_admin" || actor.role === "admin")) {
+  if (actor.role === "resident") {
     throw new functions.https.HttpsError(
       "permission-denied",
-      "Only admin and super admin can claim reports from queue."
+      "Only staff can claim reports from queue."
     );
   }
 
   const requestedOfficeId = coerceString(payload.officeId);
-  const scopeOfficeId = actor.role === "super_admin" ? requestedOfficeId : actor.officeId;
-  if (actor.role !== "super_admin" && !scopeOfficeId) {
+  const scopeOfficeId = isMunicipalAdminRole(actor.role) ? requestedOfficeId : actor.officeId;
+  if (!isMunicipalAdminRole(actor.role) && !scopeOfficeId) {
     throw new functions.https.HttpsError(
       "failed-precondition",
-      "Admin account must have an office assignment."
+      "Office-scoped report managers must have an office assignment."
     );
   }
 
-  const queueStatuses = ["submitted", "in_review"];
+  const queueStatuses = ["submitted", "acknowledged", "in_review"];
   let claimQuery: FirebaseFirestore.Query = db
     .collection("reports")
     .where("assignedToUid", "==", null)
@@ -2309,7 +3227,7 @@ async function adminClaimNextReportHandler(
       if (scopeOfficeId && coerceString(row.officeId) !== scopeOfficeId) {
         return null;
       }
-      if (!reportInActorScope(actor, row)) {
+      if (!canClaimReportInActorScope(actor, row)) {
         return null;
       }
 
@@ -2403,10 +3321,10 @@ async function adminRequeueReportHandler(
     : {};
   const actor = await requireStaffContext(context);
   await requireFeatureWritable("reports");
-  if (!(actor.role === "super_admin" || actor.role === "admin")) {
+  if (!canAssignReportsRole(actor.role)) {
     throw new functions.https.HttpsError(
       "permission-denied",
-      "Only admin and super admin can requeue reports."
+      "Only office_admin, admin, and super_admin can requeue reports."
     );
   }
 
@@ -2511,6 +3429,234 @@ export const adminRequeueReport = onCallV2({region: REGION}, async (request) => 
     throw normalizeCallableErrorForV2(error);
   }
 });
+
+function normalizePublicIssuePayload(
+  payload: Record<string, unknown>
+): Omit<PublicReportWriteInput, "trackingNumber" | "officeId" | "officeName" | "priority" | "sla" | "duplicateOf" | "duplicateWarning" | "attachments"> {
+  const category = requiredPublicField(payload.category || "general", "Category", 80)
+    .toLowerCase()
+    .replace(/\s+/g, "_");
+  const title = requiredPublicField(payload.title, "Issue title", 120);
+  const description = optionalPublicField(payload.description, 2000);
+  if (!description) {
+    throw new functions.https.HttpsError("invalid-argument", "Description is required.");
+  }
+  const barangay = requiredPublicField(payload.barangay || "Unspecified", "Barangay", 120);
+  const rawLocation = requiredPublicField(payload.location, "Location", 200);
+  const reporterName = optionalPublicField(payload.name, 120) || "Anonymous";
+  const reporterContact = optionalPublicField(payload.contact, 120) || "Not provided";
+
+  return {
+    lane: "issue",
+    title,
+    category,
+    emergencyType: null,
+    barangay,
+    landmark: rawLocation,
+    description,
+    reporterName,
+    reporterContact,
+    source: normalizePublicSource(payload.source),
+    geo: normalizeGeoInput(payload.geo),
+  };
+}
+
+function normalizeEmergencyPayload(
+  payload: Record<string, unknown>
+): Omit<PublicReportWriteInput, "trackingNumber" | "officeId" | "officeName" | "priority" | "sla" | "duplicateOf" | "duplicateWarning" | "attachments"> & {
+  emergencyTypeKey: EmergencyTypeKey;
+  photoDataUrl: string;
+} {
+  const emergencyTypeKey = normalizeEmergencyType(payload.emergencyType);
+  const barangay = requiredPublicField(payload.barangay, "Barangay", 120);
+  const landmark = requiredPublicField(payload.landmark, "Purok / street / landmark", 200);
+  const reporterName = requiredPublicField(payload.reporterName, "Reporter name", 120);
+  const reporterContact = requiredPublicField(payload.contactNumber, "Contact number", 120);
+  const description = optionalPublicField(payload.description, 2000);
+  const privacyAccepted = payload.privacyAccepted === true;
+  if (!privacyAccepted) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "Privacy notice acknowledgement is required."
+    );
+  }
+
+  return {
+    lane: "emergency",
+    title: `${emergencyTypeLabel(emergencyTypeKey)} - ${barangay}`,
+    category: emergencyTypeKey,
+    emergencyType: emergencyTypeKey,
+    emergencyTypeKey,
+    barangay,
+    landmark,
+    description,
+    reporterName,
+    reporterContact,
+    source: normalizePublicSource(payload.source),
+    geo: normalizeGeoInput(payload.geo),
+    photoDataUrl: optionalPublicField(payload.photoDataUrl, 4 * 1024 * 1024),
+  };
+}
+
+async function handleSubmitPublicIssueHttpRequest(
+  req: functions.https.Request,
+  res: functions.Response<unknown>
+) {
+  const corsAllowed = applyPublicReportCors(req, res);
+  if (!corsAllowed) {
+    res.status(403).json({error: "Origin not allowed.", code: "permission-denied"});
+    return;
+  }
+  if (req.method === "OPTIONS") {
+    res.status(204).send("");
+    return;
+  }
+  if (req.method !== "POST") {
+    res.status(405).json({error: "Method not allowed.", code: "method-not-allowed"});
+    return;
+  }
+
+  try {
+    await requirePublicReportsWritable(false);
+    await enforcePublicReportRateLimit(req, "issue");
+    const payload = req.body && typeof req.body === "object" ?
+      (req.body as Record<string, unknown>) :
+      {};
+    const normalized = normalizePublicIssuePayload(payload);
+    const trackingNumber = generatePublicTrackingNumber("RPT");
+    const routedOffice = {
+      // TODO: Replace this safe default with a category-based office router once official office IDs are finalized.
+      officeId: "MDRRMO",
+      officeName: "Municipal Disaster Risk Reduction and Management Office",
+    };
+    const now = new Date();
+    const result = await createPublicReportDocument({
+      ...normalized,
+      trackingNumber,
+      officeId: routedOffice.officeId,
+      officeName: routedOffice.officeName,
+      priority: deriveIssuePriority(normalized.category),
+      attachments: [],
+      duplicateOf: null,
+      duplicateWarning: null,
+      sla: buildEmergencySla(now),
+    });
+
+    res.status(200).json({
+      success: true,
+      trackingNumber: result.trackingNumber,
+      lane: "issue",
+    });
+  } catch (error) {
+    const {code, message, statusCode} = publicReportHttpStatus(error);
+    functions.logger.warn("submitPublicReport request failed.", {
+      code,
+      statusCode,
+      ipHash: sha256(getRequestIp(req)).substring(0, 16),
+      region: REGION,
+    });
+    res.status(statusCode).json({error: message, code});
+  }
+}
+
+export const submitPublicReport = onRequestV2(
+  {region: REGION},
+  handleSubmitPublicIssueHttpRequest
+);
+
+async function handleSubmitEmergencyReportHttpRequest(
+  req: functions.https.Request,
+  res: functions.Response<unknown>
+) {
+  const corsAllowed = applyPublicReportCors(req, res);
+  if (!corsAllowed) {
+    res.status(403).json({error: "Origin not allowed.", code: "permission-denied"});
+    return;
+  }
+  if (req.method === "OPTIONS") {
+    res.status(204).send("");
+    return;
+  }
+  if (req.method !== "POST") {
+    res.status(405).json({error: "Method not allowed.", code: "method-not-allowed"});
+    return;
+  }
+
+  try {
+    await requirePublicReportsWritable(true);
+    await enforcePublicReportRateLimit(req, "emergency");
+    const payload = req.body && typeof req.body === "object" ?
+      (req.body as Record<string, unknown>) :
+      {};
+    const normalized = normalizeEmergencyPayload(payload);
+    const routingRule = EMERGENCY_ROUTING_RULES[normalized.emergencyTypeKey];
+    const duplicate = await detectEmergencyDuplicate(
+      normalized.emergencyTypeKey,
+      normalized.barangay,
+      normalized.geo
+    );
+    const trackingNumber = generatePublicTrackingNumber("EMR");
+    const now = new Date();
+    const provisionalReportId = db.collection("reports").doc().id;
+    const photoAttachment = normalized.photoDataUrl ?
+      await uploadPublicReportAttachment(
+        provisionalReportId,
+        "incident_photo",
+        normalized.photoDataUrl
+      ) :
+      null;
+    const attachments = photoAttachment ? [photoAttachment] : [];
+
+    // The report write uses a deterministic document id when an attachment exists
+    // so the uploaded path and report document stay in sync.
+    const result = await createPublicReportDocument({
+      ...normalized,
+      reportId: provisionalReportId,
+      emergencyType: normalized.emergencyTypeKey,
+      trackingNumber,
+      officeId: routingRule.officeId,
+      officeName: routingRule.officeName,
+      priority: deriveEmergencyPriority(normalized.emergencyTypeKey),
+      attachments,
+      duplicateOf: duplicate.duplicateOf,
+      duplicateWarning: duplicate.duplicateWarning,
+      sla: buildEmergencySla(now),
+    });
+
+    // Emergency intake is escalated immediately to the routed office queue and
+    // municipal admins so the 1-hour acknowledgement target is visible from the
+    // moment the ticket lands.
+    await recordReportEscalation(result.reportId, {
+      ...normalized,
+      officeId: routingRule.officeId,
+      currentOfficeId: routingRule.officeId,
+      assignedToUid: null,
+      status: "submitted",
+      title: normalized.title,
+    }, "emergency", "Emergency lane reported. Immediate dispatch review required.");
+
+    res.status(200).json({
+      success: true,
+      trackingNumber: result.trackingNumber,
+      duplicateWarning: duplicate.duplicateWarning,
+      lane: "emergency",
+    });
+  } catch (error) {
+    const {code, message, statusCode} = publicReportHttpStatus(error);
+    functions.logger.warn("submitEmergencyReport request failed.", {
+      code,
+      statusCode,
+      ipHash: sha256(getRequestIp(req)).substring(0, 16),
+      region: REGION,
+    });
+    res.status(statusCode).json({error: message, code});
+  }
+}
+
+export const submitEmergencyReport = onRequestV2(
+  {region: REGION},
+  handleSubmitEmergencyReportHttpRequest
+);
 
 async function civilRegistrySubmitHandler(
   data: unknown
@@ -2945,7 +4091,7 @@ async function adminRecordCivilRegistryPaymentHandler(
   if (!(actor.role === "super_admin" || actor.role === "admin")) {
     throw new functions.https.HttpsError(
       "permission-denied",
-      "Only super admin or admin from Municipal Local Civil Registry Office can record payment."
+      "Only super admin or municipal admin can record payment."
     );
   }
   const payload = data && typeof data === "object"
@@ -3191,6 +4337,7 @@ export const opsRuntimeHealth = functions.https.onCall(async (data, context) => 
   const requiredCallables: string[] = [
     "adminUpdateSettings",
     "adminUpdateReportStatus",
+    "staffClaimReport",
     "adminAssignReport",
     "adminClaimNextReport",
     "adminRequeueReport",
@@ -3259,7 +4406,8 @@ export const setUserRole = functions.https.onCall(async (data, context) => {
     );
   }
 
-  const needsOffice = nextRole === "admin" || nextRole === "moderator";
+  // Only office-scoped roles require office metadata during direct role updates.
+  const needsOffice = nextRole === "office_admin" || nextRole === "moderator";
   let officeId = coerceString(data?.officeId) ?? targetProfile.officeId;
   let officeName = coerceString(data?.officeName) ?? targetProfile.officeName;
   const isActive =
@@ -3268,7 +4416,7 @@ export const setUserRole = functions.https.onCall(async (data, context) => {
   if (needsOffice && !officeId) {
       throw new functions.https.HttpsError(
         "invalid-argument",
-        "officeId is required for admin or moderator."
+        "officeId is required for office_admin or moderator."
       );
   }
 
@@ -3349,6 +4497,7 @@ export const adminListUsers = functions.https.onCall(async (data, context) => {
   const rolePriority: Record<NormalizedRole, number> = {
     super_admin: 100,
     admin: 80,
+    office_admin: 70,
     moderator: 60,
     resident: 10,
   };
@@ -4064,6 +5213,14 @@ export const onReportNotify = functions.firestore
         assignedToUid: assignedToUid ?? null,
         message: "Report created.",
       });
+      await addReportTimeline(reportId, {
+        type: "CREATED",
+        actorUid: createdByUid || null,
+        actorRole: createdByUid ? "resident" : "public",
+        notes: "Report created.",
+        fromStatus: null,
+        toStatus: status,
+      });
 
       await addAuditLog({
         action: "report_created",
@@ -4076,7 +5233,7 @@ export const onReportNotify = functions.firestore
         actorUid: createdByUid,
         actorEmail: createdByEmail,
         actorName: createdByName,
-        actorRole: "resident",
+        actorRole: createdByUid ? "resident" : "public",
         message: "Report created.",
       });
       return;
@@ -4118,12 +5275,35 @@ export const onReportNotify = functions.firestore
         });
       }
 
+      const assignmentTimelineType = afterAssigned
+        ? (
+          beforeAssigned
+            ? "REASSIGNED"
+            : (actorUid && actorUid === afterAssigned ? "CLAIMED" : "ASSIGNED")
+        )
+        : "UNASSIGNED";
+      const assignmentMessage = afterAssigned
+        ? (
+          beforeAssigned
+            ? "Report reassigned."
+            : (actorUid && actorUid === afterAssigned ? "Report claimed." : "Report assigned.")
+        )
+        : "Report unassigned.";
+
       await addHistory(reportId, {
         type: "assignment_changed",
         fromAssignedUid: beforeAssigned ?? null,
         toAssignedUid: afterAssigned ?? null,
         status: afterStatus,
-        message: afterAssigned ? "Report assigned." : "Report unassigned.",
+        message: assignmentMessage,
+      });
+      await addReportTimeline(reportId, {
+        type: assignmentTimelineType,
+        actorUid: actorUid || null,
+        actorRole: actorRole || null,
+        notes: assignmentMessage,
+        fromStatus: beforeStatus,
+        toStatus: afterStatus,
       });
 
       await addAuditLog({
@@ -4139,7 +5319,7 @@ export const onReportNotify = functions.firestore
         actorEmail: actorEmail || null,
         actorName: actorName || null,
         actorRole: actorRole || null,
-        message: afterAssigned ? "Report assigned." : "Report unassigned.",
+        message: assignmentMessage,
       });
     }
 
@@ -4167,6 +5347,16 @@ export const onReportNotify = functions.firestore
         message: `Status changed from ${prettyStatus(beforeStatus)} to ${prettyStatus(
           afterStatus
         )}.`,
+      });
+      await addReportTimeline(reportId, {
+        type: "STATUS_CHANGED",
+        actorUid: actorUid || null,
+        actorRole: actorRole || null,
+        notes: `Status changed from ${prettyStatus(beforeStatus)} to ${prettyStatus(
+          afterStatus
+        )}.`,
+        fromStatus: beforeStatus,
+        toStatus: afterStatus,
       });
 
       await addAuditLog({
@@ -4196,6 +5386,14 @@ export const onReportNotify = functions.firestore
         status: afterStatus,
         assignedToUid: afterAssigned ?? null,
         message: msg,
+      });
+      await addReportTimeline(reportId, {
+        type: afterArchived ? "ARCHIVED" : "RESTORED",
+        actorUid: actorUid || null,
+        actorRole: actorRole || null,
+        notes: msg,
+        fromStatus: beforeStatus,
+        toStatus: afterStatus,
       });
 
       await addAuditLog({
@@ -4377,6 +5575,53 @@ export const onAnnouncementView = functions.firestore
       },
       { merge: true }
     );
+  });
+
+/**
+ * =========================
+ * REPORT SLA ESCALATION SWEEP
+ * =========================
+ * Periodically checks open reports against the SOP deadlines. Server-side
+ * escalation keeps overdue tickets visible even if no admin screen is open.
+ */
+export const escalateOverdueReports = functions.pubsub
+  .schedule("every 15 minutes")
+  .timeZone("Asia/Manila")
+  .onRun(async () => {
+    const now = Date.now();
+    const activeStatuses = Array.from(OPEN_STATUSES);
+    let escalated = 0;
+    // Keep the sweep bounded per invocation. This avoids an unbounded scan while
+    // still catching overdue tickets during routine operations.
+    const snapshot = await db
+      .collection("reports")
+      .where("status", "in", activeStatuses)
+      .limit(100)
+      .get();
+
+    for (const doc of snapshot.docs) {
+      const row = (doc.data() ?? {}) as Record<string, unknown>;
+      const stage = overdueReportSlaStage(row, now);
+      if (!stage) {
+        continue;
+      }
+
+      const lastStage = coerceString((row.slaEscalation as Record<string, unknown> | undefined)?.stage);
+      if (lastStage === stage) {
+        continue;
+      }
+
+      await recordReportEscalation(
+        doc.id,
+        row,
+        stage,
+        `SLA target missed for ${stage}. Immediate staff action is required.`
+      );
+      escalated += 1;
+    }
+
+    functions.logger.info("escalateOverdueReports completed", {escalated});
+    return null;
   });
 
 /**

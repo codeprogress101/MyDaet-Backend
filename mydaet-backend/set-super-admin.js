@@ -12,6 +12,7 @@ admin.initializeApp({
 const db = admin.firestore();
 const UID = "YqE3I8997gZo6lZuEDpseGtTXqy1";
 
+// This script intentionally stamps both Auth claims and the profile document so the admin portal and backend stay in sync.
 admin
   .auth()
   .setCustomUserClaims(UID, {
@@ -40,3 +41,9 @@ admin
     console.error("ERROR: Failed to set custom claims:", error);
     process.exit(1);
   });
+/*
+ * Bootstrap helper for the revised 5-role RBAC model.
+ * This script keeps super_admin unchanged.
+ * To create a municipal admin, use role=admin with officeId=null.
+ * To create an office admin, use role=office_admin with officeId set to the target office.
+ */

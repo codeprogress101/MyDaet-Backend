@@ -1,9 +1,20 @@
+/*
+ * Firestore rules for the revised 5-role RBAC model.
+ * Office Admin is distinct from municipal Admin.
+ * Rules here intentionally preserve legacy claim aliases while enforcing the new role split.
+ * This pass keeps report reads and timelines aligned with the SOP-driven server workflow.
+ */
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
     /** -------------------------
      * Helpers
+     * Revised 5-role RBAC model:
+     * - office_admin is distinct from admin
+     * - admin is municipal-wide
+     * - moderator and office_admin require office scope
+     * Rules must stay aligned with Cloud Functions while preserving legacy claim aliases during migration.
      * ------------------------- */
     function signedIn() {
       return request.auth != null;
@@ -22,7 +33,7 @@ service cloud.firestore {
     }
 
     function roleRaw() {
-      return (request.auth != null && request.auth.token.role != null)
+      return (request.auth != null && ("role" in request.auth.token) && request.auth.token.role != null)
         ? request.auth.token.role
         : (hasUserData() && userDoc().data.role != null
             ? userDoc().data.role
@@ -41,51 +52,50 @@ service cloud.firestore {
 
     function hasSuperAdminFlag() {
       return request.auth != null && (
-        request.auth.token.superAdmin == true
-        || request.auth.token.isSuperAdmin == true
-        || request.auth.token.super_admin == true
+        (("superAdmin" in request.auth.token) && request.auth.token.superAdmin == true)
+        || (("isSuperAdmin" in request.auth.token) && request.auth.token.isSuperAdmin == true)
+        || (("super_admin" in request.auth.token) && request.auth.token.super_admin == true)
       );
     }
 
     function hasOfficeAdminFlag() {
       return request.auth != null && (
-        request.auth.token.officeAdmin == true
-        || request.auth.token.office_admin == true
-        || request.auth.token.isOfficeAdmin == true
+        (("officeAdmin" in request.auth.token) && request.auth.token.officeAdmin == true)
+        || (("office_admin" in request.auth.token) && request.auth.token.office_admin == true)
+        || (("isOfficeAdmin" in request.auth.token) && request.auth.token.isOfficeAdmin == true)
       );
     }
 
     function hasModeratorFlag() {
       return request.auth != null && (
-        request.auth.token.moderator == true
-        || request.auth.token.isModerator == true
-        || request.auth.token.clerk == true
+        (("moderator" in request.auth.token) && request.auth.token.moderator == true)
+        || (("isModerator" in request.auth.token) && request.auth.token.isModerator == true)
+        || (("clerk" in request.auth.token) && request.auth.token.clerk == true)
       );
     }
 
     function role() {
-      return (
-        hasSuperAdminFlag()
+      return hasSuperAdminFlag()
         || roleMatches("^[\\s]*[sS][uU][pP][eE][rR][ _-]?[aA][dD][mM][iI][nN][\\s]*$")
-      )
         ? "super_admin"
         : (
           hasOfficeAdminFlag()
-          || roleMatches("^[\\s]*[aA][dD][mM][iI][nN][\\s]*$")
           || roleMatches("^[\\s]*[oO][fF][fF][iI][cC][eE][ _-]?[aA][dD][mM][iI][nN][\\s]*$")
         )
-            ? "admin"
-            : (
-              hasModeratorFlag()
-              || roleMatches("^[\\s]*[mM][oO][dD][eE][rR][aA][tT][oO][rR][\\s]*$")
-              || roleMatches("^[\\s]*[cC][lL][eE][rR][kK][\\s]*$")
-            )
-                ? "moderator"
-                : "resident";
+            ? "office_admin"
+            : roleMatches("^[\\s]*[aA][dD][mM][iI][nN][\\s]*$")
+                ? "admin"
+                : (
+                  hasModeratorFlag()
+                  || roleMatches("^[\\s]*[mM][oO][dD][eE][rR][aA][tT][oO][rR][\\s]*$")
+                  || roleMatches("^[\\s]*[cC][lL][eE][rR][kK][\\s]*$")
+                )
+                    ? "moderator"
+                    : "resident";
     }
 
     function officeId() {
-      return (request.auth != null && request.auth.token.officeId != null)
+      return (request.auth != null && ("officeId" in request.auth.token) && request.auth.token.officeId != null)
         ? request.auth.token.officeId
         : (hasUserData() && userDoc().data.officeId != null
             ? userDoc().data.officeId
@@ -93,7 +103,7 @@ service cloud.firestore {
     }
 
     function officeName() {
-      return (request.auth != null && request.auth.token.officeName != null)
+      return (request.auth != null && ("officeName" in request.auth.token) && request.auth.token.officeName != null)
         ? request.auth.token.officeName
         : (hasUserData() && userDoc().data.officeName != null
             ? userDoc().data.officeName
@@ -101,7 +111,7 @@ service cloud.firestore {
     }
 
     function isActive() {
-      return (request.auth != null && request.auth.token.isActive != null)
+      return (request.auth != null && ("isActive" in request.auth.token) && request.auth.token.isActive != null)
         ? request.auth.token.isActive
         : (hasUserData() && userDoc().data.isActive != null
             ? userDoc().data.isActive
@@ -117,6 +127,10 @@ service cloud.firestore {
     }
 
     function isOfficeAdmin() {
+      return role() == "office_admin";
+    }
+
+    function isMunicipalAdmin() {
       return role() == "admin";
     }
 
@@ -124,32 +138,18 @@ service cloud.firestore {
       return role() == "moderator";
     }
 
-    function isResident() {
-      return role() == "resident";
-    }
-
     function isStaff() {
-      return isSuperAdmin() || isOfficeAdmin() || isModerator();
+      return isSuperAdmin()
+        || isMunicipalAdmin()
+        || (
+          (isOfficeAdmin() || isModerator())
+          && officeId() != null
+          && officeId() != ""
+        );
     }
 
     function isSuperAdminByDoc() {
       return hasUserData() && userDoc().data.role in ["super_admin"];
-    }
-
-    function isStaffByDoc() {
-      return hasUserData() && userDoc().data.role in ["super_admin", "admin", "office_admin", "moderator"];
-    }
-
-    function officeIdByDoc() {
-      return hasUserData() && userDoc().data.officeId != null
-        ? userDoc().data.officeId
-        : null;
-    }
-
-    function officeNameByDoc() {
-      return hasUserData() && userDoc().data.officeName != null
-        ? userDoc().data.officeName
-        : null;
     }
 
     function civilRegistryOfficeIds() {
@@ -173,13 +173,12 @@ service cloud.firestore {
     function canAccessCivilRegistry() {
       return signedInUser() && (
         isSuperAdmin()
+        || isMunicipalAdmin()
         || (
-          (isStaff() || isStaffByDoc())
+          isStaff()
           && (
             civilRegistryOfficeTag(officeId())
-            || civilRegistryOfficeTag(officeIdByDoc())
             || civilRegistryOfficeTag(officeName())
-            || civilRegistryOfficeTag(officeNameByDoc())
           )
         )
       );
@@ -208,7 +207,37 @@ service cloud.firestore {
     }
 
     function officeAllowed(data) {
-      return !hasOfficeId(data) || (officeId() != null && data.officeId == officeId());
+      return isSuperAdmin()
+        || isMunicipalAdmin()
+        || !hasOfficeId(data)
+        || (officeId() != null && data.officeId == officeId())
+    }
+
+    function reportStaffReadAllowed(data) {
+      return signedInUser() && (
+        isSuperAdmin()
+        || isMunicipalAdmin()
+        || (
+          isOfficeAdmin()
+          && officeId() != null
+          && (
+            data.officeId == officeId()
+            || data.currentOfficeId == officeId()
+            || data.assignedOfficeId == officeId()
+            || data.assignedToUid == request.auth.uid
+          )
+        )
+        || (
+          isModerator()
+          && officeId() != null
+          && (
+            data.officeId == officeId()
+            || data.currentOfficeId == officeId()
+            || data.assignedOfficeId == officeId()
+            || data.assignedToUid == request.auth.uid
+          )
+        )
+      );
     }
 
     function isOwner(uid) {
@@ -227,18 +256,14 @@ service cloud.firestore {
 
     function dtsOfficeAllowed(data) {
       return isSuperAdmin()
-        || isSuperAdminByDoc()
+        || isMunicipalAdmin()
         || (
-          (isStaff() || isStaffByDoc())
+          isStaff()
           && (
             (officeId() != null && data.currentOfficeId == officeId())
-            || (officeIdByDoc() != null && data.currentOfficeId == officeIdByDoc())
             || (officeName() != null && data.currentOfficeName != null && data.currentOfficeName == officeName())
-            || (officeNameByDoc() != null && data.currentOfficeName != null && data.currentOfficeName == officeNameByDoc())
             || (data.pendingTransfer != null && officeId() != null && data.pendingTransfer.toOfficeId == officeId())
-            || (data.pendingTransfer != null && officeIdByDoc() != null && data.pendingTransfer.toOfficeId == officeIdByDoc())
             || (data.pendingTransfer != null && officeName() != null && data.pendingTransfer.toOfficeName != null && data.pendingTransfer.toOfficeName == officeName())
-            || (data.pendingTransfer != null && officeNameByDoc() != null && data.pendingTransfer.toOfficeName != null && data.pendingTransfer.toOfficeName == officeNameByDoc())
             || (data.pendingTransfer != null && data.pendingTransfer.toUid != null && data.pendingTransfer.toUid == request.auth.uid)
             || (data.currentCustodianUid != null && data.currentCustodianUid == request.auth.uid)
           )
@@ -271,7 +296,7 @@ service cloud.firestore {
 
     function canWritePublishedState(statusValue) {
       return validLifecycleStatus(statusValue)
-        && (isSuperAdmin() || isOfficeAdmin() || statusValue == "draft");
+        && (isSuperAdmin() || isMunicipalAdmin() || isOfficeAdmin() || statusValue == "draft");
     }
 
     function systemSettingsPath() {
@@ -314,6 +339,7 @@ service cloud.firestore {
 
     function officeMatches(targetOfficeId) {
       return isSuperAdmin()
+        || isMunicipalAdmin()
         || (officeId() != null && targetOfficeId != null && targetOfficeId != "" && officeId() == targetOfficeId);
     }
 
@@ -350,6 +376,7 @@ service cloud.firestore {
 
     function jobOfficeAllowed(targetOfficeId) {
       return isSuperAdmin()
+        || isMunicipalAdmin()
         || (isOfficeAdmin() && officeId() != null && targetOfficeId != null && targetOfficeId != "" && officeId() == targetOfficeId);
     }
 
@@ -517,6 +544,7 @@ service cloud.firestore {
 
       allow read: if signedInUser() && isOwner(uid);
       allow read: if signedInUser() && isSuperAdmin();
+      allow read: if signedInUser() && isMunicipalAdmin();
       allow read: if signedInUser()
         && isOfficeAdmin()
         && officeId() != null
@@ -533,7 +561,7 @@ service cloud.firestore {
           isSuperAdmin()
           && (resource.data.role != "super_admin" || request.resource.data.role == "super_admin")
           && (
-            request.resource.data.role in ["admin", "office_admin", "moderator"]
+            request.resource.data.role in ["office_admin", "moderator"]
               ? (request.resource.data.officeId != null && request.resource.data.officeId != "")
               : true
           )
@@ -573,7 +601,7 @@ service cloud.firestore {
     match /audit_logs/{id} {
       allow read: if signedInUser() && (
         isSuperAdmin()
-        || (isOfficeAdmin() && officeId() != null && resource.data.officeId == officeId())
+        || isMunicipalAdmin()
       );
       allow write: if false;
     }
@@ -608,26 +636,18 @@ service cloud.firestore {
 
     match /reports/{reportId} {
       // TODO: Backfill report.officeId for stricter office scoping.
+      // Public web and app intake should go through HTTP functions so validation,
+      // rate limits, attachment checks, and duplicate detection cannot be bypassed.
 
-      // Resident can create report and must stamp ownership
-      allow create: if activeUser()
-        && featureEnabled("reports")
-        && canWriteFeatureData()
-        && request.resource.data.createdByUid == request.auth.uid
-        && request.resource.data.status == "submitted"
-        && hasNonEmptyString(request.resource.data, "officeId")
-        && hasNonEmptyString(request.resource.data, "officeName")
-        && fieldWithin(request.resource.data, "title", 120)
-        && fieldWithin(request.resource.data, "description", 2000)
-        && fieldWithin(request.resource.data, "location", 120)
-        && fieldWithin(request.resource.data, "name", 80)
-        && fieldWithin(request.resource.data, "contact", 120);
+      // Public intake must go through HTTP functions so validation, rate limits,
+      // duplicate detection, and attachment checks cannot be bypassed client-side.
+      allow create: if false;
 
       // Read:
       // - staff (moderator/office admin/super admin) can list and view reports
       // - residents can only read their own reports
       allow read: if signedInUser() && featureEnabled("reports") && (
-        isStaff()
+        reportStaffReadAllowed(resource.data)
         || resource.data.createdByUid == request.auth.uid
       );
 
@@ -676,16 +696,12 @@ service cloud.firestore {
       match /messages/{messageId} {
         allow read: if signedInUser() && featureEnabled("reports") && (
           get(/databases/$(database)/documents/reports/$(reportId)).data.createdByUid == request.auth.uid
-          || isSuperAdmin()
-          || (isOfficeAdmin() && officeAllowed(get(/databases/$(database)/documents/reports/$(reportId)).data))
-          || (
-            isModerator()
-            && get(/databases/$(database)/documents/reports/$(reportId)).data.assignedToUid == request.auth.uid
-          )
+          || reportStaffReadAllowed(get(/databases/$(database)/documents/reports/$(reportId)).data)
         );
 
         allow create: if activeUser() && featureEnabled("reports") && canWriteFeatureData() && (
           isSuperAdmin()
+          || isMunicipalAdmin()
           || (isOfficeAdmin() && officeAllowed(get(/databases/$(database)/documents/reports/$(reportId)).data))
           || (
             isModerator()
@@ -699,12 +715,16 @@ service cloud.firestore {
       match /history/{historyId} {
         allow read: if signedInUser() && featureEnabled("reports") && (
           get(/databases/$(database)/documents/reports/$(reportId)).data.createdByUid == request.auth.uid
-          || isSuperAdmin()
-          || (isOfficeAdmin() && officeAllowed(get(/databases/$(database)/documents/reports/$(reportId)).data))
-          || (
-            isModerator()
-            && get(/databases/$(database)/documents/reports/$(reportId)).data.assignedToUid == request.auth.uid
-          )
+          || reportStaffReadAllowed(get(/databases/$(database)/documents/reports/$(reportId)).data)
+        );
+        allow write: if false;
+      }
+
+      match /timeline/{eventId} {
+        // Timeline stays append-only and is written by backend code only.
+        allow read: if signedInUser() && featureEnabled("reports") && (
+          get(/databases/$(database)/documents/reports/$(reportId)).data.createdByUid == request.auth.uid
+          || reportStaffReadAllowed(get(/databases/$(database)/documents/reports/$(reportId)).data)
         );
         allow write: if false;
       }
@@ -857,6 +877,7 @@ service cloud.firestore {
         && postOfficeAllowed(request.resource.data.officeId)
         && (
           isSuperAdmin()
+          || isMunicipalAdmin()
           || (isOfficeAdmin() && postOfficeAllowed(resource.data.officeId))
           || request.resource.data.createdByUid == resource.data.createdByUid
         );
@@ -904,7 +925,7 @@ service cloud.firestore {
       );
 
       allow create: if activeUser()
-        && (isSuperAdmin() || isOfficeAdmin())
+        && (isSuperAdmin() || isMunicipalAdmin() || isOfficeAdmin())
         && featureEnabled("jobs")
         && canWriteFeatureData()
         && validJobShape(request.resource.data)
@@ -913,7 +934,7 @@ service cloud.firestore {
         && request.resource.data.createdByUid == request.auth.uid;
 
       allow update: if activeUser()
-        && (isSuperAdmin() || isOfficeAdmin())
+        && (isSuperAdmin() || isMunicipalAdmin() || isOfficeAdmin())
         && featureEnabled("jobs")
         && canWriteFeatureData()
         && validJobShapeForUpdate()
@@ -960,12 +981,14 @@ service cloud.firestore {
     match /appointments/{appointmentId} {
       allow read: if activeUser() && (
         isSuperAdmin()
+        || isMunicipalAdmin()
         || ((isOfficeAdmin() || isModerator())
           && officeId() != null
           && resource.data.officeId == officeId())
       );
       allow create, update, delete: if activeUser() && (
         isSuperAdmin()
+        || isMunicipalAdmin()
         || (isOfficeAdmin()
           && officeId() != null
           && request.resource.data.officeId == officeId())
@@ -979,12 +1002,14 @@ service cloud.firestore {
     match /office_slots/{slotId} {
       allow read: if activeUser() && (
         isSuperAdmin()
+        || isMunicipalAdmin()
         || ((isOfficeAdmin() || isModerator())
           && officeId() != null
           && resource.data.officeId == officeId())
       );
       allow create, update, delete: if activeUser() && (
         isSuperAdmin()
+        || isMunicipalAdmin()
         || (isOfficeAdmin()
           && officeId() != null
           && request.resource.data.officeId == officeId())
