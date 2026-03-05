@@ -1,4 +1,5 @@
 /*
+ *Update 03-05
  * Firestore rules for the revised 5-role RBAC model.
  * Office Admin is distinct from municipal Admin.
  * Rules here intentionally preserve legacy claim aliases while enforcing the new role split.
@@ -1014,6 +1015,32 @@ service cloud.firestore {
           && officeId() != null
           && request.resource.data.officeId == officeId())
       );
+    }
+
+    /** -------------------------
+     * DIRECT STAFF MESSAGING
+     * /staff_threads/{threadId}
+     *
+     * Realtime listeners are read-only from the client. All writes still go
+     * through callable functions so server-side scope checks remain the source
+     * of truth for staff messaging.
+     * ------------------------- */
+    match /staff_threads/{threadId} {
+      allow read: if activeUser()
+        && isStaff()
+        && featureEnabled("reports")
+        && resource.data.memberIds is list
+        && resource.data.memberIds.hasAny([request.auth.uid]);
+      allow create, update, delete: if false;
+
+      match /messages/{messageId} {
+        allow read: if activeUser()
+          && isStaff()
+          && featureEnabled("reports")
+          && get(/databases/$(database)/documents/staff_threads/$(threadId)).data.memberIds is list
+          && get(/databases/$(database)/documents/staff_threads/$(threadId)).data.memberIds.hasAny([request.auth.uid]);
+        allow create, update, delete: if false;
+      }
     }
 
     /** -------------------------

@@ -189,6 +189,10 @@ function isMunicipalAdminRole(role: NormalizedRole): boolean {
   return role === "admin" || role === "super_admin";
 }
 
+function isStaffRole(role: NormalizedRole): boolean {
+  return role === "moderator" || role === "office_admin" || role === "admin" || role === "super_admin";
+}
+
 function canAssignReportsRole(role: NormalizedRole): boolean {
   return role === "office_admin" || role === "admin" || role === "super_admin";
 }
@@ -2244,6 +2248,792 @@ export const adminListReportAssignees = functions.https.onCall(async (_data, con
       officeId: actor.officeId ?? null,
     },
   };
+});
+
+type StaffThreadMember = {
+  uid: string;
+  displayName: string;
+  role: NormalizedRole;
+  officeId: string | null;
+  officeName: string | null;
+  presence: Record<string, unknown>;
+};
+
+function buildStaffThreadMember(
+  uid: string,
+  profileData: Record<string, unknown>,
+  fallbackRole?: NormalizedRole,
+  fallbackOfficeId?: string | null,
+  fallbackOfficeName?: string | null
+): StaffThreadMember {
+  return {
+    uid,
+    displayName:
+      coerceString(profileData.displayName) ??
+      coerceString(profileData.name) ??
+      coerceString(profileData.email) ??
+      uid,
+    role: fallbackRole ?? normalizeRole(profileData.role),
+    officeId: fallbackOfficeId ?? coerceString(profileData.officeId),
+    officeName: fallbackOfficeName ?? coerceString(profileData.officeName),
+    presence: serializeStaffPresence(profileData),
+  };
+}
+
+function staffThreadIdFor(uidA: string, uidB: string): string {
+  const [first, second] = [uidA, uidB].map((value) => value.trim()).sort();
+  return `dm_${sha256(`${first}:${second}`).slice(0, 24)}`;
+}
+
+function canActorDirectMessageTarget(
+  actor: StaffContext,
+  target: StaffThreadMember
+): boolean {
+  if (actor.uid === target.uid) {
+    return false;
+  }
+
+  if (!isStaffRole(target.role)) {
+    return false;
+  }
+
+  if (actor.role === "super_admin" || actor.role === "admin") {
+    return true;
+  }
+
+  if (target.role === "super_admin" || target.role === "admin") {
+    return true;
+  }
+
+  return actor.officeId != null && target.officeId != null && actor.officeId === target.officeId;
+}
+
+function threadReadMap(
+  row: Record<string, unknown>
+): Record<string, unknown> {
+  const raw = row.lastReadAtByUid;
+  return raw && typeof raw === "object"
+    ? (raw as Record<string, unknown>)
+    : {};
+}
+
+function threadDeliveredMap(
+  row: Record<string, unknown>
+): Record<string, unknown> {
+  const raw = row.lastDeliveredAtByUid;
+  return raw && typeof raw === "object"
+    ? (raw as Record<string, unknown>)
+    : {};
+}
+
+function threadUnreadCountMap(
+  row: Record<string, unknown>
+): Record<string, unknown> {
+  const raw = row.unreadCountByUid;
+  return raw && typeof raw === "object"
+    ? (raw as Record<string, unknown>)
+    : {};
+}
+
+function threadTypingMap(
+  row: Record<string, unknown>
+): Record<string, unknown> {
+  const raw = row.typingByUid;
+  return raw && typeof raw === "object"
+    ? (raw as Record<string, unknown>)
+    : {};
+}
+
+function unreadCountForUid(
+  row: Record<string, unknown>,
+  uid: string
+): number {
+  const raw = threadUnreadCountMap(row)[uid];
+  const value = Number(raw ?? 0);
+  if (!Number.isFinite(value) || value <= 0) {
+    return 0;
+  }
+  return Math.floor(value);
+}
+
+function serializeThreadPeerTyping(
+  actorUid: string,
+  peerUid: string,
+  row: Record<string, unknown>
+): Record<string, unknown> {
+  if (!peerUid || peerUid === actorUid) {
+    return {isTyping: false, updatedAt: null};
+  }
+  const raw = threadTypingMap(row)[peerUid];
+  const typingData = raw && typeof raw === "object"
+    ? (raw as Record<string, unknown>)
+    : {};
+  const updatedAtMs = parseEpochMs(typingData.updatedAt);
+  const isTyping =
+    coerceBool(typingData.isTyping, false) &&
+    updatedAtMs > 0 &&
+    (Date.now() - updatedAtMs) <= 10000;
+  return {
+    isTyping,
+    updatedAt: isTyping ? toIsoString(typingData.updatedAt) : null,
+  };
+}
+
+function serializeStaffPresence(
+  profileData: Record<string, unknown>
+): Record<string, unknown> {
+  const state = coerceString(profileData.staffPresenceState) ?? "offline";
+  const lastSeenAt = toIsoString(profileData.staffPresenceLastSeenAt);
+  const lastSeenMs = parseEpochMs(profileData.staffPresenceLastSeenAt);
+  const isOnline =
+    state === "online" &&
+    lastSeenMs > 0 &&
+    (Date.now() - lastSeenMs) <= (2 * 60 * 1000);
+
+  return {
+    state,
+    isOnline,
+    lastSeenAt,
+  };
+}
+
+async function uploadStaffMessageAttachment(
+  threadId: string,
+  senderUid: string,
+  dataUrl: string,
+  fileBaseName: string
+): Promise<Record<string, unknown> | null> {
+  const trimmed = String(dataUrl ?? "").trim();
+  if (!trimmed) return null;
+  const match = trimmed.match(/^data:([^;]+);base64,(.+)$/);
+  if (!match) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "Attachment must be a valid data URL."
+    );
+  }
+  const contentType = match[1].trim().toLowerCase();
+  // Voice-note uploads reuse the same attachment pipeline to keep the UI simple.
+  const allowedTypes = ["image/", "application/pdf", "audio/"];
+  if (!allowedTypes.some((allowed) => contentType.startsWith(allowed))) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "Only image, PDF, and audio attachments are supported."
+    );
+  }
+  const buffer = Buffer.from(match[2], "base64");
+  if (buffer.length > (5 * 1024 * 1024)) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "Attachment is too large."
+    );
+  }
+
+  const safeName = (fileBaseName || "attachment")
+    .replace(/[^a-z0-9._-]/gi, "_")
+    .toLowerCase();
+  const extension = contentType === "application/pdf"
+    ? "pdf"
+    : (contentType.split("/")[1] || "bin");
+  const storagePath = `staff_threads/${threadId}/${senderUid}_${Date.now()}_${safeName}.${extension}`;
+  const bucket = admin.storage().bucket();
+  const file = bucket.file(storagePath);
+  await file.save(buffer, {
+    resumable: false,
+    metadata: {
+      contentType,
+      cacheControl: "private,max-age=3600",
+    },
+  });
+  const [url] = await file.getSignedUrl({
+    action: "read",
+    expires: "2100-01-01",
+  });
+  return {
+    name: `${safeName}.${extension}`,
+    url,
+    path: storagePath,
+    contentType,
+    size: buffer.length,
+  };
+}
+
+function serializeStaffThreadForActor(
+  actorUid: string,
+  threadId: string,
+  row: Record<string, unknown>
+): Record<string, unknown> {
+  const memberIds = Array.isArray(row.memberIds)
+    ? row.memberIds.map((value) => String(value || "").trim()).filter((value) => value.length > 0)
+    : [];
+  const profileMap = row.memberProfiles && typeof row.memberProfiles === "object"
+    ? (row.memberProfiles as Record<string, unknown>)
+    : {};
+  const peerUid = memberIds.find((value) => value !== actorUid) ?? actorUid;
+  const peerRaw = profileMap[peerUid];
+  const peerData = peerRaw && typeof peerRaw === "object"
+    ? (peerRaw as Record<string, unknown>)
+    : {};
+  const unreadCount = unreadCountForUid(row, actorUid);
+
+  return {
+    threadId,
+    targetUid: peerUid,
+    targetName: coerceString(peerData.displayName) ?? coerceString(peerData.name) ?? peerUid,
+    targetRole: normalizeRole(peerData.role),
+    targetOfficeId: coerceString(peerData.officeId),
+    targetOfficeName: coerceString(peerData.officeName),
+    lastMessageText: coerceString(row.lastMessageText) ?? "",
+    lastMessageAt: toIsoString(row.lastMessageAt),
+    updatedAt: toIsoString(row.updatedAt),
+    hasUnread: unreadCount > 0,
+    unreadCount,
+    peerTyping: serializeThreadPeerTyping(actorUid, peerUid, row),
+    targetPresence: serializeStaffPresence(peerData),
+  };
+}
+
+async function staffListDirectContactsHandler(
+  _data: unknown,
+  context: CallableContextLike
+) {
+  const actor = await requireStaffContext(context);
+  await requireFeatureEnabled("reports");
+
+  const usersRef = db.collection("users");
+  const rows = new Map<string, StaffThreadMember>();
+
+  async function collectSnapshot(snapshot: FirebaseFirestore.QuerySnapshot) {
+    snapshot.docs.forEach((doc) => {
+      const data = (doc.data() ?? {}) as Record<string, unknown>;
+      const member = buildStaffThreadMember(doc.id, data);
+      if (!coerceBool(data.isActive, true)) {
+        return;
+      }
+      if (!canActorDirectMessageTarget(actor, member)) {
+        return;
+      }
+      rows.set(doc.id, member);
+    });
+  }
+
+  if (isMunicipalAdminRole(actor.role)) {
+    const snapshot = await usersRef.limit(400).get();
+    await collectSnapshot(snapshot);
+  } else if (actor.officeId) {
+    const [sameOffice, municipalStaff] = await Promise.all([
+      usersRef.where("officeId", "==", actor.officeId).limit(300).get(),
+      usersRef.where("role", "in", ["super_admin", "admin"]).limit(50).get(),
+    ]);
+    await collectSnapshot(sameOffice);
+    await collectSnapshot(municipalStaff);
+  }
+
+  return {
+    items: Array.from(rows.values())
+      .sort((left, right) => left.displayName.localeCompare(right.displayName)),
+  };
+}
+
+export const staffListDirectContacts = onCallV2({region: REGION}, async (request) => {
+  try {
+    return await staffListDirectContactsHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+async function staffListDirectThreadsHandler(
+  _data: unknown,
+  context: CallableContextLike
+) {
+  const actor = await requireStaffContext(context);
+  await requireFeatureEnabled("reports");
+
+  const snapshot = await db
+    .collection("staff_threads")
+    .where("memberIds", "array-contains", actor.uid)
+    .limit(80)
+    .get();
+
+  const now = admin.firestore.Timestamp.now();
+  const deliverableRows = snapshot.docs
+    .map((doc) => ({
+      doc,
+      row: (doc.data() ?? {}) as Record<string, unknown>,
+    }))
+    .filter(({row}) => {
+      if (coerceString(row.lastSenderUid) === actor.uid) {
+        return false;
+      }
+      const lastMessageAtMs = parseEpochMs(row.lastMessageAt);
+      const deliveredAtMs = parseEpochMs(threadDeliveredMap(row)[actor.uid]);
+      return lastMessageAtMs > 0 && lastMessageAtMs > deliveredAtMs;
+    });
+
+  if (deliverableRows.length > 0) {
+    const batch = db.batch();
+    deliverableRows.forEach(({doc, row}) => {
+      batch.set(doc.ref, {
+        lastDeliveredAtByUid: {
+          ...threadDeliveredMap(row),
+          [actor.uid]: admin.firestore.FieldValue.serverTimestamp(),
+        },
+      }, {merge: true});
+    });
+    await batch.commit();
+  }
+
+  const refreshedRows = new Map<string, Record<string, unknown>>();
+  deliverableRows.forEach(({doc, row}) => {
+    refreshedRows.set(doc.id, {
+      ...row,
+      lastDeliveredAtByUid: {
+        ...threadDeliveredMap(row),
+        [actor.uid]: now,
+      },
+    });
+  });
+
+  const items = snapshot.docs
+    .map((doc) => serializeStaffThreadForActor(
+      actor.uid,
+      doc.id,
+      refreshedRows.get(doc.id) ?? ((doc.data() ?? {}) as Record<string, unknown>)
+    ))
+    .sort((left, right) => parseEpochMs(right.lastMessageAt) - parseEpochMs(left.lastMessageAt));
+
+  return {items};
+}
+
+export const staffListDirectThreads = onCallV2({region: REGION}, async (request) => {
+  try {
+    return await staffListDirectThreadsHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+async function staffListDirectMessagesHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const actor = await requireStaffContext(context);
+  await requireFeatureEnabled("reports");
+
+  const payload = (data && typeof data === "object")
+    ? (data as Record<string, unknown>)
+    : {};
+  const threadId = coerceString(payload.threadId);
+  if (!threadId) {
+    throw new functions.https.HttpsError("invalid-argument", "threadId is required.");
+  }
+
+  const threadRef = db.collection("staff_threads").doc(threadId);
+  const threadSnap = await threadRef.get();
+  if (!threadSnap.exists) {
+    return {items: []};
+  }
+  const threadData = (threadSnap.data() ?? {}) as Record<string, unknown>;
+  const memberIds = Array.isArray(threadData.memberIds)
+    ? threadData.memberIds.map((value) => String(value || "").trim())
+    : [];
+  if (!memberIds.includes(actor.uid)) {
+    throw new functions.https.HttpsError("permission-denied", "You cannot open this conversation.");
+  }
+
+  const messagesSnap = await threadRef
+    .collection("messages")
+    .orderBy("createdAt", "desc")
+    .limit(80)
+    .get();
+
+  const now = admin.firestore.Timestamp.now();
+  const nextReadMap = {
+    ...threadReadMap(threadData),
+    [actor.uid]: now,
+  };
+  const nextDeliveredMap = {
+    ...threadDeliveredMap(threadData),
+    [actor.uid]: now,
+  };
+  const nextUnreadMap = {
+    ...threadUnreadCountMap(threadData),
+    [actor.uid]: 0,
+  };
+
+  await threadRef.set({
+    lastReadAtByUid: {
+      ...threadReadMap(threadData),
+      [actor.uid]: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    lastDeliveredAtByUid: {
+      ...threadDeliveredMap(threadData),
+      [actor.uid]: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    unreadCountByUid: {
+      ...threadUnreadCountMap(threadData),
+      [actor.uid]: 0,
+    },
+  }, {merge: true});
+
+  const messageBatch = db.batch();
+  let hasMessageReceiptUpdates = false;
+  messagesSnap.docs.forEach((doc) => {
+    const row = (doc.data() ?? {}) as Record<string, unknown>;
+    if (coerceString(row.senderUid) === actor.uid) {
+      return;
+    }
+    const deliveredMap = row.deliveredAtByUid && typeof row.deliveredAtByUid === "object"
+      ? (row.deliveredAtByUid as Record<string, unknown>)
+      : {};
+    const readMap = row.readAtByUid && typeof row.readAtByUid === "object"
+      ? (row.readAtByUid as Record<string, unknown>)
+      : {};
+    const needsDelivered = parseEpochMs(deliveredMap[actor.uid]) <= 0;
+    const needsRead = parseEpochMs(readMap[actor.uid]) <= 0;
+    if (!needsDelivered && !needsRead) {
+      return;
+    }
+    const patch: Record<string, unknown> = {};
+    if (needsDelivered) {
+      patch[`deliveredAtByUid.${actor.uid}`] = admin.firestore.FieldValue.serverTimestamp();
+    }
+    if (needsRead) {
+      patch[`readAtByUid.${actor.uid}`] = admin.firestore.FieldValue.serverTimestamp();
+    }
+    messageBatch.set(doc.ref, patch, {merge: true});
+    hasMessageReceiptUpdates = true;
+  });
+
+  if (hasMessageReceiptUpdates) {
+    await messageBatch.commit();
+  }
+
+  const peerUid = memberIds.find((value) => value !== actor.uid) ?? "";
+  const peerDeliveredAt = peerUid ? nextDeliveredMap[peerUid] : null;
+  const peerReadAt = peerUid ? nextReadMap[peerUid] : null;
+  const peerDeliveredAtMs = parseEpochMs(peerDeliveredAt);
+  const peerReadAtMs = parseEpochMs(peerReadAt);
+
+  const items = messagesSnap.docs
+    .map((doc) => {
+      const row = (doc.data() ?? {}) as Record<string, unknown>;
+      const senderUid = coerceString(row.senderUid) ?? "";
+      const createdAtMs = parseEpochMs(row.createdAt);
+      const isOwn = senderUid === actor.uid;
+      const deliveredAt = isOwn && createdAtMs > 0 && peerDeliveredAtMs > 0 && createdAtMs <= peerDeliveredAtMs
+        ? toIsoString(peerDeliveredAt)
+        : null;
+      const readAt = isOwn && createdAtMs > 0 && peerReadAtMs > 0 && createdAtMs <= peerReadAtMs
+        ? toIsoString(peerReadAt)
+        : null;
+      return {
+        id: doc.id,
+        text: coerceString(row.text) ?? "",
+        senderUid,
+        senderRole: normalizeRole(row.senderRole),
+        senderName: coerceString(row.senderName) ?? "Staff User",
+        createdAt: toIsoString(row.createdAt),
+        deliveredAt,
+        readAt,
+        attachments: Array.isArray(row.attachments)
+          ? row.attachments.map((item) => {
+              const attachment = item && typeof item === "object"
+                ? (item as Record<string, unknown>)
+                : {};
+              return {
+                name: coerceString(attachment.name) ?? "Attachment",
+                url: coerceString(attachment.url) ?? "",
+                contentType: coerceString(attachment.contentType) ?? "",
+              };
+            }).filter((item) => item.url)
+          : [],
+        replyTo: row.replyTo && typeof row.replyTo === "object"
+          ? {
+              id: coerceString((row.replyTo as Record<string, unknown>).id) ?? "",
+              senderUid: coerceString((row.replyTo as Record<string, unknown>).senderUid) ?? "",
+              senderName: coerceString((row.replyTo as Record<string, unknown>).senderName) ?? "Staff User",
+              text: coerceString((row.replyTo as Record<string, unknown>).text) ?? "",
+              createdAt: toIsoString((row.replyTo as Record<string, unknown>).createdAt),
+            }
+          : null,
+      };
+    })
+    .reverse();
+
+  const nextThreadData = {
+    ...threadData,
+    lastReadAtByUid: nextReadMap,
+    lastDeliveredAtByUid: nextDeliveredMap,
+    unreadCountByUid: nextUnreadMap,
+  };
+
+  return {
+    items,
+    thread: serializeStaffThreadForActor(actor.uid, threadId, nextThreadData),
+  };
+}
+
+export const staffListDirectMessages = onCallV2({region: REGION}, async (request) => {
+  try {
+    return await staffListDirectMessagesHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+async function staffSendDirectMessageHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const actor = await requireStaffContext(context);
+  await requireFeatureWritable("reports");
+
+  const payload = (data && typeof data === "object")
+    ? (data as Record<string, unknown>)
+    : {};
+  const targetUid = coerceString(payload.targetUid);
+  const text = coerceString(payload.text);
+  const attachmentDataUrl = coerceString(payload.attachmentDataUrl);
+  const attachmentName = coerceString(payload.attachmentName) ?? "attachment";
+  const rawReplyTo = payload.replyTo && typeof payload.replyTo === "object"
+    ? (payload.replyTo as Record<string, unknown>)
+    : null;
+  const replyTo = rawReplyTo && coerceString(rawReplyTo.id)
+    ? {
+        id: coerceString(rawReplyTo.id) ?? "",
+        senderUid: coerceString(rawReplyTo.senderUid) ?? "",
+        senderName: coerceString(rawReplyTo.senderName) ?? "Staff User",
+        text: (coerceString(rawReplyTo.text) ?? "").slice(0, 240),
+        createdAt: coerceString(rawReplyTo.createdAt) ?? null,
+      }
+    : null;
+  if (!targetUid) {
+    throw new functions.https.HttpsError("invalid-argument", "targetUid is required.");
+  }
+  if (!text && !attachmentDataUrl) {
+    throw new functions.https.HttpsError("invalid-argument", "Message text or attachment is required.");
+  }
+  if (text && text.length > 1000) {
+    throw new functions.https.HttpsError("invalid-argument", "Message must be 1000 characters or fewer.");
+  }
+
+  const targetProfile = await getUserProfile(targetUid);
+  if (!targetProfile.isActive) {
+    throw new functions.https.HttpsError("failed-precondition", "The recipient account is inactive.");
+  }
+
+  const targetMember = buildStaffThreadMember(
+    targetUid,
+    targetProfile.data as Record<string, unknown>,
+    targetProfile.role,
+    targetProfile.officeId,
+    targetProfile.officeName
+  );
+
+  if (!canActorDirectMessageTarget(actor, targetMember)) {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "You are not allowed to message this staff member."
+    );
+  }
+
+  const actorMember = buildStaffThreadMember(
+    actor.uid,
+    actor.profileData,
+    actor.role,
+    actor.officeId,
+    actor.officeName
+  );
+  const threadId = staffThreadIdFor(actor.uid, targetUid);
+  const threadRef = db.collection("staff_threads").doc(threadId);
+  const messageRef = threadRef.collection("messages").doc();
+  const attachment = attachmentDataUrl
+    ? await uploadStaffMessageAttachment(threadId, actor.uid, attachmentDataUrl, attachmentName)
+    : null;
+  const previewText = text ?? (attachment
+    ? (coerceString(attachment.contentType)?.startsWith("audio/") ? "Voice note" : `Attachment: ${attachment.name}`)
+    : "");
+
+  await db.runTransaction(async (tx) => {
+    const threadSnap = await tx.get(threadRef);
+    const existing = threadSnap.exists
+      ? ((threadSnap.data() ?? {}) as Record<string, unknown>)
+      : {};
+    const existingUnreadMap = threadUnreadCountMap(existing);
+    const targetUnreadCount = unreadCountForUid(existing, targetUid) + 1;
+    tx.set(threadRef, {
+      memberIds: [actor.uid, targetUid].sort(),
+      memberProfiles: {
+        [actor.uid]: actorMember,
+        [targetUid]: targetMember,
+      },
+      lastMessageText: previewText,
+      lastMessageAt: admin.firestore.FieldValue.serverTimestamp(),
+      lastSenderUid: actor.uid,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      lastReadAtByUid: {
+        ...threadReadMap(existing),
+        [actor.uid]: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      lastDeliveredAtByUid: {
+        ...threadDeliveredMap(existing),
+        [actor.uid]: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      unreadCountByUid: {
+        ...existingUnreadMap,
+        [actor.uid]: 0,
+        [targetUid]: targetUnreadCount,
+      },
+      typingByUid: {
+        ...threadTypingMap(existing),
+        [actor.uid]: {
+          isTyping: false,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+      },
+      ...(threadSnap.exists ? {} : {createdAt: admin.firestore.FieldValue.serverTimestamp()}),
+    }, {merge: true});
+
+    tx.set(messageRef, {
+      text: text ?? "",
+      senderUid: actor.uid,
+      senderRole: actor.role,
+      senderName: actorMember.displayName,
+      attachments: attachment ? [attachment] : [],
+      replyTo,
+      deliveredAtByUid: {
+        [actor.uid]: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      readAtByUid: {
+        [actor.uid]: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  });
+
+  await notifyUsers([targetUid], {
+    title: "New staff message",
+    body: `${actorMember.displayName} sent you a message.`,
+    type: "staff_message",
+  });
+
+  await db.collection("users").doc(actor.uid).set({
+    staffPresenceState: "online",
+    staffPresenceLastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
+  }, {merge: true});
+
+  return {
+    success: true,
+    threadId,
+  };
+}
+
+export const staffSendDirectMessage = onCallV2({region: REGION}, async (request) => {
+  try {
+    return await staffSendDirectMessageHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+async function staffSetTypingStateHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const actor = await requireStaffContext(context);
+  await requireFeatureEnabled("reports");
+
+  const payload = (data && typeof data === "object")
+    ? (data as Record<string, unknown>)
+    : {};
+  const threadId = coerceString(payload.threadId);
+  const isTyping = coerceBool(payload.isTyping, false);
+  if (!threadId) {
+    return {success: true, isTyping: false};
+  }
+
+  const threadRef = db.collection("staff_threads").doc(threadId);
+  const threadSnap = await threadRef.get();
+  if (!threadSnap.exists) {
+    return {success: true, isTyping: false};
+  }
+  const threadData = (threadSnap.data() ?? {}) as Record<string, unknown>;
+  const memberIds = Array.isArray(threadData.memberIds)
+    ? threadData.memberIds.map((value) => String(value || "").trim())
+    : [];
+  if (!memberIds.includes(actor.uid)) {
+    throw new functions.https.HttpsError("permission-denied", "You cannot update typing for this conversation.");
+  }
+
+  await threadRef.set({
+    typingByUid: {
+      ...threadTypingMap(threadData),
+      [actor.uid]: {
+        isTyping,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+    },
+  }, {merge: true});
+
+  return {success: true, isTyping};
+}
+
+export const staffSetTypingState = onCallV2({region: REGION}, async (request) => {
+  try {
+    return await staffSetTypingStateHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+async function staffPingPresenceHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const actor = await requireStaffContext(context);
+  await requireFeatureEnabled("reports");
+  const payload = (data && typeof data === "object")
+    ? (data as Record<string, unknown>)
+    : {};
+  const requestedState = coerceString(payload.state) ?? "online";
+  const nextState = requestedState === "away" ? "away" : "online";
+
+  await db.collection("users").doc(actor.uid).set({
+    staffPresenceState: nextState,
+    staffPresenceLastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
+  }, {merge: true});
+
+  const threadSnapshot = await db
+    .collection("staff_threads")
+    .where("memberIds", "array-contains", actor.uid)
+    .limit(80)
+    .get();
+
+  if (!threadSnapshot.empty) {
+    const batch = db.batch();
+    threadSnapshot.docs.forEach((doc) => {
+      batch.set(doc.ref, {
+        [`memberProfiles.${actor.uid}.presence`]: {
+          state: nextState,
+          isOnline: nextState === "online",
+          lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+      }, {merge: true});
+    });
+    await batch.commit();
+  }
+
+  return {success: true, state: nextState};
+}
+
+export const staffPingPresence = onCallV2({region: REGION}, async (request) => {
+  try {
+    return await staffPingPresenceHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
 });
 
 function reportInActorScope(actor: StaffContext, row: Record<string, unknown>): boolean {
@@ -4906,6 +5696,7 @@ export const onUserWrite = functions.firestore
       return;
     }
 
+    const beforeData = change.before.exists ? (change.before.data() ?? {}) : null;
     const data = change.after.data() ?? {};
     const role = normalizeRole(data.role);
     let officeId = coerceString(data.officeId);
@@ -4917,13 +5708,33 @@ export const onUserWrite = functions.firestore
       officeName = null;
     }
 
-    await admin.auth().setCustomUserClaims(uid, {
-      role,
-      officeId,
-      officeName,
-      isActive,
-    });
-    await admin.auth().revokeRefreshTokens(uid);
+    // Only sync/revoke when claim-affecting fields change. This avoids
+    // invalidating sessions for unrelated profile writes (for example staff
+    // presence heartbeats from the messaging module).
+    const beforeRole = normalizeRole(beforeData?.role);
+    let beforeOfficeId = coerceString(beforeData?.officeId);
+    let beforeOfficeName = coerceString(beforeData?.officeName);
+    const beforeIsActive = coerceBool(beforeData?.isActive, true);
+    if (beforeRole === "super_admin" || beforeRole === "resident") {
+      beforeOfficeId = null;
+      beforeOfficeName = null;
+    }
+    const claimsChanged =
+      !beforeData ||
+      beforeRole !== role ||
+      beforeOfficeId !== officeId ||
+      beforeOfficeName !== officeName ||
+      beforeIsActive !== isActive;
+
+    if (claimsChanged) {
+      await admin.auth().setCustomUserClaims(uid, {
+        role,
+        officeId,
+        officeName,
+        isActive,
+      });
+      await admin.auth().revokeRefreshTokens(uid);
+    }
 
     const storedRoleRaw = coerceString(data.role);
     if (storedRoleRaw && normalizeRole(storedRoleRaw) !== storedRoleRaw) {
