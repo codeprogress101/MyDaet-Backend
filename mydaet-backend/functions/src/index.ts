@@ -286,11 +286,19 @@ function serializeReportRow(
   row: FirebaseFirestore.DocumentData
 ): Record<string, unknown> {
   const data = row ?? {};
+  const latestTimelineEvent =
+    data.latestTimelineEvent && typeof data.latestTimelineEvent === "object"
+      ? {
+          ...(data.latestTimelineEvent as Record<string, unknown>),
+          createdAt: toIsoString((data.latestTimelineEvent as Record<string, unknown>).createdAt),
+        }
+      : null;
   return {
     id,
     // Report list responses intentionally include the stored fields so the admin queue
     // and the active map can reuse the same payload without another fetch layer.
     ...data,
+    latestTimelineEvent,
     createdAt: toIsoString(data.createdAt),
     updatedAt: toIsoString(data.updatedAt),
     lastActionAt: toIsoString(data.lastActionAt),
@@ -407,14 +415,44 @@ async function addReportTimeline(
 ): Promise<void> {
   // Report timeline is append-only so each workflow movement stays auditable
   // even if summary fields on the parent report document change later.
-  await db
-    .collection("reports")
-    .doc(reportId)
-    .collection("timeline")
-    .add({
-      ...entry,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
+  const reportRef = db.collection("reports").doc(reportId);
+  const timelineRef = reportRef.collection("timeline").doc();
+  const createdAt = admin.firestore.FieldValue.serverTimestamp();
+  const actorUid = coerceString(entry.actorUid) ?? coerceString(entry.byUid);
+  const actorRole = coerceString(entry.actorRole) ?? coerceString(entry.byRole);
+  const actorName = coerceString(entry.actorName) ?? coerceString(entry.byName);
+  const type = coerceString(entry.type) ?? "UPDATE";
+  const notes = coerceString(entry.notes);
+  const fromStatus = coerceString(entry.fromStatus);
+  const toStatus = coerceString(entry.toStatus);
+
+  const batch = db.batch();
+  batch.set(timelineRef, {
+    ...entry,
+    createdAt,
+  });
+  batch.set(
+    reportRef,
+    {
+      latestTimelineEvent: {
+        id: timelineRef.id,
+        type,
+        notes: notes ?? null,
+        actorUid: actorUid ?? null,
+        actorRole: actorRole ?? null,
+        actorName: actorName ?? null,
+        fromStatus: fromStatus ?? null,
+        toStatus: toStatus ?? null,
+        createdAt,
+      },
+      lastActionAt: createdAt,
+      ...(actorUid ? {lastActionByUid: actorUid} : {}),
+      ...(actorRole ? {lastActionByRole: actorRole} : {}),
+      ...(actorName ? {lastActionByName: actorName} : {}),
+    },
+    {merge: true}
+  );
+  await batch.commit();
 }
 
 async function addAuditLog(entry: Record<string, unknown>): Promise<void> {
@@ -2014,6 +2052,122 @@ async function collectQueryRows(
   return rows;
 }
 
+const ACTIVE_DASHBOARD_STATUSES = new Set([
+  "submitted",
+  "acknowledged",
+  "in_review",
+  "assigned",
+  "in_progress",
+]);
+
+function toReportStatus(value: unknown): string {
+  const raw = (coerceString(value) ?? "").toLowerCase().replace(/\s+/g, "_");
+  return raw || "submitted";
+}
+
+function sortReportRowsByActionTime(
+  rows: Array<Record<string, unknown>>
+): Array<Record<string, unknown>> {
+  return [...rows].sort((a, b) => {
+    const aTime = parseEpochMs(a.lastActionAt ?? a.updatedAt ?? a.createdAt);
+    const bTime = parseEpochMs(b.lastActionAt ?? b.updatedAt ?? b.createdAt);
+    return bTime - aTime;
+  });
+}
+
+function buildDashboardActivityFromReports(
+  rows: Array<Record<string, unknown>>,
+  limitCount = 8
+): Array<Record<string, unknown>> {
+  return sortReportRowsByActionTime(rows)
+    .slice(0, limitCount)
+    .map((row) => {
+      const status = toReportStatus(row.status);
+      const latestTimeline =
+        row.latestTimelineEvent && typeof row.latestTimelineEvent === "object"
+          ? (row.latestTimelineEvent as Record<string, unknown>)
+          : null;
+      const timelineType = coerceString(latestTimeline?.type);
+      const timelineNotes = coerceString(latestTimeline?.notes);
+      const toStatus = coerceString(latestTimeline?.toStatus) ?? status;
+      const actionDisplay = timelineNotes
+        ?? (timelineType
+          ? timelineType.replace(/_/g, " ").trim()
+          : `Status: ${toStatus.replace(/_/g, " ").trim()}`);
+      const timestamp = toIsoString(
+        latestTimeline?.createdAt ??
+        row.lastActionAt ??
+        row.updatedAt ??
+        row.createdAt
+      );
+
+      return {
+        id: `${coerceString(row.id) ?? ""}:${timestamp ?? "0"}`,
+        timestamp,
+        actorDisplay:
+          coerceString(latestTimeline?.actorName) ??
+          coerceString(row.lastActionByName) ??
+          coerceString(latestTimeline?.actorRole) ??
+          coerceString(row.lastActionByRole) ??
+          "system",
+        actionDisplay,
+        entityDisplay:
+          coerceString(row.referenceNo) ??
+          coerceString(row.trackingNumber) ??
+          coerceString(row.title) ??
+          coerceString(row.id) ??
+          "report",
+        status,
+        officeId:
+          coerceString(row.officeId) ??
+          coerceString(row.currentOfficeId) ??
+          coerceString(row.assignedOfficeId),
+      };
+    });
+}
+
+function buildWorkQueuePreviewFromReports(
+  rows: Array<Record<string, unknown>>,
+  limitCount = 6
+): Array<Record<string, unknown>> {
+  return sortReportRowsByActionTime(rows)
+    .slice(0, limitCount)
+    .map((row) => ({
+      id: coerceString(row.id) ?? "",
+      title:
+        coerceString(row.title) ??
+        coerceString(row.subject) ??
+        coerceString(row.concern) ??
+        "Untitled report",
+      referenceNo:
+        coerceString(row.referenceNo) ??
+        coerceString(row.trackingNumber) ??
+        coerceString(row.id) ??
+        "",
+      status: toReportStatus(row.status),
+      lane:
+        (coerceString(row.lane) ?? "").toLowerCase() === "emergency" ||
+          !!coerceString(row.emergencyType)
+          ? "emergency"
+          : "issue",
+      officeId:
+        coerceString(row.officeId) ??
+        coerceString(row.currentOfficeId) ??
+        coerceString(row.assignedOfficeId),
+      assignedToUid: coerceString(row.assignedToUid),
+      updatedAt: toIsoString(row.updatedAt ?? row.createdAt),
+      latestTimelineEvent:
+        row.latestTimelineEvent && typeof row.latestTimelineEvent === "object"
+          ? {
+              ...(row.latestTimelineEvent as Record<string, unknown>),
+              createdAt: toIsoString(
+                (row.latestTimelineEvent as Record<string, unknown>).createdAt
+              ),
+            }
+          : null,
+    }));
+}
+
 /**
  * =========================
  * ADMIN DASHBOARD SUMMARY
@@ -2087,18 +2241,13 @@ export const adminDashboardSummary = functions.https.onCall(async (_data, contex
     usersCount = await queryCount(usersRef);
   }
 
-  const activeDashboardStatuses = new Set([
-    "submitted",
-    "acknowledged",
-    "in_review",
-    "assigned",
-    "in_progress",
-  ]);
-  const reportValues = Array.from(reportRows.values());
+  const reportValues = Array.from(reportRows.entries()).map(([id, row]) => ({
+    id,
+    ...(row ?? {}),
+  })) as Array<Record<string, unknown>>;
   const visibleActiveReports = reportValues.filter((rawRow) => {
-    const row = (rawRow ?? {}) as Record<string, unknown>;
-    const status = (coerceString(row.status) ?? "").toLowerCase().replace(/\s+/g, "_");
-    return activeDashboardStatuses.has(status);
+    const status = toReportStatus(rawRow.status);
+    return ACTIVE_DASHBOARD_STATUSES.has(status);
   });
   const myActiveCount = visibleActiveReports.filter(
     (row) => coerceString((row ?? {}).assignedToUid) === actor.uid
@@ -2116,10 +2265,11 @@ export const adminDashboardSummary = functions.https.onCall(async (_data, contex
     }).length
     : 0;
   const emergencyActiveCount = visibleActiveReports.filter((rawRow) => {
-    const row = (rawRow ?? {}) as Record<string, unknown>;
-    const lane = (coerceString(row.lane) ?? "").toLowerCase();
-    return lane === "emergency" || !!coerceString(row.emergencyType);
+    const lane = (coerceString(rawRow.lane) ?? "").toLowerCase();
+    return lane === "emergency" || !!coerceString(rawRow.emergencyType);
   }).length;
+  const activity = buildDashboardActivityFromReports(reportValues, 8);
+  const workQueuePreview = buildWorkQueuePreviewFromReports(visibleActiveReports, 6);
 
   return {
     role: actor.role,
@@ -2136,6 +2286,8 @@ export const adminDashboardSummary = functions.https.onCall(async (_data, contex
       visibleBacklogCount: visibleActiveReports.length,
       emergencyActiveCount,
     },
+    activity,
+    workQueuePreview,
     notes: {
       announcementsSource: POST_COLLECTIONS.join("+"),
     },
@@ -2147,7 +2299,21 @@ async function mergeQueryDocs(
   queryRef: FirebaseFirestore.Query,
   listLimit: number
 ): Promise<void> {
-  const snapshot = await queryRef.limit(listLimit).get();
+  let snapshot: FirebaseFirestore.QuerySnapshot;
+  try {
+    // Prefer deterministic newest-first windows for scoped report unions so
+    // dashboard/report totals and visible tickets stay aligned across refreshes.
+    snapshot = await queryRef.orderBy("updatedAt", "desc").limit(listLimit).get();
+  } catch (error) {
+    const code = String((error as { code?: unknown })?.code ?? "").toLowerCase();
+    // Older datasets may not have an index path for orderBy in every scope query.
+    // Fall back to unsorted reads instead of failing the whole bootstrap request.
+    if (code.includes("failed-precondition")) {
+      snapshot = await queryRef.limit(listLimit).get();
+    } else {
+      throw error;
+    }
+  }
   snapshot.docs.forEach((doc) => {
     if (!target.has(doc.id)) {
       target.set(doc.id, doc.data() ?? {});
@@ -2155,12 +2321,14 @@ async function mergeQueryDocs(
   });
 }
 
-export const adminListReportsScoped = functions.https.onCall(async (data, context) => {
-  const actor = await requireStaffContext(context);
-  await requireFeatureEnabled("reports");
-  const rawLimit = typeof data?.limit === "number" ? Math.floor(data.limit) : 250;
+async function loadScopedReportsForActor(
+  actor: StaffContext,
+  rawLimit: number
+): Promise<{
+  items: Array<Record<string, unknown>>;
+  scope: { role: NormalizedRole; officeId: string | null };
+}> {
   const listLimit = Math.max(20, Math.min(500, rawLimit));
-
   const reportsRef = db.collection("reports");
   const rows = new Map<string, FirebaseFirestore.DocumentData>();
   const queries: FirebaseFirestore.Query[] = [];
@@ -2198,12 +2366,21 @@ export const adminListReportsScoped = functions.https.onCall(async (data, contex
       officeId: actor.officeId ?? null,
     },
   };
-});
+}
 
-export const adminListReportAssignees = functions.https.onCall(async (_data, context) => {
-  const actor = await requireStaffContext(context);
-  await requireFeatureEnabled("reports");
-
+async function loadScopedReportAssigneesForActor(
+  actor: StaffContext
+): Promise<{
+  items: Array<{
+    uid: string;
+    displayName: string;
+    email: string;
+    role: NormalizedRole;
+    officeId: string;
+    isActive: boolean;
+  }>;
+  scope: { role: NormalizedRole; officeId: string | null };
+}> {
   const usersRef = db.collection("users");
   let usersQuery: FirebaseFirestore.Query;
   if (isMunicipalAdminRole(actor.role)) {
@@ -2247,6 +2424,85 @@ export const adminListReportAssignees = functions.https.onCall(async (_data, con
       role: actor.role,
       officeId: actor.officeId ?? null,
     },
+  };
+}
+
+function buildScopedReportViewCounts(
+  rows: Array<Record<string, unknown>>,
+  actor: StaffContext
+): Record<string, number> {
+  const activeStatuses = ACTIVE_DASHBOARD_STATUSES;
+  const archiveStatuses = new Set(["resolved", "closed", "rejected"]);
+  const active = rows.filter((row) => activeStatuses.has(toReportStatus(row.status)));
+  const archive = rows.filter((row) => archiveStatuses.has(toReportStatus(row.status)));
+  const myQueue = active.filter((row) => coerceString(row.assignedToUid) === actor.uid);
+  const officeQueue = active.filter((row) => !coerceString(row.assignedToUid));
+  const emergencyInbox = active.filter((row) => {
+    const lane = (coerceString(row.lane) ?? "").toLowerCase();
+    return lane === "emergency" || !!coerceString(row.emergencyType);
+  });
+  const overdue = emergencyInbox.filter((row) => {
+    const deadline = parseEpochMs(
+      (row.sla as Record<string, unknown> | undefined)?.assignBy ??
+      (row.sla as Record<string, unknown> | undefined)?.acknowledgeBy
+    );
+    return deadline > 0 && deadline < Date.now();
+  });
+
+  return {
+    allReports: rows.length,
+    allActive: active.length,
+    archive: archive.length,
+    myQueue: myQueue.length,
+    myActive: myQueue.length,
+    officeQueue: officeQueue.length,
+    emergencyInbox: emergencyInbox.length,
+    overdue: overdue.length,
+  };
+}
+
+export const adminListReportsScoped = functions.https.onCall(async (data, context) => {
+  const actor = await requireStaffContext(context);
+  await requireFeatureEnabled("reports");
+  const rawLimit = typeof data?.limit === "number" ? Math.floor(data.limit) : 120;
+  return loadScopedReportsForActor(actor, rawLimit);
+});
+
+export const adminListReportAssignees = functions.https.onCall(async (_data, context) => {
+  const actor = await requireStaffContext(context);
+  await requireFeatureEnabled("reports");
+  return loadScopedReportAssigneesForActor(actor);
+});
+
+/**
+ * Reports bootstrap bundles scoped tickets + assignees + counters in one
+ * callable so the workspace can load in a single round-trip.
+ */
+export const adminReportsBootstrap = functions.https.onCall(async (data, context) => {
+  const actor = await requireStaffContext(context);
+  await requireFeatureEnabled("reports");
+  const rawLimit = typeof data?.limit === "number" ? Math.floor(data.limit) : 120;
+  const listLimit = Math.max(20, Math.min(500, rawLimit));
+
+  const [reportsPayload, assigneesPayload] = await Promise.all([
+    loadScopedReportsForActor(actor, listLimit),
+    canAssignReportsRole(actor.role)
+      ? loadScopedReportAssigneesForActor(actor)
+      : Promise.resolve({
+          items: [],
+          scope: {
+            role: actor.role,
+            officeId: actor.officeId ?? null,
+          },
+        }),
+  ]);
+
+  return {
+    reports: reportsPayload.items,
+    items: reportsPayload.items,
+    assignees: assigneesPayload.items,
+    viewCounts: buildScopedReportViewCounts(reportsPayload.items, actor),
+    scope: reportsPayload.scope,
   };
 });
 
