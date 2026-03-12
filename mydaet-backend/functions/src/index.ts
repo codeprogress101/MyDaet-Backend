@@ -110,6 +110,13 @@ function coerceString(value: unknown): string | null {
   return text.length > 0 ? text : null;
 }
 
+function coerceRecord(value: unknown): Record<string, unknown> {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  return {};
+}
+
 function coerceBool(value: unknown, fallback = true): boolean {
   return typeof value === "boolean" ? value : fallback;
 }
@@ -399,12 +406,23 @@ async function addHistory(
   reportId: string,
   entry: Record<string, unknown>
 ): Promise<void> {
+  const reportSnap = await db.collection("reports").doc(reportId).get();
+  const reportRow = coerceRecord(reportSnap.data());
+  const scopeMirror = {
+    createdByUid: coerceString(reportRow?.createdByUid) ?? null,
+    officeId: coerceString(reportRow?.officeId) ?? null,
+    currentOfficeId: coerceString(reportRow?.currentOfficeId) ?? null,
+    assignedOfficeId: coerceString(reportRow?.assignedOfficeId) ?? null,
+    assignedToUid: coerceString(reportRow?.assignedToUid) ?? null,
+  };
+
   await db
     .collection("reports")
     .doc(reportId)
     .collection("history")
     .add({
       ...entry,
+      ...scopeMirror,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 }
@@ -412,12 +430,20 @@ async function addHistory(
 async function addReportTimeline(
   reportId: string,
   entry: Record<string, unknown>
-): Promise<void> {
+): Promise<{
+  id: string;
+  type: string;
+  actorRole: string;
+  notes: string;
+  createdAt: string;
+}> {
   // Report timeline is append-only so each workflow movement stays auditable
   // even if summary fields on the parent report document change later.
   const reportRef = db.collection("reports").doc(reportId);
   const timelineRef = reportRef.collection("timeline").doc();
-  const createdAt = admin.firestore.FieldValue.serverTimestamp();
+  const reportSnapshot = await reportRef.get();
+  const reportRow = coerceRecord(reportSnapshot.data());
+  const createdAt = admin.firestore.Timestamp.now();
   const actorUid = coerceString(entry.actorUid) ?? coerceString(entry.byUid);
   const actorRole = coerceString(entry.actorRole) ?? coerceString(entry.byRole);
   const actorName = coerceString(entry.actorName) ?? coerceString(entry.byName);
@@ -425,10 +451,18 @@ async function addReportTimeline(
   const notes = coerceString(entry.notes);
   const fromStatus = coerceString(entry.fromStatus);
   const toStatus = coerceString(entry.toStatus);
+  const scopeMirror = {
+    createdByUid: coerceString(reportRow?.createdByUid) ?? null,
+    officeId: coerceString(reportRow?.officeId) ?? null,
+    currentOfficeId: coerceString(reportRow?.currentOfficeId) ?? null,
+    assignedOfficeId: coerceString(reportRow?.assignedOfficeId) ?? null,
+    assignedToUid: coerceString(reportRow?.assignedToUid) ?? null,
+  };
 
   const batch = db.batch();
   batch.set(timelineRef, {
     ...entry,
+    ...scopeMirror,
     createdAt,
   });
   batch.set(
@@ -453,6 +487,14 @@ async function addReportTimeline(
     {merge: true}
   );
   await batch.commit();
+
+  return {
+    id: timelineRef.id,
+    type,
+    actorRole: actorRole ?? "staff",
+    notes: notes ?? "",
+    createdAt: createdAt.toDate().toISOString(),
+  };
 }
 
 async function addAuditLog(entry: Record<string, unknown>): Promise<void> {
@@ -683,6 +725,141 @@ async function requireFeatureWritable(featureKey: SystemFeatureKey): Promise<Sys
     );
   }
   return settings;
+}
+
+type LifecycleStatus = "draft" | "published" | "archived";
+const LIFECYCLE_STATUSES: LifecycleStatus[] = ["draft", "published", "archived"];
+const PUBLIC_DOC_TYPES = ["ordinance", "resolution", "executive_order", "public_hearing"] as const;
+type PublicDocType = typeof PUBLIC_DOC_TYPES[number];
+const PUBLIC_DOC_FIXED_OFFICE_BY_TYPE: Record<Exclude<PublicDocType, "public_hearing">, string> = {
+  ordinance: "SANGGUNIANG_BAYAN",
+  resolution: "SANGGUNIANG_BAYAN",
+  executive_order: "OFFICE_OF_THE_MAYOR",
+};
+const DEFAULT_PUBLIC_HEARING_OFFICES = ["SANGGUNIANG_BAYAN", "OFFICE_OF_THE_MAYOR"];
+
+function isContentDraftRole(role: NormalizedRole): boolean {
+  return role === "moderator" || role === "office_admin" || role === "admin" || role === "super_admin";
+}
+
+function isContentPublishRole(role: NormalizedRole): boolean {
+  return role === "admin" || role === "super_admin";
+}
+
+function isJobsManageRole(role: NormalizedRole): boolean {
+  return role === "admin" || role === "super_admin";
+}
+
+function normalizeLifecycleStatus(raw: unknown, fallback: LifecycleStatus = "draft"): LifecycleStatus {
+  const value = String(raw ?? "")
+    .trim()
+    .toLowerCase();
+  if (LIFECYCLE_STATUSES.includes(value as LifecycleStatus)) {
+    return value as LifecycleStatus;
+  }
+  return fallback;
+}
+
+function normalizeKeywordTokens(...values: unknown[]): string[] {
+  const unique = new Set<string>();
+  values.forEach((value) => {
+    String(value ?? "")
+      .toLowerCase()
+      .split(/[^a-z0-9]+/g)
+      .map((token) => token.trim())
+      .filter((token) => token.length >= 2)
+      .forEach((token) => unique.add(token));
+  });
+  return Array.from(unique).slice(0, 64);
+}
+
+function parseStringList(
+  raw: unknown,
+  {maxItems = 20, maxLen = 80}: {maxItems?: number; maxLen?: number} = {}
+): string[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const out: string[] = [];
+  for (const item of raw) {
+    const value = coerceString(item);
+    if (!value) continue;
+    if (value.length > maxLen) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        `List item length must be ${maxLen} characters or fewer.`
+      );
+    }
+    out.push(value);
+    if (out.length >= maxItems) break;
+  }
+  return out;
+}
+
+function parseDateField(raw: unknown): admin.firestore.Timestamp | null {
+  if (!raw) return null;
+  const date = new Date(String(raw));
+  if (Number.isNaN(date.getTime())) return null;
+  return admin.firestore.Timestamp.fromDate(date);
+}
+
+function isActorOfficeScoped(actor: StaffContext): boolean {
+  return actor.role === "moderator" || actor.role === "office_admin";
+}
+
+function ensureActorOfficeScope(actor: StaffContext, targetOfficeId: string | null) {
+  if (!isActorOfficeScoped(actor)) return;
+  if (!actor.officeId) {
+    throw new functions.https.HttpsError("failed-precondition", "Office-scoped account has no office assignment.");
+  }
+  if (targetOfficeId && targetOfficeId !== actor.officeId) {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "Office-scoped staff can only modify records for their assigned office."
+    );
+  }
+}
+
+async function getAllowedPublicHearingOffices(): Promise<string[]> {
+  const defaults = new Set(DEFAULT_PUBLIC_HEARING_OFFICES);
+  const configSnap = await db.collection("system_config").doc("rbac").get();
+  if (configSnap.exists) {
+    const values = configSnap.data()?.publicHearingOffices;
+    if (Array.isArray(values)) {
+      values.forEach((entry) => {
+        const officeId = coerceString(entry);
+        if (officeId) defaults.add(officeId);
+      });
+    }
+  }
+  return Array.from(defaults);
+}
+
+async function resolvePublicDocOfficeId(docType: PublicDocType, requestedOfficeId: string | null): Promise<string> {
+  if (docType === "public_hearing") {
+    const officeId = requestedOfficeId ?? DEFAULT_PUBLIC_HEARING_OFFICES[0];
+    const allowed = await getAllowedPublicHearingOffices();
+    if (!allowed.includes(officeId)) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "public_hearing documents must target an allowed office."
+      );
+    }
+    return officeId;
+  }
+
+  return PUBLIC_DOC_FIXED_OFFICE_BY_TYPE[docType];
+}
+
+function assertStringLength(value: string | null, fieldName: string, minLen: number, maxLen: number): string {
+  const normalized = coerceString(value);
+  if (!normalized || normalized.length < minLen || normalized.length > maxLen) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      `${fieldName} must be between ${minLen} and ${maxLen} characters.`
+    );
+  }
+  return normalized;
 }
 
 type PublicReportLane = "issue" | "emergency";
@@ -2294,22 +2471,49 @@ export const adminDashboardSummary = functions.https.onCall(async (_data, contex
   };
 });
 
+type ReportsCursor = {
+  cursorUpdatedAt: string;
+  cursorId: string;
+};
+
+function normalizeReportsCursorInput(
+  payload: Record<string, unknown>
+): ReportsCursor | null {
+  const cursorUpdatedAt = coerceString(payload.cursorUpdatedAt);
+  const cursorId = coerceString(payload.cursorId);
+  if (!cursorUpdatedAt || !cursorId) {
+    return null;
+  }
+  const cursorEpoch = parseEpochMs(cursorUpdatedAt);
+  if (!cursorEpoch) {
+    return null;
+  }
+  return {
+    cursorUpdatedAt: new Date(cursorEpoch).toISOString(),
+    cursorId,
+  };
+}
+
+function toCursorEpoch(cursor: ReportsCursor | null): number {
+  return cursor ? parseEpochMs(cursor.cursorUpdatedAt) : 0;
+}
+
 async function mergeQueryDocs(
   target: Map<string, FirebaseFirestore.DocumentData>,
   queryRef: FirebaseFirestore.Query,
-  listLimit: number
+  branchLimit: number
 ): Promise<void> {
   let snapshot: FirebaseFirestore.QuerySnapshot;
   try {
     // Prefer deterministic newest-first windows for scoped report unions so
     // dashboard/report totals and visible tickets stay aligned across refreshes.
-    snapshot = await queryRef.orderBy("updatedAt", "desc").limit(listLimit).get();
+    snapshot = await queryRef.orderBy("updatedAt", "desc").limit(branchLimit).get();
   } catch (error) {
     const code = String((error as { code?: unknown })?.code ?? "").toLowerCase();
     // Older datasets may not have an index path for orderBy in every scope query.
     // Fall back to unsorted reads instead of failing the whole bootstrap request.
     if (code.includes("failed-precondition")) {
-      snapshot = await queryRef.limit(listLimit).get();
+      snapshot = await queryRef.limit(branchLimit).get();
     } else {
       throw error;
     }
@@ -2323,13 +2527,71 @@ async function mergeQueryDocs(
 
 async function loadScopedReportsForActor(
   actor: StaffContext,
-  rawLimit: number
+  rawLimit: number,
+  options: {
+    cursor?: ReportsCursor | null;
+  } = {}
 ): Promise<{
   items: Array<Record<string, unknown>>;
   scope: { role: NormalizedRole; officeId: string | null };
+  nextCursor: ReportsCursor | null;
+  generatedAt: string;
 }> {
   const listLimit = Math.max(20, Math.min(500, rawLimit));
+  const branchLimit = Math.max(120, Math.min(320, listLimit * 3));
   const reportsRef = db.collection("reports");
+  const cursor = options.cursor ?? null;
+  const cursorEpoch = toCursorEpoch(cursor);
+  const cursorId = cursor?.cursorId ?? "";
+
+  if (isMunicipalAdminRole(actor.role)) {
+    try {
+      let municipalQuery = reportsRef
+        .orderBy("updatedAt", "desc")
+        .orderBy(admin.firestore.FieldPath.documentId(), "desc");
+      if (cursorEpoch > 0 && cursorId) {
+        municipalQuery = municipalQuery.startAfter(
+          admin.firestore.Timestamp.fromMillis(cursorEpoch),
+          cursorId
+        );
+      }
+      const snapshot = await municipalQuery.limit(listLimit + 1).get();
+      const sortedRows = snapshot.docs.map((doc) =>
+        serializeReportRow(doc.id, doc.data() ?? {})
+      );
+      const hasMore = sortedRows.length > listLimit;
+      const items = sortedRows.slice(0, listLimit);
+      const lastRow = items.length > 0 ? items[items.length - 1] : null;
+      return {
+        items,
+        scope: {
+          role: actor.role,
+          officeId: actor.officeId ?? null,
+        },
+        nextCursor:
+          hasMore && lastRow
+            ? {
+                cursorUpdatedAt:
+                  String(
+                    (lastRow.updatedAt as string) ||
+                      (lastRow.createdAt as string) ||
+                      new Date().toISOString()
+                  ),
+                cursorId: String(lastRow.id),
+              }
+            : null,
+        generatedAt: new Date().toISOString(),
+      };
+    } catch (error) {
+      const code = String((error as { code?: unknown })?.code ?? "").toLowerCase();
+      // If the municipal dual-order index is not ready yet, continue to the
+      // union fallback below to avoid blocking staff access.
+      if (!code.includes("failed-precondition")) {
+        throw error;
+      }
+    }
+  }
+
   const rows = new Map<string, FirebaseFirestore.DocumentData>();
   const queries: FirebaseFirestore.Query[] = [];
 
@@ -2347,17 +2609,43 @@ async function loadScopedReportsForActor(
   }
 
   for (const queryRef of queries) {
-    await mergeQueryDocs(rows, queryRef, listLimit);
+    await mergeQueryDocs(rows, queryRef, branchLimit);
   }
 
-  const items = Array.from(rows.entries())
+  const sortedRows = Array.from(rows.entries())
     .map(([id, row]) => serializeReportRow(id, row))
     .sort((a, b) => {
       const aTime = parseEpochMs((a.updatedAt as unknown) ?? a.createdAt);
       const bTime = parseEpochMs((b.updatedAt as unknown) ?? b.createdAt);
-      return bTime - aTime;
+      if (bTime !== aTime) {
+        return bTime - aTime;
+      }
+      return String(b.id).localeCompare(String(a.id));
+    });
+
+  const filteredRows = cursorEpoch > 0 && cursorId
+    ? sortedRows.filter((row) => {
+      const rowEpoch = parseEpochMs((row.updatedAt as unknown) ?? row.createdAt);
+      if (rowEpoch < cursorEpoch) {
+        return true;
+      }
+      if (rowEpoch > cursorEpoch) {
+        return false;
+      }
+      return String(row.id).localeCompare(cursorId) < 0;
     })
-    .slice(0, listLimit);
+    : sortedRows;
+
+  const hasMore = filteredRows.length > listLimit;
+  const items = filteredRows.slice(0, listLimit);
+  const lastRow = items.length > 0 ? items[items.length - 1] : null;
+  const nextCursor = hasMore && lastRow
+    ? {
+        cursorUpdatedAt:
+          String((lastRow.updatedAt as string) || (lastRow.createdAt as string) || new Date().toISOString()),
+        cursorId: String(lastRow.id),
+      }
+    : null;
 
   return {
     items,
@@ -2365,6 +2653,8 @@ async function loadScopedReportsForActor(
       role: actor.role,
       officeId: actor.officeId ?? null,
     },
+    nextCursor,
+    generatedAt: new Date().toISOString(),
   };
 }
 
@@ -2464,8 +2754,12 @@ function buildScopedReportViewCounts(
 export const adminListReportsScoped = functions.https.onCall(async (data, context) => {
   const actor = await requireStaffContext(context);
   await requireFeatureEnabled("reports");
-  const rawLimit = typeof data?.limit === "number" ? Math.floor(data.limit) : 120;
-  return loadScopedReportsForActor(actor, rawLimit);
+  const payload = (data && typeof data === "object")
+    ? (data as Record<string, unknown>)
+    : {};
+  const rawLimit = typeof payload.limit === "number" ? Math.floor(payload.limit) : 120;
+  const cursor = normalizeReportsCursorInput(payload);
+  return loadScopedReportsForActor(actor, rawLimit, {cursor});
 });
 
 export const adminListReportAssignees = functions.https.onCall(async (_data, context) => {
@@ -2481,11 +2775,15 @@ export const adminListReportAssignees = functions.https.onCall(async (_data, con
 export const adminReportsBootstrap = functions.https.onCall(async (data, context) => {
   const actor = await requireStaffContext(context);
   await requireFeatureEnabled("reports");
-  const rawLimit = typeof data?.limit === "number" ? Math.floor(data.limit) : 120;
+  const payload = (data && typeof data === "object")
+    ? (data as Record<string, unknown>)
+    : {};
+  const rawLimit = typeof payload.limit === "number" ? Math.floor(payload.limit) : 120;
   const listLimit = Math.max(20, Math.min(500, rawLimit));
+  const cursor = normalizeReportsCursorInput(payload);
 
   const [reportsPayload, assigneesPayload] = await Promise.all([
-    loadScopedReportsForActor(actor, listLimit),
+    loadScopedReportsForActor(actor, listLimit, {cursor}),
     canAssignReportsRole(actor.role)
       ? loadScopedReportAssigneesForActor(actor)
       : Promise.resolve({
@@ -2503,6 +2801,8 @@ export const adminReportsBootstrap = functions.https.onCall(async (data, context
     assignees: assigneesPayload.items,
     viewCounts: buildScopedReportViewCounts(reportsPayload.items, actor),
     scope: reportsPayload.scope,
+    nextCursor: reportsPayload.nextCursor,
+    generatedAt: reportsPayload.generatedAt,
   };
 });
 
@@ -3872,6 +4172,569 @@ export const adminUpdateSettings = onCallV2({region: REGION}, async (request) =>
   }
 });
 
+function normalizePostCollectionNameServer(raw: unknown): "posts" | "announcements" {
+  const value = String(raw ?? "")
+    .trim()
+    .toLowerCase();
+  return value === "announcements" ? "announcements" : "posts";
+}
+
+function assertKnownLifecycleStatus(raw: unknown): LifecycleStatus {
+  const value = String(raw ?? "")
+    .trim()
+    .toLowerCase();
+  if (!LIFECYCLE_STATUSES.includes(value as LifecycleStatus)) {
+    throw new functions.https.HttpsError("invalid-argument", "Invalid lifecycle status.");
+  }
+  return value as LifecycleStatus;
+}
+
+function canEditScopedRecord(
+  actor: StaffContext,
+  row: Record<string, unknown>
+): boolean {
+  if (actor.role === "super_admin" || actor.role === "admin") {
+    return true;
+  }
+  const rowOfficeId = coerceString(row.officeId);
+  const rowCreatorUid = coerceString(row.createdByUid);
+  if (rowCreatorUid && rowCreatorUid === actor.uid) {
+    return true;
+  }
+  if (actor.officeId && rowOfficeId && actor.officeId === rowOfficeId) {
+    return true;
+  }
+  return false;
+}
+
+function mapAttachmentList(raw: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(raw)) return [];
+  const mapped: Array<Record<string, unknown>> = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue;
+    const item = entry as Record<string, unknown>;
+    const url = coerceString(item.url);
+    if (!url) continue;
+    mapped.push({
+      name: coerceString(item.name) ?? "Attachment",
+      url,
+      path: coerceString(item.path),
+      contentType: coerceString(item.contentType),
+      size: typeof item.size === "number" ? item.size : null,
+      uploadedAt: coerceString(item.uploadedAt),
+    });
+    if (mapped.length >= 20) break;
+  }
+  return mapped;
+}
+
+async function adminSavePostDraftHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const actor = await requireStaffContext(context);
+  if (!isContentDraftRole(actor.role)) {
+    throw new functions.https.HttpsError("permission-denied", "Staff draft access is required.");
+  }
+
+  const payload = (data && typeof data === "object")
+    ? (data as Record<string, unknown>)
+    : {};
+  const id = coerceString(payload.id);
+  const type = String(payload.type ?? "announcement")
+    .trim()
+    .toLowerCase();
+  if (type !== "announcement" && type !== "news") {
+    throw new functions.https.HttpsError("invalid-argument", "type must be announcement or news.");
+  }
+  await requireFeatureWritable(type === "news" ? "news" : "announcements");
+
+  const status = normalizeLifecycleStatus(payload.status, "draft");
+  if (status !== "draft" && !isContentPublishRole(actor.role)) {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "Only admin or super_admin can publish/archive posts."
+    );
+  }
+
+  const title = assertStringLength(coerceString(payload.title), "title", 1, 120);
+  const body = assertStringLength(coerceString(payload.body), "body", 1, 5000);
+  const category = coerceString(payload.category) ?? "Announcement";
+  const officeId = coerceString(payload.officeId);
+  ensureActorOfficeScope(actor, officeId);
+
+  const tags = parseStringList(payload.tags, {maxItems: 20, maxLen: 32});
+  const publishAt = parseDateField(payload.publishAt);
+  const coverImageUrl = coerceString(payload.coverImageUrl);
+  const coverImagePath = coerceString(payload.coverImagePath);
+  const coverImageName = coerceString(payload.coverImageName);
+  const coverImageContentType = coerceString(payload.coverImageContentType);
+  const sourceCollection = normalizePostCollectionNameServer(payload.sourceCollection);
+  const targetRef = id
+    ? db.collection(sourceCollection).doc(id)
+    : db.collection(sourceCollection).doc();
+
+  if (id) {
+    const existing = await targetRef.get();
+    if (!existing.exists) {
+      throw new functions.https.HttpsError("not-found", "Post not found.");
+    }
+    const row = (existing.data() ?? {}) as Record<string, unknown>;
+    if (!canEditScopedRecord(actor, row)) {
+      throw new functions.https.HttpsError("permission-denied", "Not allowed to edit this post.");
+    }
+  }
+
+  const actorName = actorDisplayName(actor);
+  const actorEmail =
+    coerceString(actor.profileData.email) ??
+    coerceString(context.auth?.token.email) ??
+    null;
+  const now = admin.firestore.FieldValue.serverTimestamp();
+  const media = coverImageUrl ? {
+    type: "image",
+    url: coverImageUrl,
+    path: coverImagePath,
+    name: coverImageName,
+    contentType: coverImageContentType,
+  } : null;
+
+  const payloadData: Record<string, unknown> = {
+    type,
+    category,
+    title,
+    body,
+    officeId: officeId ?? null,
+    publishAt,
+    media,
+    coverImageUrl: coverImageUrl ?? null,
+    tags,
+    status,
+    searchKeywords: normalizeKeywordTokens(title, body, category, tags.join(" ")),
+    updatedAt: now,
+    updatedByUid: actor.uid,
+    updatedByName: actorName,
+    updatedByEmail: actorEmail,
+  };
+
+  if (status === "published") {
+    payloadData.publishedAt = now;
+    payloadData.publishedByUid = actor.uid;
+    payloadData.publishedByName = actorName;
+  }
+  if (status === "archived") {
+    payloadData.archivedAt = now;
+    payloadData.archivedByUid = actor.uid;
+    payloadData.archivedByName = actorName;
+  }
+
+  if (!id) {
+    payloadData.createdAt = now;
+    payloadData.createdByUid = actor.uid;
+    payloadData.createdByName = actorName;
+    payloadData.createdByEmail = actorEmail;
+    payloadData.views = 0;
+  }
+
+  await targetRef.set(payloadData, {merge: true});
+  await addAuditLog({
+    action: id ? "post_draft_updated" : "post_draft_created",
+    entityType: "posts",
+    entityId: targetRef.id,
+    officeId: officeId ?? actor.officeId ?? null,
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorName,
+    actorEmail,
+    after: {
+      status,
+      type,
+      category,
+      title,
+      sourceCollection,
+    },
+  });
+
+  return {
+    success: true,
+    id: targetRef.id,
+    sourceCollection,
+    status,
+  };
+}
+
+export const adminSavePostDraft = onCallV2({region: REGION}, async (request) => {
+  try {
+    return await adminSavePostDraftHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+async function adminSavePublicDocDraftHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const actor = await requireStaffContext(context);
+  if (!isContentDraftRole(actor.role)) {
+    throw new functions.https.HttpsError("permission-denied", "Staff draft access is required.");
+  }
+  await requireFeatureWritable("transparency");
+
+  const payload = (data && typeof data === "object")
+    ? (data as Record<string, unknown>)
+    : {};
+  const id = coerceString(payload.id);
+  const rawDocType = String(payload.docType ?? "")
+    .trim()
+    .toLowerCase();
+  if (!PUBLIC_DOC_TYPES.includes(rawDocType as PublicDocType)) {
+    throw new functions.https.HttpsError("invalid-argument", "Unsupported document type.");
+  }
+  const docType = rawDocType as PublicDocType;
+  const status = normalizeLifecycleStatus(payload.status, "draft");
+  if (status !== "draft" && !isContentPublishRole(actor.role)) {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "Only admin or super_admin can publish/archive public documents."
+    );
+  }
+
+  const docNo = assertStringLength(coerceString(payload.docNo), "docNo", 1, 40);
+  const title = assertStringLength(coerceString(payload.title), "title", 1, 120);
+  const summary = assertStringLength(coerceString(payload.summary), "summary", 1, 500);
+  const requestedOfficeId = coerceString(payload.officeId);
+  const officeId = await resolvePublicDocOfficeId(docType, requestedOfficeId);
+  ensureActorOfficeScope(actor, officeId);
+
+  const tags = parseStringList(payload.tags, {maxItems: 20, maxLen: 32});
+  const attachments = mapAttachmentList(payload.attachments);
+  const dateIssued = parseDateField(payload.dateIssued);
+  const dateApproved = parseDateField(payload.dateApproved);
+  const pdfUrl = coerceString(payload.pdfUrl);
+
+  const targetRef = id
+    ? db.collection("public_docs").doc(id)
+    : db.collection("public_docs").doc();
+  if (id) {
+    const existing = await targetRef.get();
+    if (!existing.exists) {
+      throw new functions.https.HttpsError("not-found", "Public document not found.");
+    }
+    const row = (existing.data() ?? {}) as Record<string, unknown>;
+    if (!canEditScopedRecord(actor, row)) {
+      throw new functions.https.HttpsError("permission-denied", "Not allowed to edit this document.");
+    }
+  }
+
+  const actorName = actorDisplayName(actor);
+  const actorEmail =
+    coerceString(actor.profileData.email) ??
+    coerceString(context.auth?.token.email) ??
+    null;
+  const now = admin.firestore.FieldValue.serverTimestamp();
+  const payloadData: Record<string, unknown> = {
+    docType,
+    docNo,
+    title,
+    summary,
+    officeId,
+    pdfUrl: pdfUrl ?? null,
+    attachments,
+    status,
+    tags,
+    dateIssued,
+    dateApproved,
+    searchKeywords: normalizeKeywordTokens(docNo, title, summary, tags.join(" ")),
+    updatedAt: now,
+    updatedByUid: actor.uid,
+    updatedByName: actorName,
+    updatedByEmail: actorEmail,
+  };
+  if (status === "published") {
+    payloadData.publishedAt = now;
+    payloadData.publishedByUid = actor.uid;
+    payloadData.publishedByName = actorName;
+  }
+  if (status === "archived") {
+    payloadData.archivedAt = now;
+    payloadData.archivedByUid = actor.uid;
+    payloadData.archivedByName = actorName;
+  }
+  if (!id) {
+    payloadData.createdAt = now;
+    payloadData.createdByUid = actor.uid;
+    payloadData.createdByName = actorName;
+  }
+
+  await targetRef.set(payloadData, {merge: true});
+  await addAuditLog({
+    action: id ? "public_doc_updated" : "public_doc_created",
+    entityType: "public_docs",
+    entityId: targetRef.id,
+    officeId,
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorName,
+    actorEmail,
+    after: {
+      status,
+      docType,
+      docNo,
+      title,
+    },
+  });
+
+  return {
+    success: true,
+    id: targetRef.id,
+    status,
+  };
+}
+
+export const adminSavePublicDocDraft = onCallV2({region: REGION}, async (request) => {
+  try {
+    return await adminSavePublicDocDraftHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+async function adminSaveJobDraftHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const actor = await requireStaffContext(context);
+  await requireFeatureWritable("jobs");
+  if (!isJobsManageRole(actor.role)) {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "Only admin or super_admin can manage job postings."
+    );
+  }
+
+  const payload = (data && typeof data === "object")
+    ? (data as Record<string, unknown>)
+    : {};
+  const id = coerceString(payload.id);
+  const status = normalizeLifecycleStatus(payload.status, "draft");
+  if (status !== "draft" && !isContentPublishRole(actor.role)) {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "Only admin or super_admin can publish/archive jobs."
+    );
+  }
+
+  const title = assertStringLength(coerceString(payload.title), "title", 1, 120);
+  const officeId = assertStringLength(coerceString(payload.officeId), "officeId", 1, 120);
+  const employmentType = assertStringLength(coerceString(payload.employmentType), "employmentType", 1, 60);
+  const description = assertStringLength(coerceString(payload.description), "description", 1, 5000);
+  const salaryRange = coerceString(payload.salaryRange);
+  const location = coerceString(payload.location);
+  const qualifications = coerceString(payload.qualifications);
+  const applicationLink = coerceString(payload.applicationLink);
+  const applicationEmail = coerceString(payload.applicationEmail);
+  const deadline = parseDateField(payload.deadline);
+  const requirements = parseStringList(payload.requirements, {maxItems: 30, maxLen: 250});
+  const tags = parseStringList(payload.tags, {maxItems: 20, maxLen: 32});
+
+  const targetRef = id
+    ? db.collection("jobs").doc(id)
+    : db.collection("jobs").doc();
+  if (id) {
+    const existing = await targetRef.get();
+    if (!existing.exists) {
+      throw new functions.https.HttpsError("not-found", "Job posting not found.");
+    }
+  }
+
+  const actorName = actorDisplayName(actor);
+  const actorEmail =
+    coerceString(actor.profileData.email) ??
+    coerceString(context.auth?.token.email) ??
+    null;
+  const now = admin.firestore.FieldValue.serverTimestamp();
+  const payloadData: Record<string, unknown> = {
+    title,
+    officeId,
+    employmentType,
+    plantilla: Boolean(payload.plantilla),
+    salaryRange: salaryRange ?? null,
+    location: location ?? null,
+    description,
+    qualifications: qualifications ?? null,
+    requirements,
+    applicationLink: applicationLink ?? null,
+    applicationEmail: applicationEmail ?? null,
+    deadline,
+    status,
+    tags,
+    searchKeywords: normalizeKeywordTokens(
+      title,
+      description,
+      qualifications ?? "",
+      requirements.join(" "),
+      tags.join(" ")
+    ),
+    updatedAt: now,
+    updatedByUid: actor.uid,
+    updatedByName: actorName,
+    updatedByEmail: actorEmail,
+  };
+  if (status === "published") {
+    payloadData.publishedAt = now;
+    payloadData.publishedByUid = actor.uid;
+    payloadData.publishedByName = actorName;
+  }
+  if (status === "archived") {
+    payloadData.archivedAt = now;
+    payloadData.archivedByUid = actor.uid;
+    payloadData.archivedByName = actorName;
+  }
+  if (!id) {
+    payloadData.createdAt = now;
+    payloadData.createdByUid = actor.uid;
+    payloadData.createdByName = actorName;
+  }
+
+  await targetRef.set(payloadData, {merge: true});
+  await addAuditLog({
+    action: id ? "job_updated" : "job_created",
+    entityType: "jobs",
+    entityId: targetRef.id,
+    officeId,
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorName,
+    actorEmail,
+    after: {
+      status,
+      title,
+      officeId,
+    },
+  });
+
+  return {
+    success: true,
+    id: targetRef.id,
+    status,
+  };
+}
+
+export const adminSaveJobDraft = onCallV2({region: REGION}, async (request) => {
+  try {
+    return await adminSaveJobDraftHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+async function adminSetEntityStatusHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const actor = await requireStaffContext(context);
+  if (!isContentPublishRole(actor.role)) {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "Only admin or super_admin can update lifecycle status."
+    );
+  }
+  const payload = (data && typeof data === "object")
+    ? (data as Record<string, unknown>)
+    : {};
+  const entityType = coerceString(payload.entityType);
+  const entityId = coerceString(payload.entityId);
+  if (!entityType || !entityId) {
+    throw new functions.https.HttpsError("invalid-argument", "entityType and entityId are required.");
+  }
+  const status = assertKnownLifecycleStatus(payload.status);
+
+  const actorName = actorDisplayName(actor);
+  const actorEmail =
+    coerceString(actor.profileData.email) ??
+    coerceString(context.auth?.token.email) ??
+    null;
+  const now = admin.firestore.FieldValue.serverTimestamp();
+  const basePatch: Record<string, unknown> = {
+    status,
+    updatedAt: now,
+    updatedByUid: actor.uid,
+    updatedByName: actorName,
+    updatedByEmail: actorEmail,
+  };
+  if (status === "published") {
+    basePatch.publishedAt = now;
+    basePatch.publishedByUid = actor.uid;
+    basePatch.publishedByName = actorName;
+  }
+  if (status === "archived") {
+    basePatch.archivedAt = now;
+    basePatch.archivedByUid = actor.uid;
+    basePatch.archivedByName = actorName;
+  }
+
+  let targetRef: FirebaseFirestore.DocumentReference;
+  let auditEntityType = entityType;
+  if (entityType === "posts") {
+    const sourceCollection = normalizePostCollectionNameServer(payload.sourceCollection);
+    targetRef = db.collection(sourceCollection).doc(entityId);
+    const sourceSnap = await targetRef.get();
+    if (!sourceSnap.exists) {
+      throw new functions.https.HttpsError("not-found", "Post not found.");
+    }
+    const sourceRow = (sourceSnap.data() ?? {}) as Record<string, unknown>;
+    const sourceType = String(sourceRow.type ?? "")
+      .trim()
+      .toLowerCase();
+    await requireFeatureWritable(sourceType === "news" ? "news" : "announcements");
+  } else if (entityType === "public_docs") {
+    await requireFeatureWritable("transparency");
+    targetRef = db.collection("public_docs").doc(entityId);
+    const sourceSnap = await targetRef.get();
+    if (!sourceSnap.exists) {
+      throw new functions.https.HttpsError("not-found", "Public document not found.");
+    }
+  } else if (entityType === "jobs") {
+    await requireFeatureWritable("jobs");
+    targetRef = db.collection("jobs").doc(entityId);
+    const sourceSnap = await targetRef.get();
+    if (!sourceSnap.exists) {
+      throw new functions.https.HttpsError("not-found", "Job posting not found.");
+    }
+  } else {
+    throw new functions.https.HttpsError("invalid-argument", "Unsupported entity type.");
+  }
+
+  await targetRef.set(basePatch, {merge: true});
+  await addAuditLog({
+    action: `${auditEntityType}_${status}`,
+    entityType: auditEntityType,
+    entityId,
+    officeId: coerceString(payload.officeId) ?? actor.officeId ?? null,
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorName,
+    actorEmail,
+    after: {status},
+  });
+
+  return {
+    success: true,
+    entityType: auditEntityType,
+    entityId,
+    status,
+  };
+}
+
+export const adminSetEntityStatus = onCallV2({region: REGION}, async (request) => {
+  try {
+    return await adminSetEntityStatusHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
 async function adminUpdateReportStatusHandler(
   data: unknown,
   context: CallableContextLike
@@ -3962,20 +4825,22 @@ async function adminUpdateReportStatusHandler(
     message: `Status changed from ${previousStatus} to ${nextStatus}.`,
   });
 
-  if (notes) {
-    // Status notes are appended as their own timeline entry so operators can
-    // explain progress updates without mutating or overwriting earlier history.
-    await addReportTimeline(reportId, {
-      type: "NOTE",
-      actorUid: actor.uid,
-      actorRole: actor.role,
-      notes,
-      fromStatus: nextStatus,
-      toStatus: nextStatus,
-    });
-  }
+  const latestTimelineEvent = await addReportTimeline(reportId, {
+    type: "STATUS_CHANGED",
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorName: actorMeta.lastActionByName,
+    notes: notes ?? null,
+    fromStatus: previousStatus,
+    toStatus: nextStatus,
+  });
 
-  return {success: true, reportId, status: nextStatus};
+  return {
+    success: true,
+    reportId,
+    status: nextStatus,
+    latestTimelineEvent,
+  };
 }
 
 export const adminUpdateReportStatus = onCallV2({region: REGION}, async (request) => {
@@ -4004,6 +4869,7 @@ async function staffClaimReportHandler(
   const reportRef = db.collection("reports").doc(reportId);
   const actorMeta = reportActorMeta(actor, context);
   let previousStatus = "submitted";
+  let claimedStatus = "assigned";
   let officeId: string | null = null;
 
   await db.runTransaction(async (tx) => {
@@ -4035,6 +4901,7 @@ async function staffClaimReportHandler(
       previousStatus === "in_review"
         ? "assigned"
         : previousStatus;
+    claimedStatus = nextStatus;
 
     tx.set(
       reportRef,
@@ -4065,11 +4932,23 @@ async function staffClaimReportHandler(
     message: "Claimed to self.",
   });
 
+  const latestTimelineEvent = await addReportTimeline(reportId, {
+    type: "CLAIMED",
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorName: actorMeta.lastActionByName,
+    notes: "Claimed to self.",
+    fromStatus: previousStatus,
+    toStatus: claimedStatus,
+  });
+
   return {
     success: true,
     reportId,
     assignedToUid: actor.uid,
     assignedToName: actorDisplayName(actor),
+    status: claimedStatus,
+    latestTimelineEvent,
   };
 }
 
@@ -4199,12 +5078,25 @@ async function adminAssignReportHandler(
       : "Report unassigned.",
   });
 
+  const latestTimelineEvent = await addReportTimeline(reportId, {
+    type: assigneeUid ? (beforeAssignedUid ? "REASSIGNED" : "ASSIGNED") : "UNASSIGNED",
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorName: actorMeta.lastActionByName,
+    notes: assigneeUid
+      ? `Assigned to ${assignedToName}.`
+      : "Removed assignee and returned to queue.",
+    fromStatus: beforeStatus,
+    toStatus: afterStatus,
+  });
+
   return {
     success: true,
     reportId,
     assignedToUid: assigneeUid ?? null,
     assignedToName: assigneeUid ? assignedToName : null,
     status: afterStatus,
+    latestTimelineEvent,
   };
 }
 
@@ -4337,12 +5229,23 @@ async function adminClaimNextReportHandler(
         message: "Claimed from queue",
       });
 
+      const latestTimelineEvent = await addReportTimeline(claimResult.reportId, {
+        type: "CLAIMED",
+        actorUid: actor.uid,
+        actorRole: actor.role,
+        actorName: actorMeta.lastActionByName,
+        notes: "Claimed from queue.",
+        fromStatus: claimResult.beforeStatus,
+        toStatus: "assigned",
+      });
+
       return {
         success: true,
         reportId: claimResult.reportId,
         assignedToUid: actor.uid,
         status: "assigned",
         officeId: claimResult.officeId,
+        latestTimelineEvent,
       };
     }
   }
@@ -4460,11 +5363,22 @@ async function adminRequeueReportHandler(
     message: reason ? `Requeued report. Reason: ${reason}` : "Requeued report.",
   });
 
+  const latestTimelineEvent = await addReportTimeline(result.reportId, {
+    type: "REQUEUED",
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorName: actorMeta.lastActionByName,
+    notes: reason ? `Requeued to queue: ${reason}` : "Requeued to queue.",
+    fromStatus: result.previousStatus,
+    toStatus: result.nextStatus,
+  });
+
   return {
     success: true,
     reportId: result.reportId,
     assignedToUid: null,
     status: result.nextStatus,
+    latestTimelineEvent,
   };
 }
 
@@ -5388,6 +6302,10 @@ export const opsRuntimeHealth = functions.https.onCall(async (data, context) => 
     "adminClaimNextReport",
     "adminRequeueReport",
     "adminWriteAuditLog",
+    "adminSavePostDraft",
+    "adminSavePublicDocDraft",
+    "adminSaveJobDraft",
+    "adminSetEntityStatus",
     "civilRegistrySubmit",
     "civilRegistryCheckStatus",
     "adminListCivilRegistryRequests",

@@ -12,109 +12,32 @@ service firebase.storage {
       return request.auth != null;
     }
 
-    function roleRaw() {
-      return (request.auth != null && request.auth.token.role != null)
-        ? request.auth.token.role
-        : null;
-    }
-
-    function userDoc() {
-      return firestore.get(/databases/(default)/documents/users/$(request.auth.uid));
-    }
-
-    function hasUserData() {
-      return signedIn() && userDoc().data != null;
-    }
-
-    function roleRawByDoc() {
-      return hasUserData() && userDoc().data.role != null
-        ? userDoc().data.role
-        : null;
-    }
-
-    function roleCandidate() {
-      return roleRaw() != null
-        ? roleRaw()
-        : roleRawByDoc();
-    }
-
-    function roleString() {
-      return roleCandidate() is string
-        ? roleCandidate()
-        : "";
-    }
-
-    function roleMatches(pattern) {
-      return roleString() != "" && roleString().matches(pattern);
-    }
-
-    function hasSuperAdminFlag() {
-      return request.auth != null && (
-        request.auth.token.superAdmin == true
-        || request.auth.token.isSuperAdmin == true
-        || request.auth.token.super_admin == true
-      );
-    }
-
-    function hasOfficeAdminFlag() {
-      return request.auth != null && (
-        request.auth.token.officeAdmin == true
-        || request.auth.token.office_admin == true
-        || request.auth.token.isOfficeAdmin == true
-      );
-    }
-
-    function hasModeratorFlag() {
-      return request.auth != null && (
-        request.auth.token.moderator == true
-        || request.auth.token.isModerator == true
-        || request.auth.token.clerk == true
-      );
-    }
-
     function role() {
-      return (
-        hasSuperAdminFlag()
-        || roleMatches("^[\\s]*[sS][uU][pP][eE][rR][ _-]?[aA][dD][mM][iI][nN][\\s]*$")
-      )
-        ? "super_admin"
-        : (
-          hasOfficeAdminFlag()
-          || roleMatches("^[\\s]*[aA][dD][mM][iI][nN][\\s]*$")
-          || roleMatches("^[\\s]*[oO][fF][fF][iI][cC][eE][ _-]?[aA][dD][mM][iI][nN][\\s]*$")
-        )
-            ? "admin"
-            : (
-              hasModeratorFlag()
-              || roleMatches("^[\\s]*[mM][oO][dD][eE][rR][aA][tT][oO][rR][\\s]*$")
-              || roleMatches("^[\\s]*[cC][lL][eE][rR][kK][\\s]*$")
-            )
-                ? "moderator"
-                : "resident";
+      // Canonical 5-role claim model. Unknown values fall back to resident.
+      return signedIn()
+        && ("role" in request.auth.token)
+        && request.auth.token.role is string
+        && request.auth.token.role in ["resident", "moderator", "office_admin", "admin", "super_admin"]
+        ? request.auth.token.role
+        : "resident";
     }
 
     function officeId() {
       return (request.auth != null && request.auth.token.officeId != null)
         ? request.auth.token.officeId
-        : (hasUserData() && userDoc().data.officeId != null
-            ? userDoc().data.officeId
-            : null);
+        : null;
     }
 
     function officeName() {
       return (request.auth != null && request.auth.token.officeName != null)
         ? request.auth.token.officeName
-        : (hasUserData() && userDoc().data.officeName != null
-            ? userDoc().data.officeName
-            : null);
+        : null;
     }
 
     function isActive() {
       return (request.auth != null && request.auth.token.isActive != null)
         ? request.auth.token.isActive
-        : (hasUserData() && userDoc().data.isActive != null
-            ? userDoc().data.isActive
-            : true);
+        : true;
     }
 
     function activeUser() {
@@ -125,8 +48,12 @@ service firebase.storage {
       return role() == "super_admin";
     }
 
-    function isOfficeAdmin() {
+    function isMunicipalAdmin() {
       return role() == "admin";
+    }
+
+    function isOfficeAdmin() {
+      return role() == "office_admin";
     }
 
     function isModerator() {
@@ -134,7 +61,13 @@ service firebase.storage {
     }
 
     function isStaff() {
-      return isSuperAdmin() || isOfficeAdmin() || isModerator();
+      return isSuperAdmin()
+        || isMunicipalAdmin()
+        || (
+          (isOfficeAdmin() || isModerator())
+          && officeId() != null
+          && officeId() != ""
+        );
     }
 
     function reportDoc(reportId) {
@@ -142,14 +75,22 @@ service firebase.storage {
     }
 
     function reportOfficeAllowed(reportId) {
-      return reportDoc(reportId).data.officeId == null
-        || reportDoc(reportId).data.officeId == ""
-        || (officeId() != null && reportDoc(reportId).data.officeId == officeId());
+      return officeId() != null
+        && (
+          reportDoc(reportId).data.officeId == officeId()
+          || reportDoc(reportId).data.currentOfficeId == officeId()
+          || reportDoc(reportId).data.assignedOfficeId == officeId()
+        );
     }
 
     function canReadReport(reportId) {
       return activeUser() && (
-        isStaff()
+        isSuperAdmin()
+        || isMunicipalAdmin()
+        || (
+          (isOfficeAdmin() || isModerator())
+          && reportOfficeAllowed(reportId)
+        )
         || reportDoc(reportId).data.createdByUid == request.auth.uid
       );
     }
@@ -158,6 +99,7 @@ service firebase.storage {
       return activeUser() && (
         reportDoc(reportId).data.createdByUid == request.auth.uid
         || isSuperAdmin()
+        || isMunicipalAdmin()
         || (isOfficeAdmin() && reportOfficeAllowed(reportId))
         || (isModerator() && reportDoc(reportId).data.assignedToUid == request.auth.uid)
       );
@@ -167,8 +109,13 @@ service firebase.storage {
       return firestore.get(/databases/(default)/documents/dts_documents/$(docId));
     }
 
+    function mapValueOrNull(data, field) {
+      return data is map && data.keys().hasAny([field]) ? data[field] : null;
+    }
+
     function dtsOfficeAllowed(docId) {
       return isSuperAdmin()
+        || isMunicipalAdmin()
         || (
           isStaff()
           && (
@@ -176,11 +123,11 @@ service firebase.storage {
             || (officeName() != null && dtsDoc(docId).data.currentOfficeName != null && dtsDoc(docId).data.currentOfficeName == officeName())
             || (dtsDoc(docId).data.currentCustodianUid != null && dtsDoc(docId).data.currentCustodianUid == request.auth.uid)
             || (
-              dtsDoc(docId).data.pendingTransfer != null
+              mapValueOrNull(dtsDoc(docId).data, "pendingTransfer") is map
               && (
-                (officeId() != null && dtsDoc(docId).data.pendingTransfer.toOfficeId == officeId())
-                || (officeName() != null && dtsDoc(docId).data.pendingTransfer.toOfficeName != null && dtsDoc(docId).data.pendingTransfer.toOfficeName == officeName())
-                || (dtsDoc(docId).data.pendingTransfer.toUid != null && dtsDoc(docId).data.pendingTransfer.toUid == request.auth.uid)
+                (officeId() != null && mapValueOrNull(dtsDoc(docId).data, "pendingTransfer").toOfficeId == officeId())
+                || (officeName() != null && mapValueOrNull(dtsDoc(docId).data, "pendingTransfer").toOfficeName != null && mapValueOrNull(dtsDoc(docId).data, "pendingTransfer").toOfficeName == officeName())
+                || (mapValueOrNull(dtsDoc(docId).data, "pendingTransfer").toUid != null && mapValueOrNull(dtsDoc(docId).data, "pendingTransfer").toUid == request.auth.uid)
               )
             )
           )

@@ -67,3 +67,23 @@ node_modules/
 
 # dataconnect generated files
 .dataconnect
+
+# Build artifacts
+functions/lib/
+dist/
+
+# Emulator data and temporary exports
+firebase-export*/
+emulator-data*/
+*.sqlite
+
+# Local archives and temp debug bundles
+*.zip
+*.7z
+*.rar
+*.tar
+*.tgz
+*.bak
+*.tmp
+tmp/
+temp/

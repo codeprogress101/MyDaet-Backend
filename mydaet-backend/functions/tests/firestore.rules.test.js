@@ -7,8 +7,196 @@ const {
   assertSucceeds,
 } = require("@firebase/rules-unit-testing");
 
+function nowIso() {
+  return new Date().toISOString();
+}
+
+async function seedBaseData(testEnv) {
+  await testEnv.withSecurityRulesDisabled(async (context) => {
+    const db = context.firestore();
+
+    await db.doc("users/super1").set({
+      uid: "super1",
+      role: "super_admin",
+      isActive: true,
+      officeId: null,
+      officeName: null,
+    });
+    await db.doc("users/admin1").set({
+      uid: "admin1",
+      role: "admin",
+      isActive: true,
+      officeId: null,
+      officeName: "Municipal Admin",
+    });
+    await db.doc("users/office1").set({
+      uid: "office1",
+      role: "office_admin",
+      isActive: true,
+      officeId: "OFF-1",
+      officeName: "Office 1",
+    });
+    await db.doc("users/mod1").set({
+      uid: "mod1",
+      role: "moderator",
+      isActive: true,
+      officeId: "OFF-1",
+      officeName: "Office 1",
+    });
+    await db.doc("users/mod2").set({
+      uid: "mod2",
+      role: "moderator",
+      isActive: true,
+      officeId: "OFF-2",
+      officeName: "Office 2",
+    });
+    await db.doc("users/civilMod").set({
+      uid: "civilMod",
+      role: "moderator",
+      isActive: true,
+      officeId: "OFF-CIVIL",
+      officeName: "Municipal Civil Registry Office",
+    });
+    await db.doc("users/resident1").set({
+      uid: "resident1",
+      role: "resident",
+      isActive: true,
+    });
+    await db.doc("users/resident2").set({
+      uid: "resident2",
+      role: "resident",
+      isActive: true,
+    });
+
+    await db.doc("reports/report-1").set({
+      title: "Streetlight issue",
+      category: "Road",
+      status: "assigned",
+      officeId: "OFF-1",
+      officeName: "Office 1",
+      createdByUid: "resident1",
+      assignedToUid: "mod1",
+      assignedOfficeId: "OFF-1",
+      currentOfficeId: "OFF-1",
+      updatedAt: nowIso(),
+    });
+    await db.doc("reports/report-2").set({
+      title: "Flooded street",
+      category: "Emergency",
+      status: "in_progress",
+      officeId: "OFF-2",
+      officeName: "Office 2",
+      createdByUid: "resident2",
+      assignedToUid: "mod2",
+      assignedOfficeId: "OFF-2",
+      currentOfficeId: "OFF-2",
+      updatedAt: nowIso(),
+    });
+    await db.doc("reports/report-3").set({
+      title: "Loose wire",
+      category: "Road",
+      status: "submitted",
+      officeId: "OFF-1",
+      officeName: "Office 1",
+      createdByUid: "resident1",
+      assignedToUid: null,
+      assignedOfficeId: null,
+      currentOfficeId: "OFF-1",
+      updatedAt: nowIso(),
+    });
+
+    await db.doc("reports/report-1/timeline/event-1").set({
+      type: "STATUS_CHANGED",
+      actorUid: "mod1",
+      actorRole: "moderator",
+      notes: "Assigned to moderator.",
+      createdByUid: "resident1",
+      officeId: "OFF-1",
+      currentOfficeId: "OFF-1",
+      assignedOfficeId: "OFF-1",
+      assignedToUid: "mod1",
+      createdAt: nowIso(),
+    });
+
+    await db.doc("audit_logs/log-1").set({
+      action: "report_created",
+      entityType: "report",
+      entityId: "report-1",
+      officeId: "OFF-1",
+    });
+    await db.doc("auditLogs/log-2").set({
+      action: "reports_bootstrap",
+      entityType: "reports",
+      entityId: "bootstrap",
+      officeId: "OFF-1",
+    });
+
+    await db.doc("dts_documents/doc-1").set({
+      qrCode: "QR-1",
+      trackingNo: "DTS-2026-OFF1-0001",
+      publicPinHash: "legacy",
+      title: "Office 1 Doc",
+      docType: "Request",
+      status: "WITH_OFFICE",
+      currentOfficeId: "OFF-1",
+      currentOfficeName: "Office 1",
+      currentCustodianUid: "mod1",
+      updatedAt: new Date(),
+    });
+    await db.doc("dts_documents/doc-2").set({
+      qrCode: "QR-2",
+      trackingNo: "DTS-2026-OFF2-0001",
+      publicPinHash: "legacy",
+      title: "Office 2 Doc",
+      docType: "Request",
+      status: "WITH_OFFICE",
+      currentOfficeId: "OFF-2",
+      currentOfficeName: "Office 2",
+      currentCustodianUid: "mod2",
+      updatedAt: new Date(),
+    });
+
+    await db.doc("civil_registry_requests/cr-1").set({
+      fullName: "Test Citizen",
+      status: "submitted",
+      createdAt: nowIso(),
+    });
+
+    await db.doc("staff_threads/thread-1").set({
+      memberIds: ["mod1", "admin1"],
+      updatedAt: nowIso(),
+    });
+    await db.doc("staff_threads/thread-1/messages/msg-1").set({
+      senderUid: "mod1",
+      text: "Hello admin",
+      createdAt: nowIso(),
+    });
+
+    await db.doc("posts/post-1").set({
+      type: "announcement",
+      title: "Existing post",
+      body: "Hello",
+      status: "draft",
+      officeId: "OFF-1",
+    });
+    await db.doc("public_docs/doc-1").set({
+      docType: "ordinance",
+      docNo: "2026-001",
+      title: "Ordinance",
+      summary: "Summary",
+      status: "draft",
+      officeId: "SANGGUNIANG_BAYAN",
+    });
+    await db.doc("jobs/job-1").set({
+      title: "Engineer",
+      status: "draft",
+      officeId: "OFF-1",
+    });
+  });
+}
+
 async function run() {
-  const projectId = `mydaet-rules-${Date.now()}`;
+  const projectId = process.env.GCLOUD_PROJECT || "mydaet";
   const rules = fs.readFileSync(
     path.resolve(__dirname, "../../firestore.rules"),
     "utf8"
@@ -20,150 +208,190 @@ async function run() {
   });
 
   try {
-    await testEnv.withSecurityRulesDisabled(async (context) => {
-      const db = context.firestore();
+    await seedBaseData(testEnv);
 
-      await db.doc("users/super1").set({
-        uid: "super1",
-        role: "super_admin",
-        isActive: true,
-      });
-      await db.doc("users/admin1").set({
-        uid: "admin1",
-        role: "admin",
-        officeId: "OFF-1",
-        officeName: "Office 1",
-        isActive: true,
-      });
-      await db.doc("users/mod1").set({
-        uid: "mod1",
-        role: "moderator",
-        officeId: "OFF-1",
-        officeName: "Office 1",
-        isActive: true,
-      });
-      await db.doc("users/mod2").set({
-        uid: "mod2",
-        role: "moderator",
-        officeId: "OFF-2",
-        officeName: "Office 2",
-        isActive: true,
-      });
-      await db.doc("users/resident1").set({
-        uid: "resident1",
-        role: "resident",
-        isActive: true,
-      });
-      await db.doc("users/resident2").set({
-        uid: "resident2",
-        role: "resident",
-        isActive: true,
-      });
-
-      await db.doc("reports/report-1").set({
-        title: "Streetlight issue",
-        category: "Road",
-        status: "submitted",
-        officeId: "OFF-1",
-        officeName: "Office 1",
-        createdByUid: "resident1",
-        assignedToUid: "mod1",
-        assignedOfficeId: "OFF-1",
-        currentOfficeId: "OFF-1",
-      });
-
-      await db.doc("audit_logs/log-1").set({
-        action: "report_created",
-        entityType: "report",
-        entityId: "report-1",
-        officeId: "OFF-1",
-      });
-
-      await db.doc("dts_documents/doc-1").set({
-        qrCode: "QR-1",
-        trackingNo: "DTS-2026-OFF-0001",
-        publicPinHash: "legacy",
-        title: "Sample",
-        docType: "Request",
-        status: "WITH_OFFICE",
-        currentOfficeId: "OFF-1",
-        currentOfficeName: "Office 1",
-        updatedAt: new Date(),
-      });
-    });
-
-    const superCtx = testEnv.authenticatedContext("super1", {
+    const superDb = testEnv.authenticatedContext("super1", {
       role: "super_admin",
+      officeId: "",
+      officeName: "",
       isActive: true,
-    });
-    const adminCtx = testEnv.authenticatedContext("admin1", {
+    }).firestore();
+    const adminDb = testEnv.authenticatedContext("admin1", {
       role: "admin",
+      officeId: "",
+      officeName: "",
+      isActive: true,
+    }).firestore();
+    const officeDb = testEnv.authenticatedContext("office1", {
+      role: "office_admin",
       officeId: "OFF-1",
       officeName: "Office 1",
       isActive: true,
-    });
-    const modCtx = testEnv.authenticatedContext("mod2", {
+    }).firestore();
+    const mod1Db = testEnv.authenticatedContext("mod1", {
+      role: "moderator",
+      officeId: "OFF-1",
+      officeName: "Office 1",
+      isActive: true,
+    }).firestore();
+    const mod2Db = testEnv.authenticatedContext("mod2", {
       role: "moderator",
       officeId: "OFF-2",
       officeName: "Office 2",
       isActive: true,
-    });
-    const residentCtx = testEnv.authenticatedContext("resident1", {
-      role: "resident",
+    }).firestore();
+    const civilModDb = testEnv.authenticatedContext("civilMod", {
+      role: "moderator",
+      officeId: "OFF-CIVIL",
+      officeName: "Municipal Civil Registry Office",
       isActive: true,
-    });
-    const otherResidentCtx = testEnv.authenticatedContext("resident2", {
+    }).firestore();
+    const resident1Db = testEnv.authenticatedContext("resident1", {
       role: "resident",
+      officeId: "",
+      officeName: "",
       isActive: true,
-    });
+    }).firestore();
+    const resident2Db = testEnv.authenticatedContext("resident2", {
+      role: "resident",
+      officeId: "",
+      officeName: "",
+      isActive: true,
+    }).firestore();
 
-    const superDb = superCtx.firestore();
-    const adminDb = adminCtx.firestore();
-    const modDb = modCtx.firestore();
-    const residentDb = residentCtx.firestore();
-    const otherResidentDb = otherResidentCtx.firestore();
-
-    // Reports visibility
+    // Role + scope: reports.
     await assertSucceeds(adminDb.doc("reports/report-1").get());
-    await assertSucceeds(modDb.doc("reports/report-1").get());
-    await assertSucceeds(residentDb.doc("reports/report-1").get());
-    await assertFails(otherResidentDb.doc("reports/report-1").get());
+    await assertSucceeds(adminDb.doc("reports/report-2").get());
+    await assertSucceeds(officeDb.doc("reports/report-1").get());
+    await assertFails(officeDb.doc("reports/report-2").get());
+    await assertSucceeds(mod1Db.doc("reports/report-1").get());
+    await assertFails(mod1Db.doc("reports/report-2").get());
+    await assertSucceeds(resident1Db.doc("reports/report-1").get());
+    await assertFails(resident1Db.doc("reports/report-2").get());
 
-    // Audit logs are server-write only
-    await assertFails(
-      adminDb.doc("audit_logs/new-log").set({
-        action: "manual_write",
-      })
-    );
-    await assertSucceeds(adminDb.doc("audit_logs/log-1").get());
-    await assertFails(modDb.doc("audit_logs/log-1").get());
-    await assertSucceeds(superDb.doc("audit_logs/log-1").get());
-
-    // User management constraints
+    // Residents can edit only their own submitted/in_review content fields.
     await assertSucceeds(
-      residentDb.doc("users/resident1").set(
+      resident1Db.doc("reports/report-3").set(
         {
-          displayName: "Resident One",
-          updatedAt: new Date(),
+          title: "Loose wire near post",
+          description: "Updated details from resident",
+          status: "submitted",
+          assignedToUid: null,
+          assignedToName: null,
+          assignedOfficeId: null,
+          createdByUid: "resident1",
         },
         {merge: true}
       )
     );
     await assertFails(
-      residentDb.doc("users/resident1").set(
+      resident1Db.doc("reports/report-3").set(
         {
-          role: "admin",
-          updatedAt: new Date(),
+          status: "assigned",
+          createdByUid: "resident1",
         },
+        {merge: true}
+      )
+    );
+    await assertFails(
+      mod1Db.doc("reports/report-1").set(
+        {status: "resolved"},
+        {merge: true}
+      )
+    );
+
+    // Timeline is append-only from backend.
+    await assertSucceeds(mod1Db.doc("reports/report-1/timeline/event-1").get());
+    await assertFails(mod2Db.doc("reports/report-1/timeline/event-1").get());
+    await assertFails(
+      mod1Db.doc("reports/report-1/timeline/event-client").set({
+        type: "STATUS_CHANGED",
+        actorUid: "mod1",
+        createdAt: nowIso(),
+      })
+    );
+
+    // Privileged content mutations are callable-only.
+    await assertFails(
+      adminDb.doc("posts/post-1").set({title: "Client edit blocked"}, {merge: true})
+    );
+    await assertFails(
+      superDb.doc("public_docs/doc-1").set({status: "published"}, {merge: true})
+    );
+    await assertFails(
+      adminDb.doc("jobs/job-1").set({status: "published"}, {merge: true})
+    );
+
+    // Messaging scope and write restrictions.
+    await assertSucceeds(mod1Db.doc("staff_threads/thread-1").get());
+    await assertSucceeds(mod1Db.doc("staff_threads/thread-1/messages/msg-1").get());
+    await assertFails(officeDb.doc("staff_threads/thread-1").get());
+    await assertFails(
+      mod1Db.doc("staff_threads/thread-1/messages/msg-2").set({
+        senderUid: "mod1",
+        text: "Client write should fail",
+        createdAt: nowIso(),
+      })
+    );
+
+    // DTS scope boundaries.
+    await assertSucceeds(officeDb.doc("dts_documents/doc-1").get());
+    await assertFails(officeDb.doc("dts_documents/doc-2").get());
+    await assertSucceeds(adminDb.doc("dts_documents/doc-2").get());
+    await assertFails(
+      mod1Db.doc("dts_documents/doc-1/timeline/event-2").set({
+        type: "NOTE",
+        byUid: "mod1",
+        createdAt: nowIso(),
+      })
+    );
+    await assertFails(
+      mod1Db.doc("dts_documents/doc-2/timeline/event-3").set({
+        type: "NOTE",
+        byUid: "mod1",
+        createdAt: nowIso(),
+      })
+    );
+    await assertFails(
+      adminDb.doc("dts_documents/doc-new").set({
+        qrCode: "QR-NEW",
+        trackingNo: "DTS-NEW",
+        publicPinHash: "hash",
+        title: "New Doc",
+        docType: "REQUEST",
+        status: "RECEIVED",
+        currentOfficeId: "OFF-1",
+      })
+    );
+    await assertFails(
+      adminDb.doc("dts_qr_index/QR-NEW").set({
+        docId: "doc-new",
+      })
+    );
+
+    // Civil registry scope.
+    await assertSucceeds(adminDb.doc("civil_registry_requests/cr-1").get());
+    await assertSucceeds(civilModDb.doc("civil_registry_requests/cr-1").get());
+    await assertFails(mod2Db.doc("civil_registry_requests/cr-1").get());
+
+    // User management boundaries.
+    await assertSucceeds(officeDb.doc("users/mod1").get());
+    await assertFails(officeDb.doc("users/super1").get());
+    await assertSucceeds(
+      resident1Db.doc("users/resident1").set(
+        {displayName: "Resident One", updatedAt: new Date()},
+        {merge: true}
+      )
+    );
+    await assertFails(
+      resident1Db.doc("users/resident1").set(
+        {role: "admin", updatedAt: new Date()},
         {merge: true}
       )
     );
     await assertFails(
       adminDb.doc("users/mod1").set(
-        {
-          role: "super_admin",
-          updatedAt: new Date(),
-        },
+        {role: "super_admin", updatedAt: new Date()},
         {merge: true}
       )
     );

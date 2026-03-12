@@ -25,98 +25,34 @@ service cloud.firestore {
       return signedIn();
     }
 
-    function userDoc() {
-      return get(/databases/$(database)/documents/users/$(request.auth.uid));
-    }
-
-    function hasUserData() {
-      return signedIn() && userDoc().data != null;
-    }
-
-    function roleRaw() {
-      return (request.auth != null && ("role" in request.auth.token) && request.auth.token.role != null)
-        ? request.auth.token.role
-        : (hasUserData() && userDoc().data.role != null
-            ? userDoc().data.role
-            : null);
-    }
-
-    function roleString() {
-      return roleRaw() is string
-        ? roleRaw()
-        : "";
-    }
-
-    function roleMatches(pattern) {
-      return roleString() != "" && roleString().matches(pattern);
-    }
-
-    function hasSuperAdminFlag() {
-      return request.auth != null && (
-        (("superAdmin" in request.auth.token) && request.auth.token.superAdmin == true)
-        || (("isSuperAdmin" in request.auth.token) && request.auth.token.isSuperAdmin == true)
-        || (("super_admin" in request.auth.token) && request.auth.token.super_admin == true)
-      );
-    }
-
-    function hasOfficeAdminFlag() {
-      return request.auth != null && (
-        (("officeAdmin" in request.auth.token) && request.auth.token.officeAdmin == true)
-        || (("office_admin" in request.auth.token) && request.auth.token.office_admin == true)
-        || (("isOfficeAdmin" in request.auth.token) && request.auth.token.isOfficeAdmin == true)
-      );
-    }
-
-    function hasModeratorFlag() {
-      return request.auth != null && (
-        (("moderator" in request.auth.token) && request.auth.token.moderator == true)
-        || (("isModerator" in request.auth.token) && request.auth.token.isModerator == true)
-        || (("clerk" in request.auth.token) && request.auth.token.clerk == true)
-      );
-    }
-
     function role() {
-      return hasSuperAdminFlag()
-        || roleMatches("^[\\s]*[sS][uU][pP][eE][rR][ _-]?[aA][dD][mM][iI][nN][\\s]*$")
-        ? "super_admin"
-        : (
-          hasOfficeAdminFlag()
-          || roleMatches("^[\\s]*[oO][fF][fF][iI][cC][eE][ _-]?[aA][dD][mM][iI][nN][\\s]*$")
-        )
-            ? "office_admin"
-            : roleMatches("^[\\s]*[aA][dD][mM][iI][nN][\\s]*$")
-                ? "admin"
-                : (
-                  hasModeratorFlag()
-                  || roleMatches("^[\\s]*[mM][oO][dD][eE][rR][aA][tT][oO][rR][\\s]*$")
-                  || roleMatches("^[\\s]*[cC][lL][eE][rR][kK][\\s]*$")
-                )
-                    ? "moderator"
-                    : "resident";
+      // Security baseline: rely on canonical role claim values issued by
+      // backend/admin claim management. Unknown/missing values fall back to
+      // resident (least privilege).
+      return signedIn()
+        && ("role" in request.auth.token)
+        && request.auth.token.role is string
+        && request.auth.token.role in ["resident", "moderator", "office_admin", "admin", "super_admin"]
+        ? request.auth.token.role
+        : "resident";
     }
 
     function officeId() {
       return (request.auth != null && ("officeId" in request.auth.token) && request.auth.token.officeId != null)
         ? request.auth.token.officeId
-        : (hasUserData() && userDoc().data.officeId != null
-            ? userDoc().data.officeId
-            : null);
+        : null;
     }
 
     function officeName() {
       return (request.auth != null && ("officeName" in request.auth.token) && request.auth.token.officeName != null)
         ? request.auth.token.officeName
-        : (hasUserData() && userDoc().data.officeName != null
-            ? userDoc().data.officeName
-            : null);
+        : null;
     }
 
     function isActive() {
       return (request.auth != null && ("isActive" in request.auth.token) && request.auth.token.isActive != null)
         ? request.auth.token.isActive
-        : (hasUserData() && userDoc().data.isActive != null
-            ? userDoc().data.isActive
-            : true);
+        : true;
     }
 
     function activeUser() {
@@ -147,10 +83,6 @@ service cloud.firestore {
           && officeId() != null
           && officeId() != ""
         );
-    }
-
-    function isSuperAdminByDoc() {
-      return hasUserData() && userDoc().data.role in ["super_admin"];
     }
 
     function civilRegistryOfficeIds() {
@@ -197,14 +129,21 @@ service cloud.firestore {
       return !(value is string) || value.size() <= max;
     }
 
-    function fieldWithin(data, field, max) {
-      return !(field in data) || stringWithin(data[field], max);
+    function mapValueOrNull(data, field) {
+      return data.keys().hasAny([field]) ? data[field] : null;
     }
 
     function unchangedOrWithin(field, max) {
-      return !(field in request.resource.data)
-        || request.resource.data[field] == resource.data[field]
-        || stringWithin(request.resource.data[field], max);
+      // Use changedKeys() to skip untouched fields, then safely read the value
+      // with a key-presence guard.
+      return !request.resource.data.diff(resource.data).changedKeys().hasAny([field])
+        || stringWithin(mapValueOrNull(request.resource.data, field), max);
+    }
+
+    function sameField(field) {
+      // Compare field values with key-existence guards so missing fields on either
+      // side are treated as null and do not trigger "undefined property" errors.
+      return mapValueOrNull(request.resource.data, field) == mapValueOrNull(resource.data, field);
     }
 
     function officeAllowed(data) {
@@ -214,31 +153,40 @@ service cloud.firestore {
         || (officeId() != null && data.officeId == officeId())
     }
 
+    function reportInOfficeScope(data) {
+      return officeId() != null
+        && (
+          data.officeId == officeId()
+          || data.currentOfficeId == officeId()
+          || data.assignedOfficeId == officeId()
+          || data.assignedToUid == request.auth.uid
+        );
+    }
+
     function reportStaffReadAllowed(data) {
       return signedInUser() && (
         isSuperAdmin()
         || isMunicipalAdmin()
-        || (
-          isOfficeAdmin()
-          && officeId() != null
-          && (
-            data.officeId == officeId()
-            || data.currentOfficeId == officeId()
-            || data.assignedOfficeId == officeId()
-            || data.assignedToUid == request.auth.uid
-          )
-        )
-        || (
-          isModerator()
-          && officeId() != null
-          && (
-            data.officeId == officeId()
-            || data.currentOfficeId == officeId()
-            || data.assignedOfficeId == officeId()
-            || data.assignedToUid == request.auth.uid
-          )
-        )
+        || ((isOfficeAdmin() || isModerator()) && reportInOfficeScope(data))
       );
+    }
+
+    function reportSubDocReadAllowed(data) {
+      return reportStaffReadAllowed(data)
+        || (data.createdByUid != null && data.createdByUid == request.auth.uid);
+    }
+
+    function reportSubDocLegacyStaffRead(data) {
+      // Legacy timeline/history rows may not include scope mirror fields yet.
+      // Allow staff-only reads for those legacy rows until backfill is complete.
+      return isStaff()
+        && !data.keys().hasAny([
+          "createdByUid",
+          "officeId",
+          "currentOfficeId",
+          "assignedOfficeId",
+          "assignedToUid"
+        ]);
     }
 
     function isOwner(uid) {
@@ -263,9 +211,9 @@ service cloud.firestore {
           && (
             (officeId() != null && data.currentOfficeId == officeId())
             || (officeName() != null && data.currentOfficeName != null && data.currentOfficeName == officeName())
-            || (data.pendingTransfer != null && officeId() != null && data.pendingTransfer.toOfficeId == officeId())
-            || (data.pendingTransfer != null && officeName() != null && data.pendingTransfer.toOfficeName != null && data.pendingTransfer.toOfficeName == officeName())
-            || (data.pendingTransfer != null && data.pendingTransfer.toUid != null && data.pendingTransfer.toUid == request.auth.uid)
+            || (mapValueOrNull(data, "pendingTransfer") is map && officeId() != null && mapValueOrNull(data, "pendingTransfer").toOfficeId == officeId())
+            || (mapValueOrNull(data, "pendingTransfer") is map && officeName() != null && mapValueOrNull(data, "pendingTransfer").toOfficeName != null && mapValueOrNull(data, "pendingTransfer").toOfficeName == officeName())
+            || (mapValueOrNull(data, "pendingTransfer") is map && mapValueOrNull(data, "pendingTransfer").toUid != null && mapValueOrNull(data, "pendingTransfer").toUid == request.auth.uid)
             || (data.currentCustodianUid != null && data.currentCustodianUid == request.auth.uid)
           )
         );
@@ -274,7 +222,6 @@ service cloud.firestore {
     function dtsCanRead(data) {
       return signedInUser() && (
         isSuperAdmin()
-        || isSuperAdminByDoc()
         || dtsOfficeAllowed(data)
       );
     }
@@ -287,17 +234,8 @@ service cloud.firestore {
       return get(/databases/$(database)/documents/dts_documents/$(docId));
     }
 
-    function validLifecycleStatus(statusValue) {
-      return statusValue in ["draft", "published", "archived"];
-    }
-
     function isPublishedStatus(statusValue) {
       return statusValue in ["published", "Published", "PUBLISHED"];
-    }
-
-    function canWritePublishedState(statusValue) {
-      return validLifecycleStatus(statusValue)
-        && (isSuperAdmin() || isMunicipalAdmin() || isOfficeAdmin() || statusValue == "draft");
     }
 
     function systemSettingsPath() {
@@ -338,210 +276,17 @@ service cloud.firestore {
         );
     }
 
-    function officeMatches(targetOfficeId) {
-      return isSuperAdmin()
-        || isMunicipalAdmin()
-        || (officeId() != null && targetOfficeId != null && targetOfficeId != "" && officeId() == targetOfficeId);
-    }
-
-    function defaultPublicHearingOffices() {
-      return ["SANGGUNIANG_BAYAN", "OFFICE_OF_THE_MAYOR"];
-    }
-
-    function publicHearingConfigPath() {
-      return /databases/$(database)/documents/system_config/rbac;
-    }
-
-    function publicHearingOfficeAllowed(targetOfficeId) {
-      return targetOfficeId in defaultPublicHearingOffices()
-        || (exists(publicHearingConfigPath())
-          && get(publicHearingConfigPath()).data.publicHearingOffices is list
-          && targetOfficeId in get(publicHearingConfigPath()).data.publicHearingOffices);
-    }
-
-    function docTypeOfficeAllowed(docType, targetOfficeId) {
-      return (
-        (docType in ["ordinance", "resolution"]
-          && targetOfficeId == "SANGGUNIANG_BAYAN"
-          && officeMatches("SANGGUNIANG_BAYAN"))
-        || (docType == "executive_order"
-          && targetOfficeId == "OFFICE_OF_THE_MAYOR"
-          && officeMatches("OFFICE_OF_THE_MAYOR"))
-        || (docType == "public_hearing"
-          && targetOfficeId != null
-          && targetOfficeId != ""
-          && officeMatches(targetOfficeId)
-          && publicHearingOfficeAllowed(targetOfficeId))
-      );
-    }
-
-    function jobOfficeAllowed(targetOfficeId) {
-      return isSuperAdmin()
-        || isMunicipalAdmin()
-        || (isOfficeAdmin() && officeId() != null && targetOfficeId != null && targetOfficeId != "" && officeId() == targetOfficeId);
-    }
-
-    function postOfficeAllowed(targetOfficeId) {
-      return targetOfficeId == null
-        || targetOfficeId == ""
-        || officeMatches(targetOfficeId);
-    }
-
-    function validPostShape(data) {
-      return data.keys().hasAll([
-        "type",
-        "title",
-        "body",
-        "status",
-        "createdByUid",
-        "createdAt",
-        "updatedAt"
-      ])
-      && data.type in ["announcement", "news"]
-      && hasNonEmptyString(data, "title")
-      && hasNonEmptyString(data, "body")
-      && stringWithin(data.title, 120)
-      && stringWithin(data.body, 5000)
-      && data.createdByUid is string
-      && data.createdAt is timestamp
-      && data.updatedAt is timestamp
-      && validLifecycleStatus(data.status);
-    }
-
-    function validPostShapeForUpdate() {
-      return request.resource.data.keys().hasAll([
-        "type",
-        "title",
-        "body",
-        "status",
-        "createdByUid",
-        "createdAt",
-        "updatedAt"
-      ])
-      && request.resource.data.type in ["announcement", "news"]
-      && hasNonEmptyString(request.resource.data, "title")
-      && hasNonEmptyString(request.resource.data, "body")
-      && unchangedOrWithin("title", 120)
-      && unchangedOrWithin("body", 5000)
-      && request.resource.data.createdByUid is string
-      && request.resource.data.createdAt is timestamp
-      && request.resource.data.updatedAt is timestamp
-      && validLifecycleStatus(request.resource.data.status);
-    }
-
-    function validPublicDocShape(data) {
-      return data.keys().hasAll([
-        "docType",
-        "docNo",
-        "title",
-        "summary",
-        "officeId",
-        "status",
-        "createdByUid",
-        "createdAt",
-        "updatedAt"
-      ])
-      && data.docType in ["ordinance", "resolution", "executive_order", "public_hearing"]
-      && hasNonEmptyString(data, "docNo")
-      && hasNonEmptyString(data, "title")
-      && data.summary is string
-      && stringWithin(data.docNo, 40)
-      && stringWithin(data.title, 120)
-      && stringWithin(data.summary, 500)
-      && hasNonEmptyString(data, "officeId")
-      && data.createdByUid is string
-      && data.createdAt is timestamp
-      && data.updatedAt is timestamp
-      && validLifecycleStatus(data.status);
-    }
-
-    function validPublicDocShapeForUpdate() {
-      return request.resource.data.keys().hasAll([
-        "docType",
-        "docNo",
-        "title",
-        "summary",
-        "officeId",
-        "status",
-        "createdByUid",
-        "createdAt",
-        "updatedAt"
-      ])
-      && request.resource.data.docType in ["ordinance", "resolution", "executive_order", "public_hearing"]
-      && hasNonEmptyString(request.resource.data, "docNo")
-      && hasNonEmptyString(request.resource.data, "title")
-      && request.resource.data.summary is string
-      && unchangedOrWithin("docNo", 40)
-      && unchangedOrWithin("title", 120)
-      && unchangedOrWithin("summary", 500)
-      && hasNonEmptyString(request.resource.data, "officeId")
-      && request.resource.data.createdByUid is string
-      && request.resource.data.createdAt is timestamp
-      && request.resource.data.updatedAt is timestamp
-      && validLifecycleStatus(request.resource.data.status);
-    }
-
-    function validJobShape(data) {
-      return data.keys().hasAll([
-        "title",
-        "officeId",
-        "employmentType",
-        "description",
-        "status",
-        "createdByUid",
-        "createdAt",
-        "updatedAt"
-      ])
-      && hasNonEmptyString(data, "title")
-      && hasNonEmptyString(data, "officeId")
-      && hasNonEmptyString(data, "employmentType")
-      && hasNonEmptyString(data, "description")
-      && stringWithin(data.title, 120)
-      && stringWithin(data.employmentType, 60)
-      && stringWithin(data.description, 5000)
-      && fieldWithin(data, "qualifications", 1000)
-      && data.createdByUid is string
-      && data.createdAt is timestamp
-      && data.updatedAt is timestamp
-      && validLifecycleStatus(data.status);
-    }
-
-    function validJobShapeForUpdate() {
-      return request.resource.data.keys().hasAll([
-        "title",
-        "officeId",
-        "employmentType",
-        "description",
-        "status",
-        "createdByUid",
-        "createdAt",
-        "updatedAt"
-      ])
-      && hasNonEmptyString(request.resource.data, "title")
-      && hasNonEmptyString(request.resource.data, "officeId")
-      && hasNonEmptyString(request.resource.data, "employmentType")
-      && hasNonEmptyString(request.resource.data, "description")
-      && unchangedOrWithin("title", 120)
-      && unchangedOrWithin("employmentType", 60)
-      && unchangedOrWithin("description", 5000)
-      && (("qualifications" in request.resource.data) == false || unchangedOrWithin("qualifications", 1000))
-      && request.resource.data.createdByUid is string
-      && request.resource.data.createdAt is timestamp
-      && request.resource.data.updatedAt is timestamp
-      && validLifecycleStatus(request.resource.data.status);
-    }
-
     /** -------------------------
      * USERS
      * /users/{uid}
      * ------------------------- */
     match /users/{uid} {
       allow create: if isOwner(uid)
-        && request.resource.data.uid == request.auth.uid
-        && request.resource.data.role == "resident"
-        && (!("officeId" in request.resource.data) || request.resource.data.officeId == null)
-        && (!("officeName" in request.resource.data) || request.resource.data.officeName == null)
-        && (!("isActive" in request.resource.data) || request.resource.data.isActive == true);
+        && mapValueOrNull(request.resource.data, "uid") == request.auth.uid
+        && mapValueOrNull(request.resource.data, "role") == "resident"
+        && mapValueOrNull(request.resource.data, "officeId") == null
+        && mapValueOrNull(request.resource.data, "officeName") == null
+        && (mapValueOrNull(request.resource.data, "isActive") == null || mapValueOrNull(request.resource.data, "isActive") == true);
 
       allow read: if signedInUser() && isOwner(uid);
       allow read: if signedInUser() && isSuperAdmin();
@@ -560,10 +305,16 @@ service cloud.firestore {
         )
         || (
           isSuperAdmin()
-          && (resource.data.role != "super_admin" || request.resource.data.role == "super_admin")
           && (
-            request.resource.data.role in ["office_admin", "moderator"]
-              ? (request.resource.data.officeId != null && request.resource.data.officeId != "")
+            mapValueOrNull(resource.data, "role") != "super_admin"
+            || mapValueOrNull(request.resource.data, "role") == "super_admin"
+          )
+          && (
+            mapValueOrNull(request.resource.data, "role") in ["office_admin", "moderator"]
+              ? (
+                mapValueOrNull(request.resource.data, "officeId") != null
+                && mapValueOrNull(request.resource.data, "officeId") != ""
+              )
               : true
           )
         )
@@ -647,7 +398,7 @@ service cloud.firestore {
       // Read:
       // - staff (moderator/office admin/super admin) can list and view reports
       // - residents can only read their own reports
-      allow read: if signedInUser() && featureEnabled("reports") && (
+      allow read: if signedInUser() && (
         reportStaffReadAllowed(resource.data)
         || resource.data.createdByUid == request.auth.uid
       );
@@ -660,11 +411,11 @@ service cloud.firestore {
         (
           resource.data.createdByUid == request.auth.uid
           && (resource.data.status == "submitted" || resource.data.status == "in_review")
-          && request.resource.data.createdByUid == resource.data.createdByUid
-          && request.resource.data.assignedToUid == resource.data.assignedToUid
-          && request.resource.data.assignedToName == resource.data.assignedToName
-          && request.resource.data.assignedOfficeId == resource.data.assignedOfficeId
-          && request.resource.data.status == resource.data.status
+          && sameField("createdByUid")
+          && sameField("assignedToUid")
+          && sameField("assignedToName")
+          && sameField("assignedOfficeId")
+          && sameField("status")
           && unchangedOrWithin("title", 120)
           && unchangedOrWithin("description", 2000)
           && unchangedOrWithin("location", 120)
@@ -695,10 +446,8 @@ service cloud.firestore {
 
       // Optional: messages subcollection
       match /messages/{messageId} {
-        allow read: if signedInUser() && featureEnabled("reports") && (
-          get(/databases/$(database)/documents/reports/$(reportId)).data.createdByUid == request.auth.uid
-          || reportStaffReadAllowed(get(/databases/$(database)/documents/reports/$(reportId)).data)
-        );
+        allow read: if signedInUser()
+          && (reportSubDocReadAllowed(resource.data) || reportSubDocLegacyStaffRead(resource.data));
 
         allow create: if activeUser() && featureEnabled("reports") && canWriteFeatureData() && (
           isSuperAdmin()
@@ -714,19 +463,15 @@ service cloud.firestore {
       }
 
       match /history/{historyId} {
-        allow read: if signedInUser() && featureEnabled("reports") && (
-          get(/databases/$(database)/documents/reports/$(reportId)).data.createdByUid == request.auth.uid
-          || reportStaffReadAllowed(get(/databases/$(database)/documents/reports/$(reportId)).data)
-        );
+        allow read: if signedInUser()
+          && (reportSubDocReadAllowed(resource.data) || reportSubDocLegacyStaffRead(resource.data));
         allow write: if false;
       }
 
       match /timeline/{eventId} {
         // Timeline stays append-only and is written by backend code only.
-        allow read: if signedInUser() && featureEnabled("reports") && (
-          get(/databases/$(database)/documents/reports/$(reportId)).data.createdByUid == request.auth.uid
-          || reportStaffReadAllowed(get(/databases/$(database)/documents/reports/$(reportId)).data)
-        );
+        allow read: if signedInUser()
+          && (reportSubDocReadAllowed(resource.data) || reportSubDocLegacyStaffRead(resource.data));
         allow write: if false;
       }
     }
@@ -736,24 +481,9 @@ service cloud.firestore {
      * /dts_documents/{docId}
      * ------------------------- */
     match /dts_documents/{docId} {
-      allow create: if activeUser()
-        && isStaff()
-        && featureEnabled("documentTracking")
-        && canWriteFeatureData()
-        && hasNonEmptyString(request.resource.data, "qrCode")
-        && hasNonEmptyString(request.resource.data, "trackingNo")
-        && hasNonEmptyString(request.resource.data, "publicPinHash")
-        && hasNonEmptyString(request.resource.data, "title")
-        && hasNonEmptyString(request.resource.data, "docType")
-        && hasNonEmptyString(request.resource.data, "currentOfficeId")
-        && request.resource.data.status == "RECEIVED"
-        && !exists(/databases/$(database)/documents/dts_qr_index/$(request.resource.data.qrCode))
-        && exists(/databases/$(database)/documents/dts_qr_codes/$(request.resource.data.qrCode))
-        && dtsQrDoc(request.resource.data.qrCode).data.status == "unused"
-        && (
-          isSuperAdmin()
-          || (officeId() != null && request.resource.data.currentOfficeId == officeId())
-        );
+      // Security hardening: DTS lifecycle mutations are callable-only.
+      // Cloud Functions enforce role/scope, write shape, and audit timeline.
+      allow create: if false;
 
       allow read: if featureEnabled("documentTracking") && dtsCanRead(resource.data);
 
@@ -764,45 +494,26 @@ service cloud.firestore {
 
       match /timeline/{eventId} {
         allow read: if signedInUser() && isStaff() && featureEnabled("documentTracking");
-        allow create: if activeUser()
-          && isStaff()
-          && featureEnabled("documentTracking")
-          && canWriteFeatureData()
-          && dtsOfficeAllowed(dtsDocById(docId).data)
-          && request.resource.data.keys().hasAll(["type", "byUid", "createdAt"])
-          && request.resource.data.byUid == request.auth.uid
-          && request.resource.data.type is string;
-        allow update, delete: if false;
+        allow create, update, delete: if false;
       }
     }
 
     match /dts_qr_index/{qrCode} {
       allow read: if signedInUser() && isStaff() && featureEnabled("documentTracking");
-      allow create: if activeUser() && isStaff()
-        && featureEnabled("documentTracking")
-        && canWriteFeatureData()
-        && !exists(/databases/$(database)/documents/dts_qr_index/$(qrCode));
+      allow create: if false;
       allow update, delete: if false;
     }
 
     match /dts_qr_codes/{qrCode} {
       allow read: if signedInUser() && isStaff() && featureEnabled("documentTracking");
       allow create: if false;
-      allow update: if activeUser() && isStaff()
-        && featureEnabled("documentTracking")
-        && canWriteFeatureData()
-        && resource.data.status == "unused"
-        && request.resource.data.status == "used"
-        && request.resource.data.docId != null;
+      allow update: if false;
       allow delete: if false;
     }
 
     match /dts_counters/{year} {
       allow read: if signedInUser() && isStaff() && featureEnabled("documentTracking");
-      allow create, update: if activeUser()
-        && isStaff()
-        && featureEnabled("documentTracking")
-        && canWriteFeatureData();
+      allow create, update: if false;
       allow delete: if false;
     }
 
@@ -859,29 +570,9 @@ service cloud.firestore {
         || (signedInUser() && isStaff())
       );
 
-      allow create: if activeUser() && isStaff()
-        && canWriteFeatureData()
-        && validPostShape(request.resource.data)
-        && postFeatureEnabled(request.resource.data)
-        && canWritePublishedState(request.resource.data.status)
-        && postOfficeAllowed(request.resource.data.officeId)
-        && (
-          isSuperAdmin()
-          || request.resource.data.createdByUid == request.auth.uid
-        );
-
-      allow update, delete: if activeUser() && isStaff()
-        && canWriteFeatureData()
-        && validPostShapeForUpdate()
-        && postFeatureEnabled(request.resource.data)
-        && canWritePublishedState(request.resource.data.status)
-        && postOfficeAllowed(request.resource.data.officeId)
-        && (
-          isSuperAdmin()
-          || isMunicipalAdmin()
-          || (isOfficeAdmin() && postOfficeAllowed(resource.data.officeId))
-          || request.resource.data.createdByUid == resource.data.createdByUid
-        );
+      // Privileged post mutations are callable-only so role/scope/audit checks
+      // stay centralized in Cloud Functions.
+      allow create, update, delete: if false;
     }
 
     /** -------------------------
@@ -894,25 +585,9 @@ service cloud.firestore {
         || (signedInUser() && isStaff())
       );
 
-      allow create: if activeUser()
-        && isStaff()
-        && featureEnabled("transparency")
-        && canWriteFeatureData()
-        && validPublicDocShape(request.resource.data)
-        && canWritePublishedState(request.resource.data.status)
-        && docTypeOfficeAllowed(request.resource.data.docType, request.resource.data.officeId)
-        && request.resource.data.createdByUid == request.auth.uid;
-
-      allow update: if activeUser()
-        && isStaff()
-        && featureEnabled("transparency")
-        && canWriteFeatureData()
-        && validPublicDocShapeForUpdate()
-        && canWritePublishedState(request.resource.data.status)
-        && docTypeOfficeAllowed(request.resource.data.docType, request.resource.data.officeId)
-        && request.resource.data.createdByUid == resource.data.createdByUid;
-
-      allow delete: if false;
+      // Privileged document mutations are callable-only so role/scope checks
+      // cannot be bypassed through direct Firestore writes.
+      allow create, update, delete: if false;
     }
 
     /** -------------------------
@@ -925,25 +600,8 @@ service cloud.firestore {
         || (signedInUser() && isStaff())
       );
 
-      allow create: if activeUser()
-        && (isSuperAdmin() || isMunicipalAdmin() || isOfficeAdmin())
-        && featureEnabled("jobs")
-        && canWriteFeatureData()
-        && validJobShape(request.resource.data)
-        && canWritePublishedState(request.resource.data.status)
-        && jobOfficeAllowed(request.resource.data.officeId)
-        && request.resource.data.createdByUid == request.auth.uid;
-
-      allow update: if activeUser()
-        && (isSuperAdmin() || isMunicipalAdmin() || isOfficeAdmin())
-        && featureEnabled("jobs")
-        && canWriteFeatureData()
-        && validJobShapeForUpdate()
-        && canWritePublishedState(request.resource.data.status)
-        && jobOfficeAllowed(request.resource.data.officeId)
-        && request.resource.data.createdByUid == resource.data.createdByUid;
-
-      allow delete: if false;
+      // Privileged job mutations are callable-only.
+      allow create, update, delete: if false;
     }
 
     /** -------------------------
@@ -972,7 +630,7 @@ service cloud.firestore {
      * ------------------------- */
     match /offices/{officeId} {
       allow read: if signedInUser();
-      allow create, update, delete: if activeUser() && (isSuperAdmin() || isSuperAdminByDoc());
+      allow create, update, delete: if activeUser() && isSuperAdmin();
     }
 
     /** -------------------------

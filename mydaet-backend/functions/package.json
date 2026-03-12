@@ -11,7 +11,9 @@
     "logs": "firebase functions:log",
     "backfill:report-offices": "node scripts/backfill-report-offices.js",
     "audit:users": "node scripts/audit-user-office-consistency.js",
-    "test:rules": "npx firebase-tools emulators:exec --only firestore \"node tests/firestore.rules.test.js\""
+    "test:rules": "npx firebase-tools emulators:exec --only firestore \"node tests/firestore.rules.test.js\"",
+    "test:rules:storage": "npx firebase-tools emulators:exec --only firestore,storage \"node tests/storage.rules.test.js\"",
+    "test:rules:all": "npm run test:rules && npm run test:rules:storage"
   },
   "engines": {
     "node": "22"
