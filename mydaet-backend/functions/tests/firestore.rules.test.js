@@ -334,6 +334,20 @@ async function run() {
       })
     );
 
+    // Messaging feature is independent from reports toggle.
+    await testEnv.withSecurityRulesDisabled(async (context) => {
+      await context.firestore().doc("system/settings").set({
+        features: {
+          reports: false,
+          messages: true,
+        },
+      }, {merge: true});
+    });
+    await assertSucceeds(mod1Db.doc("staff_threads/thread-1").get());
+    await testEnv.withSecurityRulesDisabled(async (context) => {
+      await context.firestore().doc("system/settings").delete();
+    });
+
     // DTS scope boundaries.
     await assertSucceeds(officeDb.doc("dts_documents/doc-1").get());
     await assertFails(officeDb.doc("dts_documents/doc-2").get());

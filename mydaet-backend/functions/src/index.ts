@@ -33,6 +33,9 @@ const PUBLIC_REPORT_ALLOWED_ORIGINS = String(process.env.PUBLIC_REPORT_ALLOWED_O
   .split(",")
   .map((value) => value.trim())
   .filter((value) => value.length > 0);
+const CORS_MODE = String(process.env.CORS_MODE ?? "").trim().toLowerCase();
+const FUNCTIONS_EMULATOR_ENABLED =
+  String(process.env.FUNCTIONS_EMULATOR ?? "").trim().toLowerCase() === "true";
 const POST_COLLECTIONS = ["posts", "announcements"] as const;
 const PUBLISHED_STATUS_VARIANTS = ["published", "Published", "PUBLISHED"] as const;
 const SYSTEM_SETTINGS_FEATURE_KEYS = [
@@ -43,6 +46,7 @@ const SYSTEM_SETTINGS_FEATURE_KEYS = [
   "directory",
   "documentTracking",
   "reports",
+  "messages",
   "transparency",
   "civilRegistry",
 ] as const;
@@ -936,6 +940,22 @@ const EMERGENCY_ROUTING_RULES: Record<EmergencyTypeKey, {officeId: string; offic
   other: {officeId: "MDRRMO", officeName: "Municipal Disaster Risk Reduction and Management Office"},
 };
 
+/*
+ * CORS is fail-closed outside emulator by default.
+ * - Emulator/local integration can run with open mode for faster iteration.
+ * - Deployed environments should provide explicit allowlists.
+ * Override via CORS_MODE=open|strict when needed for controlled rollouts.
+ */
+function strictCorsEnabled(): boolean {
+  if (CORS_MODE === "open") return false;
+  if (CORS_MODE === "strict") return true;
+  return !FUNCTIONS_EMULATOR_ENABLED;
+}
+
+function allowOriginWithoutAllowlist(): boolean {
+  return !strictCorsEnabled();
+}
+
 function getPublicReportAllowedOrigins(): string[] {
   if (PUBLIC_REPORT_ALLOWED_ORIGINS.length > 0) {
     return PUBLIC_REPORT_ALLOWED_ORIGINS;
@@ -945,7 +965,7 @@ function getPublicReportAllowedOrigins(): string[] {
 
 function isAllowedPublicReportCorsOrigin(origin: string): boolean {
   const allowedOrigins = getPublicReportAllowedOrigins();
-  if (allowedOrigins.length === 0) return true;
+  if (allowedOrigins.length === 0) return allowOriginWithoutAllowlist();
   return allowedOrigins.includes(origin);
 }
 
@@ -955,8 +975,11 @@ function applyPublicReportCors(
 ): boolean {
   const origin = String(req.headers.origin ?? "").trim();
   if (!origin) {
-    // Non-browser clients (for example future mobile apps) may not send Origin.
-    res.set("Access-Control-Allow-Origin", "*");
+    // Non-browser clients (for example future mobile apps) may omit Origin.
+    // Only emit wildcard in non-strict CORS mode.
+    if (allowOriginWithoutAllowlist()) {
+      res.set("Access-Control-Allow-Origin", "*");
+    }
   } else if (isAllowedPublicReportCorsOrigin(origin)) {
     res.set("Access-Control-Allow-Origin", origin);
     res.set("Vary", "Origin");
@@ -1784,7 +1807,7 @@ function validateTrackingLookupInput(
 }
 
 function isAllowedCorsOrigin(origin: string): boolean {
-  if (TRACK_LOOKUP_ALLOWED_ORIGINS.length === 0) return true;
+  if (TRACK_LOOKUP_ALLOWED_ORIGINS.length === 0) return allowOriginWithoutAllowlist();
   return TRACK_LOOKUP_ALLOWED_ORIGINS.includes(origin);
 }
 
@@ -1794,7 +1817,9 @@ function applyTrackLookupCors(
 ): boolean {
   const origin = String(req.headers.origin ?? "").trim();
   if (!origin) {
-    res.set("Access-Control-Allow-Origin", "*");
+    if (allowOriginWithoutAllowlist()) {
+      res.set("Access-Control-Allow-Origin", "*");
+    }
   } else if (isAllowedCorsOrigin(origin)) {
     res.set("Access-Control-Allow-Origin", origin);
     res.set("Vary", "Origin");
@@ -2498,106 +2523,16 @@ function toCursorEpoch(cursor: ReportsCursor | null): number {
   return cursor ? parseEpochMs(cursor.cursorUpdatedAt) : 0;
 }
 
-async function mergeQueryDocs(
-  target: Map<string, FirebaseFirestore.DocumentData>,
-  queryRef: FirebaseFirestore.Query,
-  branchLimit: number
-): Promise<void> {
-  let snapshot: FirebaseFirestore.QuerySnapshot;
-  try {
-    // Prefer deterministic newest-first windows for scoped report unions so
-    // dashboard/report totals and visible tickets stay aligned across refreshes.
-    snapshot = await queryRef.orderBy("updatedAt", "desc").limit(branchLimit).get();
-  } catch (error) {
-    const code = String((error as { code?: unknown })?.code ?? "").toLowerCase();
-    // Older datasets may not have an index path for orderBy in every scope query.
-    // Fall back to unsorted reads instead of failing the whole bootstrap request.
-    if (code.includes("failed-precondition")) {
-      snapshot = await queryRef.limit(branchLimit).get();
-    } else {
-      throw error;
-    }
-  }
-  snapshot.docs.forEach((doc) => {
-    if (!target.has(doc.id)) {
-      target.set(doc.id, doc.data() ?? {});
-    }
-  });
-}
-
-async function loadScopedReportsForActor(
-  actor: StaffContext,
-  rawLimit: number,
-  options: {
-    cursor?: ReportsCursor | null;
-  } = {}
-): Promise<{
-  items: Array<Record<string, unknown>>;
-  scope: { role: NormalizedRole; officeId: string | null };
-  nextCursor: ReportsCursor | null;
-  generatedAt: string;
-}> {
-  const listLimit = Math.max(20, Math.min(500, rawLimit));
-  const branchLimit = Math.max(120, Math.min(320, listLimit * 3));
+async function collectScopedReportRowsForActor(
+  actor: StaffContext
+): Promise<Array<Record<string, unknown>>> {
   const reportsRef = db.collection("reports");
-  const cursor = options.cursor ?? null;
-  const cursorEpoch = toCursorEpoch(cursor);
-  const cursorId = cursor?.cursorId ?? "";
-
-  if (isMunicipalAdminRole(actor.role)) {
-    try {
-      let municipalQuery = reportsRef
-        .orderBy("updatedAt", "desc")
-        .orderBy(admin.firestore.FieldPath.documentId(), "desc");
-      if (cursorEpoch > 0 && cursorId) {
-        municipalQuery = municipalQuery.startAfter(
-          admin.firestore.Timestamp.fromMillis(cursorEpoch),
-          cursorId
-        );
-      }
-      const snapshot = await municipalQuery.limit(listLimit + 1).get();
-      const sortedRows = snapshot.docs.map((doc) =>
-        serializeReportRow(doc.id, doc.data() ?? {})
-      );
-      const hasMore = sortedRows.length > listLimit;
-      const items = sortedRows.slice(0, listLimit);
-      const lastRow = items.length > 0 ? items[items.length - 1] : null;
-      return {
-        items,
-        scope: {
-          role: actor.role,
-          officeId: actor.officeId ?? null,
-        },
-        nextCursor:
-          hasMore && lastRow
-            ? {
-                cursorUpdatedAt:
-                  String(
-                    (lastRow.updatedAt as string) ||
-                      (lastRow.createdAt as string) ||
-                      new Date().toISOString()
-                  ),
-                cursorId: String(lastRow.id),
-              }
-            : null,
-        generatedAt: new Date().toISOString(),
-      };
-    } catch (error) {
-      const code = String((error as { code?: unknown })?.code ?? "").toLowerCase();
-      // If the municipal dual-order index is not ready yet, continue to the
-      // union fallback below to avoid blocking staff access.
-      if (!code.includes("failed-precondition")) {
-        throw error;
-      }
-    }
-  }
-
   const rows = new Map<string, FirebaseFirestore.DocumentData>();
   const queries: FirebaseFirestore.Query[] = [];
 
-  // Municipal Admin sees all offices; Office Admin and Moderator stay office-scoped.
   if (isMunicipalAdminRole(actor.role)) {
-    queries.push(reportsRef);
+    const snapshot = await reportsRef.get();
+    snapshot.docs.forEach((doc) => rows.set(doc.id, doc.data() ?? {}));
   } else {
     if (actor.officeId) {
       queries.push(reportsRef.where("officeId", "==", actor.officeId));
@@ -2606,13 +2541,18 @@ async function loadScopedReportsForActor(
     }
     queries.push(reportsRef.where("assignedToUid", "==", actor.uid));
     queries.push(reportsRef.where("createdByUid", "==", actor.uid));
+
+    for (const queryRef of queries) {
+      const snapshot = await queryRef.get();
+      snapshot.docs.forEach((doc) => {
+        if (!rows.has(doc.id)) {
+          rows.set(doc.id, doc.data() ?? {});
+        }
+      });
+    }
   }
 
-  for (const queryRef of queries) {
-    await mergeQueryDocs(rows, queryRef, branchLimit);
-  }
-
-  const sortedRows = Array.from(rows.entries())
+  return Array.from(rows.entries())
     .map(([id, row]) => serializeReportRow(id, row))
     .sort((a, b) => {
       const aTime = parseEpochMs((a.updatedAt as unknown) ?? a.createdAt);
@@ -2622,7 +2562,18 @@ async function loadScopedReportsForActor(
       }
       return String(b.id).localeCompare(String(a.id));
     });
+}
 
+function pageScopedReportRows(
+  sortedRows: Array<Record<string, unknown>>,
+  listLimit: number,
+  cursor: ReportsCursor | null
+): {
+  items: Array<Record<string, unknown>>;
+  nextCursor: ReportsCursor | null;
+} {
+  const cursorEpoch = toCursorEpoch(cursor);
+  const cursorId = cursor?.cursorId ?? "";
   const filteredRows = cursorEpoch > 0 && cursorId
     ? sortedRows.filter((row) => {
       const rowEpoch = parseEpochMs((row.updatedAt as unknown) ?? row.createdAt);
@@ -2646,6 +2597,84 @@ async function loadScopedReportsForActor(
         cursorId: String(lastRow.id),
       }
     : null;
+  return {items, nextCursor};
+}
+
+async function loadScopedReportsForActor(
+  actor: StaffContext,
+  rawLimit: number,
+  options: {
+    cursor?: ReportsCursor | null;
+  } = {}
+): Promise<{
+  items: Array<Record<string, unknown>>;
+  scope: { role: NormalizedRole; officeId: string | null };
+  nextCursor: ReportsCursor | null;
+  generatedAt: string;
+}> {
+  const listLimit = Math.max(20, Math.min(500, rawLimit));
+  const reportsRef = db.collection("reports");
+  const cursor = options.cursor ?? null;
+  const cursorEpoch = toCursorEpoch(cursor);
+  const cursorId = cursor?.cursorId ?? "";
+
+  if (isMunicipalAdminRole(actor.role)) {
+    try {
+      let municipalQuery = reportsRef
+        .orderBy("updatedAt", "desc")
+        .orderBy(admin.firestore.FieldPath.documentId(), "desc");
+      if (cursorEpoch > 0 && cursorId) {
+        municipalQuery = municipalQuery.startAfter(
+          admin.firestore.Timestamp.fromMillis(cursorEpoch),
+          cursorId
+        );
+      }
+      const snapshot = await municipalQuery.limit(listLimit + 1).get();
+      const rows = snapshot.docs.map((doc) =>
+        serializeReportRow(doc.id, doc.data() ?? {})
+      );
+      const hasMore = rows.length > listLimit;
+      const items = rows.slice(0, listLimit);
+      const lastRow = items.length > 0 ? items[items.length - 1] : null;
+      return {
+        items,
+        scope: {
+          role: actor.role,
+          officeId: actor.officeId ?? null,
+        },
+        nextCursor:
+          hasMore && lastRow
+            ? {
+                cursorUpdatedAt:
+                  String(
+                    (lastRow.updatedAt as string) ||
+                      (lastRow.createdAt as string) ||
+                      new Date().toISOString()
+                  ),
+                cursorId: String(lastRow.id),
+              }
+            : null,
+        generatedAt: new Date().toISOString(),
+      };
+    } catch (error) {
+      const code = String((error as { code?: unknown })?.code ?? "").toLowerCase();
+      if (code.includes("failed-precondition")) {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          "Required reports index is missing. Deploy Firestore indexes before using adminReportsBootstrap."
+        );
+      }
+      throw error;
+    }
+  }
+
+  /*
+   * Office-scoped report reads intentionally union all scope branches before
+   * cursor slicing so pagination remains complete and no branch gets dropped by
+   * a branch-local limit cap.
+   */
+  const sortedRows = await collectScopedReportRowsForActor(actor);
+  const {items, nextCursor} = pageScopedReportRows(sortedRows, listLimit, cursor);
 
   return {
     items,
@@ -2656,6 +2685,13 @@ async function loadScopedReportsForActor(
     nextCursor,
     generatedAt: new Date().toISOString(),
   };
+}
+
+async function loadScopedReportViewCountsForActor(
+  actor: StaffContext
+): Promise<Record<string, number>> {
+  const rows = await collectScopedReportRowsForActor(actor);
+  return buildScopedReportViewCounts(rows, actor);
 }
 
 async function loadScopedReportAssigneesForActor(
@@ -2751,7 +2787,10 @@ function buildScopedReportViewCounts(
   };
 }
 
-export const adminListReportsScoped = functions.https.onCall(async (data, context) => {
+async function adminListReportsScopedHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
   const actor = await requireStaffContext(context);
   await requireFeatureEnabled("reports");
   const payload = (data && typeof data === "object")
@@ -2760,7 +2799,11 @@ export const adminListReportsScoped = functions.https.onCall(async (data, contex
   const rawLimit = typeof payload.limit === "number" ? Math.floor(payload.limit) : 120;
   const cursor = normalizeReportsCursorInput(payload);
   return loadScopedReportsForActor(actor, rawLimit, {cursor});
-});
+}
+
+export const adminListReportsScoped = functions.https.onCall(async (data, context) =>
+  adminListReportsScopedHandler(data, context)
+);
 
 export const adminListReportAssignees = functions.https.onCall(async (_data, context) => {
   const actor = await requireStaffContext(context);
@@ -2772,7 +2815,10 @@ export const adminListReportAssignees = functions.https.onCall(async (_data, con
  * Reports bootstrap bundles scoped tickets + assignees + counters in one
  * callable so the workspace can load in a single round-trip.
  */
-export const adminReportsBootstrap = functions.https.onCall(async (data, context) => {
+async function adminReportsBootstrapHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
   const actor = await requireStaffContext(context);
   await requireFeatureEnabled("reports");
   const payload = (data && typeof data === "object")
@@ -2782,7 +2828,7 @@ export const adminReportsBootstrap = functions.https.onCall(async (data, context
   const listLimit = Math.max(20, Math.min(500, rawLimit));
   const cursor = normalizeReportsCursorInput(payload);
 
-  const [reportsPayload, assigneesPayload] = await Promise.all([
+  const [reportsPayload, assigneesPayload, viewCounts] = await Promise.all([
     loadScopedReportsForActor(actor, listLimit, {cursor}),
     canAssignReportsRole(actor.role)
       ? loadScopedReportAssigneesForActor(actor)
@@ -2793,18 +2839,23 @@ export const adminReportsBootstrap = functions.https.onCall(async (data, context
             officeId: actor.officeId ?? null,
           },
         }),
+    loadScopedReportViewCountsForActor(actor),
   ]);
 
   return {
     reports: reportsPayload.items,
     items: reportsPayload.items,
     assignees: assigneesPayload.items,
-    viewCounts: buildScopedReportViewCounts(reportsPayload.items, actor),
+    viewCounts,
     scope: reportsPayload.scope,
     nextCursor: reportsPayload.nextCursor,
     generatedAt: reportsPayload.generatedAt,
   };
-});
+}
+
+export const adminReportsBootstrap = functions.https.onCall(async (data, context) =>
+  adminReportsBootstrapHandler(data, context)
+);
 
 type StaffThreadMember = {
   uid: string;
@@ -3054,7 +3105,7 @@ async function staffListDirectContactsHandler(
   context: CallableContextLike
 ) {
   const actor = await requireStaffContext(context);
-  await requireFeatureEnabled("reports");
+  await requireFeatureEnabled("messages");
 
   const usersRef = db.collection("users");
   const rows = new Map<string, StaffThreadMember>();
@@ -3104,7 +3155,7 @@ async function staffListDirectThreadsHandler(
   context: CallableContextLike
 ) {
   const actor = await requireStaffContext(context);
-  await requireFeatureEnabled("reports");
+  await requireFeatureEnabled("messages");
 
   const snapshot = await db
     .collection("staff_threads")
@@ -3175,7 +3226,7 @@ async function staffListDirectMessagesHandler(
   context: CallableContextLike
 ) {
   const actor = await requireStaffContext(context);
-  await requireFeatureEnabled("reports");
+  await requireFeatureEnabled("messages");
 
   const payload = (data && typeof data === "object")
     ? (data as Record<string, unknown>)
@@ -3344,7 +3395,7 @@ async function staffSendDirectMessageHandler(
   context: CallableContextLike
 ) {
   const actor = await requireStaffContext(context);
-  await requireFeatureWritable("reports");
+  await requireFeatureWritable("messages");
 
   const payload = (data && typeof data === "object")
     ? (data as Record<string, unknown>)
@@ -3499,7 +3550,7 @@ async function staffSetTypingStateHandler(
   context: CallableContextLike
 ) {
   const actor = await requireStaffContext(context);
-  await requireFeatureEnabled("reports");
+  await requireFeatureEnabled("messages");
 
   const payload = (data && typeof data === "object")
     ? (data as Record<string, unknown>)
@@ -3549,7 +3600,7 @@ async function staffPingPresenceHandler(
   context: CallableContextLike
 ) {
   const actor = await requireStaffContext(context);
-  await requireFeatureEnabled("reports");
+  await requireFeatureEnabled("messages");
   const payload = (data && typeof data === "object")
     ? (data as Record<string, unknown>)
     : {};
@@ -4675,7 +4726,7 @@ async function adminSetEntityStatusHandler(
   }
 
   let targetRef: FirebaseFirestore.DocumentReference;
-  let auditEntityType = entityType;
+  const auditEntityType = entityType;
   if (entityType === "posts") {
     const sourceCollection = normalizePostCollectionNameServer(payload.sourceCollection);
     targetRef = db.collection(sourceCollection).doc(entityId);
@@ -9277,3 +9328,19 @@ export const exportDtsQrZip = functions.https.onCall(
     };
   }
 );
+
+/*
+ * Test-only exports for emulator integration tests.
+ * These are not deployed callable endpoints; they only expose internal handlers
+ * to keep privileged behavior verifiable in CI.
+ */
+export const __testing = {
+  adminListReportsScopedHandler,
+  adminReportsBootstrapHandler,
+  loadScopedReportsForActor,
+  loadScopedReportViewCountsForActor,
+  buildScopedReportViewCounts,
+  strictCorsEnabled,
+  isAllowedCorsOrigin,
+  isAllowedPublicReportCorsOrigin,
+};
