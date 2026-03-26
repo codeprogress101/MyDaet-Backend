@@ -36,15 +36,17 @@ const PUBLIC_REPORT_ALLOWED_ORIGINS = String(process.env.PUBLIC_REPORT_ALLOWED_O
 const CORS_MODE = String(process.env.CORS_MODE ?? "").trim().toLowerCase();
 const FUNCTIONS_EMULATOR_ENABLED =
   String(process.env.FUNCTIONS_EMULATOR ?? "").trim().toLowerCase() === "true";
-const POST_COLLECTIONS = ["posts", "announcements"] as const;
+const POST_COLLECTIONS = ["posts"] as const;
 const PUBLISHED_STATUS_VARIANTS = ["published", "Published", "PUBLISHED"] as const;
 const SYSTEM_SETTINGS_FEATURE_KEYS = [
   "tourism",
   "announcements",
   "news",
   "jobs",
+  "publicDocs",
   "directory",
   "documentTracking",
+  "feedback",
   "reports",
   "messages",
   "transparency",
@@ -81,6 +83,9 @@ const OPEN_STATUSES = ["submitted", "acknowledged", "in_review", "assigned", "in
 const PUBLIC_REPORT_WRITE_SERVICE = "Public reporting HTTP endpoints";
 const PUBLIC_REPORT_RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000;
 const PUBLIC_REPORT_RATE_LIMIT_MAX_REQUESTS = 5;
+const PUBLIC_REPORT_LOOKUP_RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000;
+const PUBLIC_REPORT_LOOKUP_RATE_LIMIT_MAX_REQUESTS = 12;
+const FEATURE_SUGGESTION_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const EMERGENCY_DUPLICATE_WINDOW_MS = 45 * 60 * 1000;
 const EMERGENCY_DUPLICATE_DISTANCE_METERS = 250;
 
@@ -866,7 +871,9 @@ function assertStringLength(value: string | null, fieldName: string, minLen: num
   return normalized;
 }
 
-type PublicReportLane = "issue" | "emergency";
+type PublicReportLane = "issue" | "emergency" | "feedback";
+type PublicReportKind = "report" | "feedback";
+type PublicReportServiceKey = "public_issue" | "public_emergency" | "citizen_feedback";
 type PublicReportStatus =
   "submitted" |
   "acknowledged" |
@@ -900,14 +907,20 @@ type PublicReportAttachment = {
 type PublicReportWriteInput = {
   reportId?: string;
   lane: PublicReportLane;
+  reportKind: PublicReportKind;
+  serviceKey: PublicReportServiceKey;
   title: string;
+  subject: string;
   category: string;
   emergencyType: string | null;
   barangay: string;
   landmark: string;
   description: string;
+  message: string;
   reporterName: string;
   reporterContact: string;
+  reporterEmail?: string | null;
+  preferredDepartment?: string | null;
   source: "website" | "app";
   geo: PublicReportGeo;
   officeId: string;
@@ -939,6 +952,10 @@ const EMERGENCY_ROUTING_RULES: Record<EmergencyTypeKey, {officeId: string; offic
   crime: {officeId: "MDRRMO", officeName: "Municipal Disaster Risk Reduction and Management Office"},
   other: {officeId: "MDRRMO", officeName: "Municipal Disaster Risk Reduction and Management Office"},
 };
+const FEEDBACK_ROUTING_RULE = {
+  officeId: "OFFICE_OF_THE_MAYOR",
+  officeName: "Office of the Mayor",
+};
 
 /*
  * CORS is fail-closed outside emulator by default.
@@ -963,7 +980,17 @@ function getPublicReportAllowedOrigins(): string[] {
   return Array.from(PUBLIC_REPORT_DEFAULT_ALLOWED_ORIGINS);
 }
 
+function isLoopbackOrigin(origin: string): boolean {
+  try {
+    const parsed = new URL(origin);
+    return ["localhost", "127.0.0.1", "::1", "[::1]"].includes(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
 function isAllowedPublicReportCorsOrigin(origin: string): boolean {
+  if (isLoopbackOrigin(origin)) return true;
   const allowedOrigins = getPublicReportAllowedOrigins();
   if (allowedOrigins.length === 0) return allowOriginWithoutAllowlist();
   return allowedOrigins.includes(origin);
@@ -991,8 +1018,244 @@ function applyPublicReportCors(
   return true;
 }
 
-async function requirePublicReportsWritable(
-  requireEmergencyFlag: boolean
+function normalizePublicTicketNumber(payload: Record<string, unknown>): string {
+  const rawTicket =
+    payload.ticketNumber ??
+    payload.ticket_number ??
+    payload.trackingNumber ??
+    payload.trackingNo ??
+    payload.reference ??
+    payload.referenceNo;
+  const trackingNo = normalizeTrackingNo(rawTicket);
+  if (!trackingNo) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "ticketNumber/trackingNumber is required."
+    );
+  }
+  if (!TRACKING_NO_REGEX.test(trackingNo)) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "Invalid ticket number format."
+    );
+  }
+  return trackingNo;
+}
+
+async function enforcePublicReportLookupRateLimit(
+  req: functions.https.Request,
+  ticketNumber: string
+): Promise<void> {
+  const ipHash = sha256(getRequestIp(req)).substring(0, 32);
+  const ticketHash = sha256(ticketNumber).substring(0, 16);
+  const docId = `lookup_${ticketHash}_${ipHash}`;
+  const rateRef = db.collection("public_report_lookup_rate_limits").doc(docId);
+  const windowStart = Date.now() - PUBLIC_REPORT_LOOKUP_RATE_LIMIT_WINDOW_MS;
+
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(rateRef);
+    const data = snap.exists ? snap.data() ?? {} : {};
+    const lastAttemptMs = parseEpochMs(data.lastAttemptAt);
+    const currentCount =
+      lastAttemptMs >= windowStart ?
+        Math.max(0, Number(data.count ?? 0)) :
+        0;
+
+    if (currentCount >= PUBLIC_REPORT_LOOKUP_RATE_LIMIT_MAX_REQUESTS) {
+      throw new functions.https.HttpsError(
+        "resource-exhausted",
+        "Too many tracking lookups from this connection. Please wait a few minutes before trying again."
+      );
+    }
+
+    tx.set(rateRef, {
+      ticketNumber,
+      count: currentCount + 1,
+      ipHash,
+      lastAttemptAt: admin.firestore.FieldValue.serverTimestamp(),
+      expiresAt: admin.firestore.Timestamp.fromMillis(
+        Date.now() + PUBLIC_REPORT_LOOKUP_RATE_LIMIT_WINDOW_MS
+      ),
+    }, {merge: true});
+  });
+}
+
+function sanitizePublicReportAttachment(
+  attachment: Record<string, unknown>
+): Record<string, unknown> {
+  const name =
+    coerceString(attachment.name) ??
+    coerceString(attachment.fileName) ??
+    coerceString(attachment.file_name) ??
+    "Attachment";
+  const path =
+    coerceString(attachment.path) ??
+    coerceString(attachment.filePath) ??
+    coerceString(attachment.file_path) ??
+    "";
+  const url = coerceString(attachment.url) ?? "";
+  const contentType =
+    coerceString(attachment.contentType) ??
+    coerceString(attachment.content_type) ??
+    "";
+  return {
+    id: path || name,
+    url,
+    path,
+    file_path: path,
+    content_type: contentType,
+    name,
+    file_name: name,
+  };
+}
+
+function sanitizePublicReportTimelineEntry(
+  row: Record<string, unknown>
+): Record<string, unknown> {
+  const action = coerceString(row.type) ?? "UPDATE";
+  const timestamp = toIsoString(row.createdAt ?? row.timestamp);
+  const notes =
+    coerceString(row.notes) ??
+    coerceString(row.message) ??
+    "";
+  const officeName =
+    coerceString(row.officeName) ??
+    coerceString(row.assignedOfficeName) ??
+    coerceString(row.currentOfficeName) ??
+    coerceString(row.officeId) ??
+    coerceString(row.assignedOfficeId) ??
+    null;
+  const nextStatus = coerceString(row.toStatus) ?? coerceString(row.status) ?? action;
+  return {
+    id: coerceString(row.id) ?? "",
+    timestamp,
+    updated_at: timestamp,
+    action,
+    actor_name:
+      coerceString(row.actorName) ??
+      coerceString(row.byName) ??
+      coerceString(row.lastActionByName) ??
+      "System",
+    actor_role:
+      coerceString(row.actorRole) ??
+      coerceString(row.byRole) ??
+      coerceString(row.lastActionByRole) ??
+      null,
+    office_name: officeName,
+    notes,
+    admin_response: notes,
+    note_public: notes,
+    assigned_to: officeName,
+    from_status: coerceString(row.fromStatus),
+    to_status: nextStatus,
+    status: nextStatus,
+    attachment_path: null,
+  };
+}
+
+async function loadPublicReportTimeline(
+  docRef: admin.firestore.DocumentReference,
+  limitRows = 20
+): Promise<Record<string, unknown>[]> {
+  const timelineSnap = await docRef
+    .collection("timeline")
+    .orderBy("createdAt", "desc")
+    .limit(Math.max(1, Math.min(50, limitRows)))
+    .get();
+  return timelineSnap.docs.map((item) => sanitizePublicReportTimelineEntry(item.data() ?? {}));
+}
+
+function sanitizePublicReportTicket(
+  row: Record<string, unknown>
+): Record<string, unknown> {
+  const ticketNumber =
+    coerceString(row.ticketNumber) ??
+    coerceString(row.trackingNumber) ??
+    coerceString(row.referenceNo) ??
+    coerceString(row.reference) ??
+    "";
+  const subject =
+    coerceString(row.subject) ??
+    coerceString(row.title) ??
+    "";
+  const message =
+    coerceString(row.message) ??
+    coerceString(row.description) ??
+    "";
+  const assignedToName = coerceString(row.assignedToName);
+  const assignedOfficeName =
+    coerceString(row.assignedOfficeName) ??
+    coerceString(row.officeName);
+  const latestStatus = coerceString(row.status) ?? "submitted";
+  const attachments = Array.isArray(row.attachments)
+    ? row.attachments
+      .map((item) => (item && typeof item === "object" ? sanitizePublicReportAttachment(item as Record<string, unknown>) : null))
+      .filter((item): item is Record<string, unknown> => item != null)
+    : [];
+
+  return {
+    id: coerceString(row.id),
+    lane: getPublicReportLane(row),
+    report_kind:
+      coerceString(row.reportKind) ??
+      (getPublicReportLane(row) === "feedback" ? "feedback" : "report"),
+    service_key:
+      coerceString(row.serviceKey) ??
+      (getPublicReportLane(row) === "feedback" ? "citizen_feedback" : "public_issue"),
+    ticket_number: ticketNumber,
+    reference: ticketNumber,
+    trackingNumber: ticketNumber,
+    referenceNo: ticketNumber,
+    category: coerceString(row.category) ?? "",
+    subject,
+    message,
+    latest_status: latestStatus,
+    status: latestStatus,
+    assigned_to: assignedToName ?? assignedOfficeName ?? "",
+    assignedToName: assignedToName ?? null,
+    assignedToUid: coerceString(row.assignedToUid),
+    created_at: toIsoString(row.createdAt),
+    updated_at: toIsoString(row.updatedAt),
+    attachments,
+  };
+}
+
+function getPublicReportLane(row: Record<string, unknown>): PublicReportLane {
+  const lane = (coerceString(row.lane) ?? "").toLowerCase();
+  const serviceKey = (coerceString(row.serviceKey) ?? "").toLowerCase();
+  const reportKind = (coerceString(row.reportKind) ?? "").toLowerCase();
+  if (lane === "feedback" || serviceKey === "citizen_feedback" || reportKind === "feedback") {
+    return "feedback";
+  }
+  if (lane === "emergency" || !!coerceString(row.emergencyType)) {
+    return "emergency";
+  }
+  return "issue";
+}
+
+function normalizeRequestedPublicReportLane(raw: unknown): PublicReportLane | null {
+  const value = String(raw ?? "")
+    .trim()
+    .toLowerCase();
+  if (value === "feedback") {
+    return "feedback";
+  }
+  if (value === "emergency") {
+    return "emergency";
+  }
+  if (value === "issue" || value === "report" || value === "reports") {
+    return "issue";
+  }
+  return null;
+}
+
+function featureKeyForPublicReportLane(lane: PublicReportLane): SystemFeatureKey {
+  return lane === "feedback" ? "feedback" : "reports";
+}
+
+async function requirePublicReportLaneAvailability(
+  lane: PublicReportLane,
+  options: {write?: boolean} = {}
 ): Promise<void> {
   const settingsSnap = await db.collection("system").doc("settings").get();
   const raw = settingsSnap.exists ? settingsSnap.data() ?? {} : {};
@@ -1004,20 +1267,21 @@ async function requirePublicReportsWritable(
   const emergencyReportsEnabled = rawFeatures.emergencyReports == null ?
     true :
     Boolean(rawFeatures.emergencyReports);
+  const featureKey = featureKeyForPublicReportLane(lane);
 
-  if (!normalized.features.reports) {
+  if (!normalized.features[featureKey]) {
     throw new functions.https.HttpsError(
       "permission-denied",
-      "reports feature is currently disabled by Command Center."
+      `${featureKey} feature is currently disabled by Command Center.`
     );
   }
-  if (requireEmergencyFlag && !emergencyReportsEnabled) {
+  if (lane === "emergency" && !emergencyReportsEnabled) {
     throw new functions.https.HttpsError(
       "permission-denied",
       "emergencyReports feature is currently disabled by Command Center."
     );
   }
-  if (normalized.readOnly) {
+  if (options.write && normalized.readOnly) {
     throw new functions.https.HttpsError(
       "failed-precondition",
       "System is in read-only mode. Public report intake is temporarily blocked."
@@ -1055,7 +1319,7 @@ function getRequestIp(req: functions.https.Request): string {
 
 async function enforcePublicReportRateLimit(
   req: functions.https.Request,
-  lane: PublicReportLane
+  lane: string
 ): Promise<void> {
   // This is intentionally lightweight. Production should add App Check, reCAPTCHA,
   // and a stronger central limiter, but this closes the obvious abuse gap now.
@@ -1258,7 +1522,11 @@ function generatePublicTrackingNumber(prefix: string): string {
 async function uploadPublicReportAttachment(
   reportId: string,
   fileBaseName: string,
-  dataUrl: string
+  dataUrl: string,
+  options: {
+    allowedContentTypes?: Array<string | RegExp>;
+    maxBytes?: number;
+  } = {}
 ): Promise<PublicReportAttachment | null> {
   const trimmed = String(dataUrl ?? "").trim();
   if (!trimmed) return null;
@@ -1270,14 +1538,24 @@ async function uploadPublicReportAttachment(
     );
   }
   const contentType = match[1].trim().toLowerCase();
-  if (!contentType.startsWith("image/")) {
+  const allowedContentTypes = Array.isArray(options.allowedContentTypes) && options.allowedContentTypes.length > 0 ?
+    options.allowedContentTypes :
+    [/^image\//];
+  const contentTypeAllowed = allowedContentTypes.some((allowed) => {
+    if (allowed instanceof RegExp) {
+      return allowed.test(contentType);
+    }
+    return String(allowed).trim().toLowerCase() === contentType;
+  });
+  if (!contentTypeAllowed) {
     throw new functions.https.HttpsError(
       "invalid-argument",
-      "Only image attachments are allowed for public reports."
+      "Attachment type is not allowed for this public report."
     );
   }
   const buffer = Buffer.from(match[2], "base64");
-  if (buffer.length > (3 * 1024 * 1024)) {
+  const maxBytes = Number(options.maxBytes) > 0 ? Number(options.maxBytes) : (3 * 1024 * 1024);
+  if (buffer.length > maxBytes) {
     throw new functions.https.HttpsError(
       "invalid-argument",
       "Attachment is too large."
@@ -1321,9 +1599,12 @@ async function createPublicReportDocument(
   // immediately for queues, dashboards, and the active map.
   await reportRef.set({
     lane: input.lane,
+    reportKind: input.reportKind,
+    serviceKey: input.serviceKey,
     emergencyType: input.emergencyType,
     category: input.category,
     title: input.title,
+    subject: input.subject,
     barangay: input.barangay,
     landmark: input.landmark,
     location: {
@@ -1342,19 +1623,26 @@ async function createPublicReportDocument(
     assignedToName: null,
     createdByUid: null,
     createdByName: input.reporterName,
-    createdByEmail: null,
+    createdByEmail: input.reporterEmail ?? null,
     source: input.source,
     reporter: {
       name: input.reporterName,
       contact: input.reporterContact,
+      email: input.reporterEmail ?? null,
+      preferredDepartment: input.preferredDepartment ?? null,
     },
     name: input.reporterName,
+    email: input.reporterEmail ?? null,
     contact: input.reporterContact,
     contactNumber: input.reporterContact,
+    preferredDepartment: input.preferredDepartment ?? null,
     description: input.description,
+    message: input.message,
     attachments: input.attachments,
     ticketNumber: input.trackingNumber,
     trackingNumber: input.trackingNumber,
+    referenceNo: input.trackingNumber,
+    reference: input.trackingNumber,
     duplicateOf: input.duplicateOf,
     duplicateWarning: input.duplicateWarning,
     sla: {
@@ -1807,6 +2095,7 @@ function validateTrackingLookupInput(
 }
 
 function isAllowedCorsOrigin(origin: string): boolean {
+  if (isLoopbackOrigin(origin)) return true;
   if (TRACK_LOOKUP_ALLOWED_ORIGINS.length === 0) return allowOriginWithoutAllowlist();
   return TRACK_LOOKUP_ALLOWED_ORIGINS.includes(origin);
 }
@@ -2347,11 +2636,7 @@ function buildWorkQueuePreviewFromReports(
         coerceString(row.id) ??
         "",
       status: toReportStatus(row.status),
-      lane:
-        (coerceString(row.lane) ?? "").toLowerCase() === "emergency" ||
-          !!coerceString(row.emergencyType)
-          ? "emergency"
-          : "issue",
+      lane: getPublicReportLane(row),
       officeId:
         coerceString(row.officeId) ??
         coerceString(row.currentOfficeId) ??
@@ -2792,22 +3077,36 @@ async function adminListReportsScopedHandler(
   context: CallableContextLike
 ) {
   const actor = await requireStaffContext(context);
-  await requireFeatureEnabled("reports");
   const payload = (data && typeof data === "object")
     ? (data as Record<string, unknown>)
     : {};
+  const requestedLane = normalizeRequestedPublicReportLane(payload.lane);
+  await requireFeatureEnabled(requestedLane === "feedback" ? "feedback" : "reports");
   const rawLimit = typeof payload.limit === "number" ? Math.floor(payload.limit) : 120;
   const cursor = normalizeReportsCursorInput(payload);
-  return loadScopedReportsForActor(actor, rawLimit, {cursor});
+  const response = await loadScopedReportsForActor(actor, rawLimit, {cursor});
+  if (!requestedLane || !Array.isArray(response?.items)) {
+    return response;
+  }
+  return {
+    ...response,
+    items: response.items.filter((item) => getPublicReportLane(
+      (item && typeof item === "object") ? (item as Record<string, unknown>) : {}
+    ) === requestedLane),
+  };
 }
 
 export const adminListReportsScoped = functions.https.onCall(async (data, context) =>
   adminListReportsScopedHandler(data, context)
 );
 
-export const adminListReportAssignees = functions.https.onCall(async (_data, context) => {
+export const adminListReportAssignees = functions.https.onCall(async (data, context) => {
   const actor = await requireStaffContext(context);
-  await requireFeatureEnabled("reports");
+  const payload = (data && typeof data === "object")
+    ? (data as Record<string, unknown>)
+    : {};
+  const requestedLane = normalizeRequestedPublicReportLane(payload.lane);
+  await requireFeatureEnabled(requestedLane === "feedback" ? "feedback" : "reports");
   return loadScopedReportAssigneesForActor(actor);
 });
 
@@ -4223,11 +4522,58 @@ export const adminUpdateSettings = onCallV2({region: REGION}, async (request) =>
   }
 });
 
-function normalizePostCollectionNameServer(raw: unknown): "posts" | "announcements" {
-  const value = String(raw ?? "")
-    .trim()
-    .toLowerCase();
-  return value === "announcements" ? "announcements" : "posts";
+function serializeFeatureSuggestionRow(
+  id: string,
+  row: FirebaseFirestore.DocumentData
+): Record<string, unknown> {
+  const data = row ?? {};
+  return {
+    id,
+    selectedFeatures: normalizeFeatureSuggestionList(data.selectedFeatures, 12, 120),
+    note: coerceString(data.note) ?? "",
+    page: coerceString(data.page) ?? "/services",
+    source: coerceString(data.source) ?? null,
+    status: coerceString(data.status) ?? "submitted",
+    visibility: coerceString(data.visibility) ?? "super_admin_only",
+    createdAt: toIsoString(data.createdAt) ?? coerceString(data.createdAtIso),
+  };
+}
+
+async function adminListFeatureSuggestionsHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  await requireSuperAdminContext(context);
+  const payload = data && typeof data === "object" ?
+    (data as Record<string, unknown>) :
+    {};
+  const rawLimit = Number(payload.limit ?? 25);
+  const requestedLimit = Number.isFinite(rawLimit) ?
+    Math.min(100, Math.max(1, rawLimit)) :
+    25;
+  const snapshot = await db.collection("feature_suggestions")
+    .orderBy("createdAt", "desc")
+    .limit(requestedLimit)
+    .get();
+
+  return {
+    success: true,
+    items: snapshot.docs.map((doc) => serializeFeatureSuggestionRow(doc.id, doc.data() ?? {})),
+    generatedAt: new Date().toISOString(),
+  };
+}
+
+export const adminListFeatureSuggestions = onCallV2({region: REGION}, async (request) => {
+  try {
+    return await adminListFeatureSuggestionsHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+function normalizePostCollectionNameServer(raw?: unknown): "posts" {
+  void raw;
+  return "posts";
 }
 
 function assertKnownLifecycleStatus(raw: unknown): LifecycleStatus {
@@ -4430,7 +4776,7 @@ async function adminSavePublicDocDraftHandler(
   if (!isContentDraftRole(actor.role)) {
     throw new functions.https.HttpsError("permission-denied", "Staff draft access is required.");
   }
-  await requireFeatureWritable("transparency");
+  await requireFeatureWritable("publicDocs");
 
   const payload = (data && typeof data === "object")
     ? (data as Record<string, unknown>)
@@ -4740,7 +5086,7 @@ async function adminSetEntityStatusHandler(
       .toLowerCase();
     await requireFeatureWritable(sourceType === "news" ? "news" : "announcements");
   } else if (entityType === "public_docs") {
-    await requireFeatureWritable("transparency");
+    await requireFeatureWritable("publicDocs");
     targetRef = db.collection("public_docs").doc(entityId);
     const sourceSnap = await targetRef.get();
     if (!sourceSnap.exists) {
@@ -4794,7 +5140,6 @@ async function adminUpdateReportStatusHandler(
     ? (data as Record<string, unknown>)
     : {};
   const actor = await requireStaffContext(context);
-  await requireFeatureWritable("reports");
   const reportId = coerceString(payload.reportId);
   if (!reportId) {
     throw new functions.https.HttpsError("invalid-argument", "reportId is required.");
@@ -4818,6 +5163,7 @@ async function adminUpdateReportStatusHandler(
       throw new functions.https.HttpsError("not-found", "Report not found.");
     }
     const row = (snap.data() ?? {}) as Record<string, unknown>;
+    await requireFeatureWritable(featureKeyForPublicReportLane(getPublicReportLane(row)));
     previousStatus = normalizeReportStatusInput(row.status ?? "submitted");
 
     const canUpdate =
@@ -5019,7 +5365,6 @@ async function adminAssignReportHandler(
     ? (data as Record<string, unknown>)
     : {};
   const actor = await requireStaffContext(context);
-  await requireFeatureWritable("reports");
   if (!canAssignReportsRole(actor.role)) {
     throw new functions.https.HttpsError(
       "permission-denied",
@@ -5068,6 +5413,7 @@ async function adminAssignReportHandler(
       throw new functions.https.HttpsError("not-found", "Report not found.");
     }
     const row = (snap.data() ?? {}) as Record<string, unknown>;
+    await requireFeatureWritable(featureKeyForPublicReportLane(getPublicReportLane(row)));
     if (!reportInActorScope(actor, row)) {
       throw new functions.https.HttpsError(
         "permission-denied",
@@ -5459,12 +5805,16 @@ function normalizePublicIssuePayload(
 
   return {
     lane: "issue",
+    reportKind: "report",
+    serviceKey: "public_issue",
     title,
+    subject: title,
     category,
     emergencyType: null,
     barangay,
     landmark: rawLocation,
     description,
+    message: description,
     reporterName,
     reporterContact,
     source: normalizePublicSource(payload.source),
@@ -5494,18 +5844,182 @@ function normalizeEmergencyPayload(
 
   return {
     lane: "emergency",
+    reportKind: "report",
+    serviceKey: "public_emergency",
     title: `${emergencyTypeLabel(emergencyTypeKey)} - ${barangay}`,
+    subject: `${emergencyTypeLabel(emergencyTypeKey)} - ${barangay}`,
     category: emergencyTypeKey,
     emergencyType: emergencyTypeKey,
     emergencyTypeKey,
     barangay,
     landmark,
     description,
+    message: description,
     reporterName,
     reporterContact,
     source: normalizePublicSource(payload.source),
     geo: normalizeGeoInput(payload.geo),
     photoDataUrl: optionalPublicField(payload.photoDataUrl, 4 * 1024 * 1024),
+  };
+}
+
+function normalizePublicFeedbackPayload(
+  payload: Record<string, unknown>
+): Omit<PublicReportWriteInput, "trackingNumber" | "officeId" | "officeName" | "priority" | "sla" | "duplicateOf" | "duplicateWarning" | "attachments"> & {
+  attachmentDataUrl: string;
+} {
+  const privacyAccepted =
+    payload.privacyAccepted === true ||
+    String(payload.privacyAccepted ?? "").trim().toLowerCase() === "true";
+  if (!privacyAccepted) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "Privacy notice acknowledgement is required."
+    );
+  }
+  const category = requiredPublicField(payload.category || "general feedback", "Category", 80)
+    .toLowerCase()
+    .replace(/\s+/g, "_");
+  const subject = requiredPublicField(payload.subject ?? payload.title, "Subject", 120);
+  const message = requiredPublicField(payload.message ?? payload.description, "Message", 2000);
+  const reporterEmail = requiredPublicField(payload.email, "Email address", 160);
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(reporterEmail)) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "Email address is invalid."
+    );
+  }
+  const reporterName = optionalPublicField(payload.name, 120) || "Anonymous";
+  const reporterContact = optionalPublicField(payload.contact, 120) || "Not provided";
+  const barangay = optionalPublicField(payload.barangay, 120) || "Unspecified";
+  const landmark = optionalPublicField(payload.location, 200) || "N/A";
+  const preferredDepartment = optionalPublicField(payload.department, 120) || null;
+
+  return {
+    lane: "feedback",
+    reportKind: "feedback",
+    serviceKey: "citizen_feedback",
+    title: subject,
+    subject,
+    category,
+    emergencyType: null,
+    barangay,
+    landmark,
+    description: message,
+    message,
+    reporterName,
+    reporterContact,
+    reporterEmail,
+    preferredDepartment,
+    source: normalizePublicSource(payload.source),
+    geo: normalizeGeoInput(payload.geo),
+    attachmentDataUrl: optionalPublicField(
+      payload.attachmentDataUrl ?? payload.photoDataUrl,
+      7 * 1024 * 1024
+    ),
+  };
+}
+
+function normalizeFeatureSuggestionList(
+  raw: unknown,
+  maxItems = 8,
+  maxLength = 120
+): string[] {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const entry of raw) {
+    const text = optionalPublicField(entry, maxLength);
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    out.push(text);
+    if (out.length >= maxItems) break;
+  }
+  return out;
+}
+
+function normalizePublicFeatureSuggestionPayload(
+  payload: Record<string, unknown>
+): {
+  selectedFeatures: string[];
+  note: string | null;
+  page: string;
+  source: string | null;
+  deviceId: string | null;
+} {
+  const rawSelectedFeatures = Array.isArray(payload.selectedFeatures) ?
+    payload.selectedFeatures :
+    (Array.isArray(payload.features) ? payload.features : []);
+  const selectedFeatures = normalizeFeatureSuggestionList(rawSelectedFeatures);
+  const note = optionalPublicField(
+    payload.note ?? payload.message ?? payload.details,
+    1500
+  );
+  if (selectedFeatures.length === 0 && !note) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "Select at least one feature or add a short suggestion."
+    );
+  }
+  const page = optionalPublicField(payload.page ?? payload.sourcePage, 160) || "/services";
+  const deviceId = optionalPublicField(payload.deviceId, 160);
+
+  return {
+    selectedFeatures,
+    note,
+    page,
+    source: normalizePublicSource(payload.source),
+    deviceId,
+  };
+}
+
+async function enforceFeatureSuggestionDailyLimit(
+  req: functions.https.Request,
+  deviceId: string | null
+): Promise<{ipHash: string; deviceHash: string | null}> {
+  const ipHash = sha256(getRequestIp(req)).substring(0, 32);
+  const deviceHash = deviceId ? sha256(deviceId).substring(0, 32) : null;
+  const ipRef = db.collection("feature_suggestion_rate_limits").doc(`ip_${ipHash}`);
+  const deviceRef = deviceHash ?
+    db.collection("feature_suggestion_rate_limits").doc(`device_${deviceHash}`) :
+    null;
+  const windowStart = Date.now() - FEATURE_SUGGESTION_COOLDOWN_MS;
+
+  await db.runTransaction(async (tx) => {
+    const refs = deviceRef ? [ipRef, deviceRef] : [ipRef];
+    const snaps = await Promise.all(refs.map((ref) => tx.get(ref)));
+
+    for (const snap of snaps) {
+      const data = snap.exists ? snap.data() ?? {} : {};
+      const lastAttemptMs = parseEpochMs(data.lastSubmittedAt);
+      if (lastAttemptMs >= windowStart) {
+        throw new functions.https.HttpsError(
+          "resource-exhausted",
+          "Only one must-have feature suggestion per device or connection is allowed every 24 hours."
+        );
+      }
+    }
+
+    tx.set(ipRef, {
+      scope: "ip",
+      hash: ipHash,
+      lastSubmittedAt: admin.firestore.FieldValue.serverTimestamp(),
+      expiresAt: admin.firestore.Timestamp.fromMillis(Date.now() + FEATURE_SUGGESTION_COOLDOWN_MS),
+    }, {merge: true});
+
+    if (deviceRef && deviceHash) {
+      tx.set(deviceRef, {
+        scope: "device",
+        hash: deviceHash,
+        lastSubmittedAt: admin.firestore.FieldValue.serverTimestamp(),
+        expiresAt: admin.firestore.Timestamp.fromMillis(Date.now() + FEATURE_SUGGESTION_COOLDOWN_MS),
+      }, {merge: true});
+    }
+  });
+
+  return {
+    ipHash,
+    deviceHash,
   };
 }
 
@@ -5528,7 +6042,7 @@ async function handleSubmitPublicIssueHttpRequest(
   }
 
   try {
-    await requirePublicReportsWritable(false);
+    await requirePublicReportLaneAvailability("issue", {write: true});
     await enforcePublicReportRateLimit(req, "issue");
     const payload = req.body && typeof req.body === "object" ?
       (req.body as Record<string, unknown>) :
@@ -5594,7 +6108,7 @@ async function handleSubmitEmergencyReportHttpRequest(
   }
 
   try {
-    await requirePublicReportsWritable(true);
+    await requirePublicReportLaneAvailability("emergency", {write: true});
     await enforcePublicReportRateLimit(req, "emergency");
     const payload = req.body && typeof req.body === "object" ?
       (req.body as Record<string, unknown>) :
@@ -5667,6 +6181,245 @@ async function handleSubmitEmergencyReportHttpRequest(
 export const submitEmergencyReport = onRequestV2(
   {region: REGION},
   handleSubmitEmergencyReportHttpRequest
+);
+
+async function handleSubmitPublicFeedbackHttpRequest(
+  req: functions.https.Request,
+  res: functions.Response<unknown>
+) {
+  const corsAllowed = applyPublicReportCors(req, res);
+  if (!corsAllowed) {
+    res.status(403).json({error: "Origin not allowed.", code: "permission-denied"});
+    return;
+  }
+  if (req.method === "OPTIONS") {
+    res.status(204).send("");
+    return;
+  }
+  if (req.method !== "POST") {
+    res.status(405).json({error: "Method not allowed.", code: "method-not-allowed"});
+    return;
+  }
+
+  try {
+    await requirePublicReportLaneAvailability("feedback", {write: true});
+    await enforcePublicReportRateLimit(req, "feedback");
+    const payload = req.body && typeof req.body === "object" ?
+      (req.body as Record<string, unknown>) :
+      {};
+    const normalized = normalizePublicFeedbackPayload(payload);
+    const now = new Date();
+    const trackingNumber = generatePublicTrackingNumber("FBK");
+    const reportId = db.collection("reports").doc().id;
+    const {attachmentDataUrl, ...reportInput} = normalized;
+    const attachment = attachmentDataUrl ?
+      await uploadPublicReportAttachment(reportId, "feedback_attachment", attachmentDataUrl, {
+        allowedContentTypes: [
+          /^image\//,
+          "application/pdf",
+          "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ],
+        maxBytes: 5 * 1024 * 1024,
+      }) :
+      null;
+    const attachments = attachment ? [attachment] : [];
+
+    await createPublicReportDocument({
+      ...reportInput,
+      reportId,
+      trackingNumber,
+      officeId: FEEDBACK_ROUTING_RULE.officeId,
+      officeName: FEEDBACK_ROUTING_RULE.officeName,
+      priority: "low",
+      attachments,
+      duplicateOf: null,
+      duplicateWarning: null,
+      sla: buildEmergencySla(now),
+    });
+
+    const ticketSnap = await db.collection("reports").doc(reportId).get();
+    const publicTicket = sanitizePublicReportTicket({
+      id: reportId,
+      ...(ticketSnap.data() ?? {}),
+    });
+
+    res.status(200).json({
+      success: true,
+      lane: "feedback",
+      ...publicTicket,
+      latest_status: "submitted",
+      status: "submitted",
+      created_at: now.toISOString(),
+      updated_at: now.toISOString(),
+      updates: [],
+      timeline: [],
+    });
+  } catch (error) {
+    const {code, message, statusCode} = publicReportHttpStatus(error);
+    functions.logger.warn("submitPublicFeedback request failed.", {
+      code,
+      statusCode,
+      ipHash: sha256(getRequestIp(req)).substring(0, 16),
+      region: REGION,
+    });
+    res.status(statusCode).json({error: message, code});
+  }
+}
+
+export const submitPublicFeedback = onRequestV2(
+  {region: REGION},
+  handleSubmitPublicFeedbackHttpRequest
+);
+
+async function handleTrackPublicFeedbackHttpRequest(
+  req: functions.https.Request,
+  res: functions.Response<unknown>
+) {
+  const corsAllowed = applyPublicReportCors(req, res);
+  if (!corsAllowed) {
+    res.status(403).json({error: "Origin not allowed.", code: "permission-denied"});
+    return;
+  }
+  if (req.method === "OPTIONS") {
+    res.status(204).send("");
+    return;
+  }
+  if (req.method !== "POST") {
+    res.status(405).json({error: "Method not allowed.", code: "method-not-allowed"});
+    return;
+  }
+
+  try {
+    await requirePublicReportLaneAvailability("feedback");
+    const payload = req.body && typeof req.body === "object" ?
+      (req.body as Record<string, unknown>) :
+      {};
+    const ticketNumber = normalizePublicTicketNumber(payload);
+    await enforcePublicReportLookupRateLimit(req, ticketNumber);
+
+    const snap = await db.collection("reports")
+      .where("trackingNumber", "==", ticketNumber)
+      .limit(1)
+      .get();
+
+    if (snap.empty) {
+      throw new functions.https.HttpsError("not-found", "Ticket not found.");
+    }
+
+    const doc = snap.docs[0];
+    const row = (doc.data() ?? {}) as Record<string, unknown>;
+    if (getPublicReportLane(row) !== "feedback") {
+      throw new functions.https.HttpsError("not-found", "Ticket not found.");
+    }
+
+    const ticket = sanitizePublicReportTicket({
+      id: doc.id,
+      ...row,
+    });
+    const timeline = await loadPublicReportTimeline(doc.ref);
+
+    res.status(200).json({
+      success: true,
+      ...ticket,
+      latest_status: coerceString(row.status) ?? "submitted",
+      status: coerceString(row.status) ?? "submitted",
+      updates: timeline,
+      timeline,
+    });
+  } catch (error) {
+    const httpsError = error as functions.https.HttpsError;
+    const code = String(httpsError?.code ?? "internal");
+    const message = String(httpsError?.message ?? "Feedback tracking lookup failed.");
+    const statusCode =
+      code === "invalid-argument" ? 400 :
+      code === "not-found" ? 404 :
+      code === "resource-exhausted" ? 429 :
+      code === "permission-denied" ? 403 : 500;
+    functions.logger.warn("trackPublicFeedback request failed.", {
+      code,
+      statusCode,
+      ipHash: sha256(getRequestIp(req)).substring(0, 16),
+      region: REGION,
+    });
+    res.status(statusCode).json({error: message, code});
+  }
+}
+
+export const trackPublicFeedback = onRequestV2(
+  {region: REGION},
+  handleTrackPublicFeedbackHttpRequest
+);
+
+async function handleSubmitFeatureSuggestionHttpRequest(
+  req: functions.https.Request,
+  res: functions.Response<unknown>
+) {
+  const corsAllowed = applyPublicReportCors(req, res);
+  if (!corsAllowed) {
+    res.status(403).json({error: "Origin not allowed.", code: "permission-denied"});
+    return;
+  }
+  if (req.method === "OPTIONS") {
+    res.status(204).send("");
+    return;
+  }
+  if (req.method !== "POST") {
+    res.status(405).json({error: "Method not allowed.", code: "method-not-allowed"});
+    return;
+  }
+
+  try {
+    const settings = await getEffectiveSystemSettings();
+    if (settings.readOnly) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "System is in read-only mode. Suggestions are temporarily paused."
+      );
+    }
+    await enforcePublicReportRateLimit(req, "feature_suggestion");
+    const payload = req.body && typeof req.body === "object" ?
+      (req.body as Record<string, unknown>) :
+      {};
+    const normalized = normalizePublicFeatureSuggestionPayload(payload);
+    const {ipHash, deviceHash} = await enforceFeatureSuggestionDailyLimit(req, normalized.deviceId);
+    const createdAt = admin.firestore.Timestamp.now();
+    const suggestionRef = db.collection("feature_suggestions").doc();
+
+    await suggestionRef.set({
+      selectedFeatures: normalized.selectedFeatures,
+      note: normalized.note ?? null,
+      page: normalized.page,
+      source: normalized.source ?? "web",
+      status: "submitted",
+      visibility: "super_admin_only",
+      ipHash,
+      deviceHash,
+      origin: coerceString(req.headers.origin),
+      userAgent: coerceString(req.headers["user-agent"]),
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdAtIso: createdAt.toDate().toISOString(),
+    });
+
+    res.status(200).json({
+      success: true,
+      suggestionId: suggestionRef.id,
+      createdAt: createdAt.toDate().toISOString(),
+    });
+  } catch (error) {
+    const {code, message, statusCode} = publicReportHttpStatus(error);
+    functions.logger.warn("submitFeatureSuggestion request failed.", {
+      code,
+      statusCode,
+      ipHash: sha256(getRequestIp(req)).substring(0, 16),
+      region: REGION,
+    });
+    res.status(statusCode).json({error: message, code});
+  }
+}
+
+export const submitFeatureSuggestion = onRequestV2(
+  {region: REGION},
+  handleSubmitFeatureSuggestionHttpRequest
 );
 
 async function civilRegistrySubmitHandler(
@@ -6347,6 +7100,7 @@ export const opsRuntimeHealth = functions.https.onCall(async (data, context) => 
   const expectedBuild = coerceString(data?.expectedBuild);
   const requiredCallables: string[] = [
     "adminUpdateSettings",
+    "adminListFeatureSuggestions",
     "adminUpdateReportStatus",
     "staffClaimReport",
     "adminAssignReport",
@@ -7463,6 +8217,8 @@ export const onAnnouncementNotify = functions.firestore
     if (!after) return;
     const postType = String(after.type ?? "announcement").trim().toLowerCase();
     if (postType !== "announcement") return;
+    const legacySourceCollection = String(after.legacySourceCollection ?? "").trim().toLowerCase();
+    if (!before && legacySourceCollection === "announcements") return;
 
     const beforeStatus = (before?.status ?? null) as string | null;
     const afterStatus = (after.status ?? "draft") as string;
@@ -7498,8 +8254,12 @@ export const onAnnouncementAudit = functions.firestore
     const typeSource = (after ?? before ?? {}) as Record<string, unknown>;
     const postType = String(typeSource.type ?? "announcement").trim().toLowerCase();
     if (postType !== "announcement") return;
+    const legacySourceCollection = String(typeSource.legacySourceCollection ?? "").trim().toLowerCase();
 
     if (!before && after) {
+      if (legacySourceCollection === "announcements") {
+        return;
+      }
       const title = (after.title ?? "Announcement") as string;
       const category = (after.category ?? "") as string;
       const status = (after.status ?? "draft") as string;

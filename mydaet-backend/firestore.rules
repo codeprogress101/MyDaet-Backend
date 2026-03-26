@@ -546,10 +546,11 @@ service cloud.firestore {
      * /announcements/{announcementId}
      * ------------------------- */
     match /announcements/{announcementId} {
-      allow read: if featureEnabled("announcements") && (
-        isPublishedStatus(resource.data.status)
-        || (signedInUser() && isStaff())
-      );
+      allow read: if (signedInUser() && isStaff())
+        || (
+          featureEnabled("announcements")
+          && isPublishedStatus(resource.data.status)
+        );
 
       allow create, update, delete: if false;
 
@@ -565,10 +566,11 @@ service cloud.firestore {
      * /posts/{postId}
      * ------------------------- */
     match /posts/{postId} {
-      allow read: if postFeatureEnabled(resource.data) && (
-        isPublishedStatus(resource.data.status)
-        || (signedInUser() && isStaff())
-      );
+      allow read: if (signedInUser() && isStaff())
+        || (
+          postFeatureEnabled(resource.data)
+          && isPublishedStatus(resource.data.status)
+        );
 
       // Privileged post mutations are callable-only so role/scope/audit checks
       // stay centralized in Cloud Functions.
@@ -580,10 +582,11 @@ service cloud.firestore {
      * /public_docs/{docId}
      * ------------------------- */
     match /public_docs/{docId} {
-      allow read: if featureEnabled("transparency") && (
-        isPublishedStatus(resource.data.status)
-        || (signedInUser() && isStaff())
-      );
+      allow read: if (signedInUser() && isStaff())
+        || (
+          featureEnabled("transparency")
+          && isPublishedStatus(resource.data.status)
+        );
 
       // Privileged document mutations are callable-only so role/scope checks
       // cannot be bypassed through direct Firestore writes.
@@ -595,10 +598,11 @@ service cloud.firestore {
      * /jobs/{jobId}
      * ------------------------- */
     match /jobs/{jobId} {
-      allow read: if featureEnabled("jobs") && (
-        isPublishedStatus(resource.data.status)
-        || (signedInUser() && isStaff())
-      );
+      allow read: if (signedInUser() && isStaff())
+        || (
+          featureEnabled("jobs")
+          && isPublishedStatus(resource.data.status)
+        );
 
       // Privileged job mutations are callable-only.
       allow create, update, delete: if false;
@@ -686,7 +690,7 @@ service cloud.firestore {
     match /staff_threads/{threadId} {
       allow read: if activeUser()
         && isStaff()
-        && featureEnabled("reports")
+        && featureEnabled("messages")
         && resource.data.memberIds is list
         && resource.data.memberIds.hasAny([request.auth.uid]);
       allow create, update, delete: if false;
@@ -694,7 +698,7 @@ service cloud.firestore {
       match /messages/{messageId} {
         allow read: if activeUser()
           && isStaff()
-          && featureEnabled("reports")
+          && featureEnabled("messages")
           && get(/databases/$(database)/documents/staff_threads/$(threadId)).data.memberIds is list
           && get(/databases/$(database)/documents/staff_threads/$(threadId)).data.memberIds.hasAny([request.auth.uid]);
         allow create, update, delete: if false;

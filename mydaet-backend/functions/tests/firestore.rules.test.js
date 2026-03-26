@@ -258,6 +258,7 @@ async function run() {
       officeName: "",
       isActive: true,
     }).firestore();
+    const publicDb = testEnv.unauthenticatedContext().firestore();
 
     // Role + scope: reports.
     await assertSucceeds(adminDb.doc("reports/report-1").get());
@@ -321,6 +322,42 @@ async function run() {
     await assertFails(
       adminDb.doc("jobs/job-1").set({status: "published"}, {merge: true})
     );
+
+    // Staff reads for admin-managed content should remain available even when
+    // the public feature toggle is off. Public readers still stay blocked.
+    await testEnv.withSecurityRulesDisabled(async (context) => {
+      await context.firestore().doc("posts/post-news-hidden").set({
+        type: "news",
+        title: "Hidden news draft",
+        body: "Draft body",
+        status: "draft",
+        officeId: "OFF-1",
+      });
+      await context.firestore().doc("posts/post-news-published").set({
+        type: "news",
+        title: "Hidden published news",
+        body: "Published body",
+        status: "published",
+        officeId: "OFF-1",
+      });
+      await context.firestore().doc("system/settings").set({
+        features: {
+          announcements: false,
+          news: false,
+          transparency: false,
+          jobs: false,
+        },
+      }, {merge: true});
+    });
+
+    await assertSucceeds(superDb.doc("posts/post-news-hidden").get());
+    await assertSucceeds(adminDb.doc("posts/post-news-hidden").get());
+    await assertSucceeds(mod1Db.doc("posts/post-news-hidden").get());
+    await assertFails(publicDb.doc("posts/post-news-published").get());
+
+    await testEnv.withSecurityRulesDisabled(async (context) => {
+      await context.firestore().doc("system/settings").delete();
+    });
 
     // Messaging scope and write restrictions.
     await assertSucceeds(mod1Db.doc("staff_threads/thread-1").get());
