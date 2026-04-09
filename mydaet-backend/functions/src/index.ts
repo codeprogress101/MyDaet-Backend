@@ -18,6 +18,8 @@ import {
   onRequest as onRequestV2,
   type CallableRequest,
 } from "firebase-functions/v2/https";
+import {defineSecret} from "firebase-functions/params";
+import nodemailer from "nodemailer";
 
 admin.initializeApp();
 const db = admin.firestore();
@@ -88,6 +90,20 @@ const PUBLIC_REPORT_LOOKUP_RATE_LIMIT_MAX_REQUESTS = 12;
 const FEATURE_SUGGESTION_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const EMERGENCY_DUPLICATE_WINDOW_MS = 45 * 60 * 1000;
 const EMERGENCY_DUPLICATE_DISTANCE_METERS = 250;
+const FEEDBACK_EMAIL_APP_PASSWORD = defineSecret("FEEDBACK_EMAIL_APP_PASSWORD");
+const FEEDBACK_EMAIL_FUNCTION_SECRETS = [FEEDBACK_EMAIL_APP_PASSWORD];
+const FEEDBACK_EMAIL_SENDER = String(process.env.FEEDBACK_EMAIL_SENDER ?? "maogmangdaet.portal@gmail.com")
+  .trim() || "maogmangdaet.portal@gmail.com";
+const FEEDBACK_EMAIL_SENDER_NAME =
+  String(process.env.FEEDBACK_EMAIL_SENDER_NAME ?? "Municipality of Daet Portal").trim() ||
+  "Municipality of Daet Portal";
+const PORTAL_PUBLIC_BASE_URL =
+  String(process.env.PORTAL_PUBLIC_BASE_URL ?? "https://maogmangdaet.gov.ph")
+    .trim()
+    .replace(/\/+$/, "") || "https://maogmangdaet.gov.ph";
+const DTS_ATTACHMENT_BUCKET_PATTERN = /^mydaet(?:\.appspot\.com|\.firebasestorage\.app)$/i;
+const DTS_ATTACHMENT_PATH_PATTERN = /^dts(?:[/_-]|$)/i;
+const INVALID_TRACKING_CREDENTIALS_MESSAGE = "Invalid tracking credentials.";
 
 function isOpenStatus(s: string): boolean {
   return (OPEN_STATUSES as readonly string[]).includes(s);
@@ -297,6 +313,364 @@ function toIsoString(value: unknown): string | null {
   return parsed.toISOString();
 }
 
+type FeedbackEmailTemplateKey =
+  | "submitted"
+  | "acknowledged"
+  | "in_review"
+  | "assigned"
+  | "in_progress"
+  | "resolved"
+  | "closed"
+  | "rejected";
+
+type FeedbackEmailPayload = {
+  residentName: string;
+  residentEmail: string;
+  ticketNumber: string;
+  subject: string;
+  category: string;
+  status: FeedbackEmailTemplateKey;
+  submittedAt: string;
+  updatedAt: string;
+  trackingUrl: string;
+  assignedOffice: string | null;
+  note: string | null;
+};
+
+let feedbackMailerTransport: nodemailer.Transporter | null = null;
+let feedbackMailerCacheKey = "";
+let feedbackMailerMissingConfigLogged = false;
+
+function titleCaseWords(value: string): string {
+  return value.replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function feedbackStatusLabel(status: string): string {
+  return titleCaseWords(prettyStatus(status));
+}
+
+function formatPortalDateTime(value: unknown, fallback = "Not available"): string {
+  const timestamp = parseEpochMs(value);
+  if (!timestamp) return fallback;
+  return new Date(timestamp).toLocaleString("en-PH", {
+    timeZone: "Asia/Manila",
+    dateStyle: "long",
+    timeStyle: "short",
+  });
+}
+
+function buildFeedbackTrackingUrl(ticketNumber: string): string {
+  return `${PORTAL_PUBLIC_BASE_URL}/track-feedback?ticket=${encodeURIComponent(ticketNumber)}`;
+}
+
+function normalizeFeedbackEmailNote(note: unknown): string | null {
+  const text = coerceString(note);
+  if (!text) return null;
+  return text
+    .replace(/\r\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function buildFeedbackEmailFooter(trackingUrl: string): string[] {
+  return [
+    "This is an automated message from the Municipality of Daet Portal.",
+    "",
+    "Track your feedback here:",
+    trackingUrl,
+    "",
+    "If your concern is an emergency, do not use the feedback channel. Please contact the proper emergency hotline immediately.",
+    "",
+    `Temporary notification sender: ${FEEDBACK_EMAIL_SENDER}`,
+  ];
+}
+
+function buildFeedbackEmailMessage(payload: FeedbackEmailPayload): {subject: string; text: string} {
+  const residentName = payload.residentName || "Resident";
+  const note = normalizeFeedbackEmailNote(payload.note);
+  const assignedOffice = payload.assignedOffice ? `Assigned Office: ${payload.assignedOffice}` : null;
+  const lines: string[] = [];
+
+  switch (payload.status) {
+    case "submitted":
+      lines.push(
+        `Hello ${residentName},`,
+        "",
+        "Your feedback has been received successfully by the Municipality of Daet Portal.",
+        "",
+        `Ticket Number: ${payload.ticketNumber}`,
+        `Subject: ${payload.subject}`,
+        `Category: ${payload.category}`,
+        `Date Submitted: ${payload.submittedAt}`,
+        "Current Status: Submitted",
+        "",
+        "Please keep your ticket number so you can track the progress of your feedback online.",
+        "",
+        payload.trackingUrl,
+        "",
+        "Your feedback will be reviewed by the proper office. You will receive another email whenever the status of your ticket changes.",
+      );
+      return {
+        subject: `Feedback Received: ${payload.ticketNumber}`,
+        text: [...lines, "", ...buildFeedbackEmailFooter(payload.trackingUrl)].join("\n"),
+      };
+    case "acknowledged":
+      lines.push(
+        `Hello ${residentName},`,
+        "",
+        "Your feedback has been acknowledged by the Municipality of Daet.",
+        "",
+        `Ticket Number: ${payload.ticketNumber}`,
+        `Subject: ${payload.subject}`,
+        "Updated Status: Acknowledged",
+        `Updated At: ${payload.updatedAt}`,
+        "",
+        "Your concern is now part of the active handling queue and will be reviewed by the responsible office.",
+      );
+      return {
+        subject: `Feedback Update: ${payload.ticketNumber} has been acknowledged`,
+        text: [...lines, "", ...buildFeedbackEmailFooter(payload.trackingUrl)].join("\n"),
+      };
+    case "in_review":
+      lines.push(
+        `Hello ${residentName},`,
+        "",
+        "Your feedback is now under review.",
+        "",
+        `Ticket Number: ${payload.ticketNumber}`,
+        `Subject: ${payload.subject}`,
+        "Updated Status: In Review",
+        `Updated At: ${payload.updatedAt}`,
+        "",
+        "The concerned office is currently checking the details of your submission and confirming the proper handling route.",
+      );
+      return {
+        subject: `Feedback Update: ${payload.ticketNumber} is under review`,
+        text: [...lines, "", ...buildFeedbackEmailFooter(payload.trackingUrl)].join("\n"),
+      };
+    case "assigned":
+      lines.push(
+        `Hello ${residentName},`,
+        "",
+        "Your feedback has been assigned for action.",
+        "",
+        `Ticket Number: ${payload.ticketNumber}`,
+        `Subject: ${payload.subject}`,
+        "Updated Status: Assigned",
+        ...(assignedOffice ? [assignedOffice] : []),
+        `Updated At: ${payload.updatedAt}`,
+        "",
+        "The responsible office has been notified and will continue handling your concern.",
+      );
+      return {
+        subject: `Feedback Update: ${payload.ticketNumber} has been assigned`,
+        text: [...lines, "", ...buildFeedbackEmailFooter(payload.trackingUrl)].join("\n"),
+      };
+    case "in_progress":
+      lines.push(
+        `Hello ${residentName},`,
+        "",
+        "Your feedback is now being actively handled.",
+        "",
+        `Ticket Number: ${payload.ticketNumber}`,
+        `Subject: ${payload.subject}`,
+        "Updated Status: In Progress",
+        `Updated At: ${payload.updatedAt}`,
+        "",
+        note ?? "The responsible office is actively handling your concern.",
+      );
+      return {
+        subject: `Feedback Update: ${payload.ticketNumber} is now in progress`,
+        text: [...lines, "", ...buildFeedbackEmailFooter(payload.trackingUrl)].join("\n"),
+      };
+    case "resolved":
+      lines.push(
+        `Hello ${residentName},`,
+        "",
+        "Your feedback has been marked as resolved.",
+        "",
+        `Ticket Number: ${payload.ticketNumber}`,
+        `Subject: ${payload.subject}`,
+        "Updated Status: Resolved",
+        `Updated At: ${payload.updatedAt}`,
+        "",
+        "Resolution Summary:",
+        note ?? "The responsible office marked your feedback as resolved.",
+      );
+      return {
+        subject: `Feedback Update: ${payload.ticketNumber} has been resolved`,
+        text: [...lines, "", ...buildFeedbackEmailFooter(payload.trackingUrl)].join("\n"),
+      };
+    case "closed":
+      lines.push(
+        `Hello ${residentName},`,
+        "",
+        "Your feedback record is now closed.",
+        "",
+        `Ticket Number: ${payload.ticketNumber}`,
+        `Subject: ${payload.subject}`,
+        "Updated Status: Closed",
+        `Updated At: ${payload.updatedAt}`,
+        "",
+        note ??
+          "If you need to review the final status of this concern, you may still check the tracking page using your ticket number.",
+      );
+      return {
+        subject: `Feedback Update: ${payload.ticketNumber} is now closed`,
+        text: [...lines, "", ...buildFeedbackEmailFooter(payload.trackingUrl)].join("\n"),
+      };
+    case "rejected":
+      lines.push(
+        `Hello ${residentName},`,
+        "",
+        "Your feedback could not be accepted for processing.",
+        "",
+        `Ticket Number: ${payload.ticketNumber}`,
+        `Subject: ${payload.subject}`,
+        "Updated Status: Rejected",
+        `Updated At: ${payload.updatedAt}`,
+        "",
+        "Reason:",
+        note ?? "The submission could not be accepted for processing.",
+        "",
+        "If this concern was sent through the wrong channel, please use the appropriate municipal service or reporting page.",
+      );
+      return {
+        subject: `Feedback Update: ${payload.ticketNumber} was not accepted`,
+        text: [...lines, "", ...buildFeedbackEmailFooter(payload.trackingUrl)].join("\n"),
+      };
+    default:
+      lines.push(
+        `Hello ${residentName},`,
+        "",
+        "Your feedback has a new update.",
+        "",
+        `Ticket Number: ${payload.ticketNumber}`,
+        `Subject: ${payload.subject}`,
+        `Updated Status: ${feedbackStatusLabel(payload.status)}`,
+        `Updated At: ${payload.updatedAt}`,
+      );
+      return {
+        subject: `Feedback Update: ${payload.ticketNumber} is now ${feedbackStatusLabel(payload.status)}`,
+        text: [...lines, "", ...buildFeedbackEmailFooter(payload.trackingUrl)].join("\n"),
+      };
+  }
+}
+
+function getFeedbackMailerTransport(): nodemailer.Transporter | null {
+  const appPassword = coerceString(FEEDBACK_EMAIL_APP_PASSWORD.value());
+  if (!FEEDBACK_EMAIL_SENDER || !appPassword) {
+    if (!feedbackMailerMissingConfigLogged) {
+      functions.logger.warn("Feedback email delivery is disabled because Gmail credentials are not configured.", {
+        hasSender: Boolean(FEEDBACK_EMAIL_SENDER),
+        hasAppPassword: Boolean(appPassword),
+      });
+      feedbackMailerMissingConfigLogged = true;
+    }
+    return null;
+  }
+
+  const cacheKey = `${FEEDBACK_EMAIL_SENDER}:${appPassword}`;
+  if (feedbackMailerTransport && feedbackMailerCacheKey === cacheKey) {
+    return feedbackMailerTransport;
+  }
+
+  feedbackMailerTransport = nodemailer.createTransport({
+    service: "gmail",
+    auth: {
+      user: FEEDBACK_EMAIL_SENDER,
+      pass: appPassword,
+    },
+  });
+  feedbackMailerCacheKey = cacheKey;
+  feedbackMailerMissingConfigLogged = false;
+  return feedbackMailerTransport;
+}
+
+async function sendFeedbackEmailNotification(
+  row: Record<string, unknown>,
+  options: {
+    status?: string | null;
+    note?: string | null;
+    updatedAt?: unknown;
+  } = {}
+): Promise<void> {
+  if (getPublicReportLane(row) !== "feedback") {
+    return;
+  }
+
+  const residentEmail =
+    coerceString((row.reporter as Record<string, unknown> | undefined)?.email) ??
+    coerceString(row.email) ??
+    coerceString(row.createdByEmail);
+  if (!residentEmail) {
+    return;
+  }
+
+  const transport = getFeedbackMailerTransport();
+  if (!transport) {
+    return;
+  }
+
+  const normalizedStatus = normalizeReportStatusInput(options.status ?? row.status ?? "submitted");
+  const ticketNumber =
+    coerceString(row.trackingNumber) ??
+    coerceString(row.ticketNumber) ??
+    coerceString(row.referenceNo);
+  if (!ticketNumber) {
+    return;
+  }
+
+  const subject = coerceString(row.subject) ?? coerceString(row.title) ?? "Citizen Feedback";
+  const category = coerceString(row.category) ?? "General Feedback";
+  const residentName =
+    coerceString((row.reporter as Record<string, unknown> | undefined)?.name) ??
+    coerceString(row.createdByName) ??
+    coerceString(row.name) ??
+    "Resident";
+  const assignedOffice =
+    coerceString(row.assignedOfficeName) ??
+    coerceString(row.officeName) ??
+    coerceString(row.assignedToName);
+  const submittedAt = formatPortalDateTime(row.createdAt);
+  const updatedAt = formatPortalDateTime(options.updatedAt ?? row.updatedAt ?? row.lastActionAt ?? row.createdAt);
+  const note = normalizeFeedbackEmailNote(options.note);
+  const emailMessage = buildFeedbackEmailMessage({
+    residentName,
+    residentEmail,
+    ticketNumber,
+    subject,
+    category,
+    status: normalizedStatus as FeedbackEmailTemplateKey,
+    submittedAt,
+    updatedAt,
+    trackingUrl: buildFeedbackTrackingUrl(ticketNumber),
+    assignedOffice,
+    note,
+  });
+
+  try {
+    await transport.sendMail({
+      from: {
+        name: FEEDBACK_EMAIL_SENDER_NAME,
+        address: FEEDBACK_EMAIL_SENDER,
+      },
+      to: residentEmail,
+      replyTo: FEEDBACK_EMAIL_SENDER,
+      subject: emailMessage.subject,
+      text: emailMessage.text,
+    });
+  } catch (error) {
+    functions.logger.warn("Feedback email delivery failed.", {
+      reportId: coerceString(row.id) ?? null,
+      trackingNumber: ticketNumber,
+      status: normalizedStatus,
+      residentEmail,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
 function serializeReportRow(
   id: string,
   row: FirebaseFirestore.DocumentData
@@ -409,6 +783,42 @@ async function notifyUsers(uids: string[], payload: NotificationData) {
 
 function prettyStatus(status: string) {
   return status.replace(/_/g, " ").trim();
+}
+
+function statusRequiresResidentNote(status: string): boolean {
+  return status === "resolved" || status === "rejected";
+}
+
+function buildReportWorkflowSummary(
+  options: {
+    beforeStatus: string;
+    afterStatus: string;
+    beforeAssignedUid?: string | null;
+    afterAssignedUid?: string | null;
+    assignedToName?: string | null;
+    assigneeRemovedMessage?: string;
+  }
+): string {
+  const parts: string[] = [];
+  const assignedChanged =
+    (options.beforeAssignedUid ?? null) !== (options.afterAssignedUid ?? null);
+  const statusChanged = options.beforeStatus !== options.afterStatus;
+
+  if (assignedChanged) {
+    if (options.afterAssignedUid) {
+      parts.push(`Assigned to ${options.assignedToName ?? "staff"}.`);
+    } else {
+      parts.push(options.assigneeRemovedMessage || "Removed assignee and returned to queue.");
+    }
+  }
+
+  if (statusChanged) {
+    parts.push(
+      `Status changed from ${prettyStatus(options.beforeStatus)} to ${prettyStatus(options.afterStatus)}.`
+    );
+  }
+
+  return parts.join(" ").trim();
 }
 
 async function addHistory(
@@ -736,6 +1146,17 @@ async function requireFeatureWritable(featureKey: SystemFeatureKey): Promise<Sys
   return settings;
 }
 
+async function requireSystemWritable(): Promise<SystemSettingsShape> {
+  const settings = await getEffectiveSystemSettings();
+  if (settings.readOnly) {
+    throw new functions.https.HttpsError(
+      "failed-precondition",
+      "System is in read-only mode. Write operations are temporarily blocked."
+    );
+  }
+  return settings;
+}
+
 type LifecycleStatus = "draft" | "published" | "archived";
 const LIFECYCLE_STATUSES: LifecycleStatus[] = ["draft", "published", "archived"];
 const PUBLIC_DOC_TYPES = ["ordinance", "resolution", "executive_order", "public_hearing"] as const;
@@ -757,6 +1178,14 @@ function isContentPublishRole(role: NormalizedRole): boolean {
 
 function isJobsManageRole(role: NormalizedRole): boolean {
   return role === "admin" || role === "super_admin";
+}
+
+function isDirectoryManageRole(role: NormalizedRole): boolean {
+  return role === "admin" || role === "super_admin";
+}
+
+function isEmergencyHotlinesManageRole(role: NormalizedRole): boolean {
+  return role === "super_admin";
 }
 
 function normalizeLifecycleStatus(raw: unknown, fallback: LifecycleStatus = "draft"): LifecycleStatus {
@@ -810,6 +1239,87 @@ function parseDateField(raw: unknown): admin.firestore.Timestamp | null {
   const date = new Date(String(raw));
   if (Number.isNaN(date.getTime())) return null;
   return admin.firestore.Timestamp.fromDate(date);
+}
+
+function assertOptionalStringLength(value: string | null, fieldName: string, maxLen: number): string | null {
+  const normalized = coerceString(value);
+  if (!normalized) {
+    return null;
+  }
+  if (normalized.length > maxLen) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      `${fieldName} must be ${maxLen} characters or fewer.`
+    );
+  }
+  return normalized;
+}
+
+function normalizeSortOrder(raw: unknown, fallback = 0): number {
+  const value = Number(raw);
+  if (!Number.isFinite(value)) {
+    return fallback;
+  }
+  return Math.max(-9999, Math.min(9999, Math.trunc(value)));
+}
+
+function parsePhoneList(
+  raw: unknown,
+  {maxItems = 8, maxLen = 80}: {maxItems?: number; maxLen?: number} = {}
+): string[] {
+  const source = Array.isArray(raw)
+    ? raw
+    : (coerceString(raw)?.split(/[\n\r;|]+/g) ?? []);
+  const out: string[] = [];
+  for (const item of source) {
+    const value = coerceString(item);
+    if (!value) continue;
+    if (value.length > maxLen) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        `Contact number must be ${maxLen} characters or fewer.`
+      );
+    }
+    out.push(value);
+    if (out.length >= maxItems) break;
+  }
+  return out;
+}
+
+function buildDirectorySearchKeywords(
+  officeName: string,
+  contactName: string,
+  position: string,
+  phone: string,
+  email: string | null,
+  facebook: string | null,
+  address: string | null
+): string[] {
+  return normalizeKeywordTokens(
+    officeName,
+    contactName,
+    position,
+    phone,
+    email ?? "",
+    facebook ?? "",
+    address ?? ""
+  );
+}
+
+function buildEmergencyHotlineSearchKeywords(
+  label: string,
+  group: string,
+  description: string | null,
+  numbers: string[],
+  notes: string | null
+): string[] {
+  return normalizeKeywordTokens(
+    label,
+    group,
+    description ?? "",
+    numbers.join(" "),
+    notes ?? ""
+  );
 }
 
 function isActorOfficeScoped(actor: StaffContext): boolean {
@@ -1131,11 +1641,6 @@ function sanitizePublicReportTimelineEntry(
     timestamp,
     updated_at: timestamp,
     action,
-    actor_name:
-      coerceString(row.actorName) ??
-      coerceString(row.byName) ??
-      coerceString(row.lastActionByName) ??
-      "System",
     actor_role:
       coerceString(row.actorRole) ??
       coerceString(row.byRole) ??
@@ -1146,6 +1651,7 @@ function sanitizePublicReportTimelineEntry(
     admin_response: notes,
     note_public: notes,
     assigned_to: officeName,
+    assigned_office: officeName,
     from_status: coerceString(row.fromStatus),
     to_status: nextStatus,
     status: nextStatus,
@@ -1182,7 +1688,6 @@ function sanitizePublicReportTicket(
     coerceString(row.message) ??
     coerceString(row.description) ??
     "";
-  const assignedToName = coerceString(row.assignedToName);
   const assignedOfficeName =
     coerceString(row.assignedOfficeName) ??
     coerceString(row.officeName);
@@ -1194,7 +1699,7 @@ function sanitizePublicReportTicket(
     : [];
 
   return {
-    id: coerceString(row.id),
+    id: ticketNumber || coerceString(row.id),
     lane: getPublicReportLane(row),
     report_kind:
       coerceString(row.reportKind) ??
@@ -1211,9 +1716,8 @@ function sanitizePublicReportTicket(
     message,
     latest_status: latestStatus,
     status: latestStatus,
-    assigned_to: assignedToName ?? assignedOfficeName ?? "",
-    assignedToName: assignedToName ?? null,
-    assignedToUid: coerceString(row.assignedToUid),
+    assigned_to: assignedOfficeName ?? "",
+    assigned_office: assignedOfficeName ?? "",
     created_at: toIsoString(row.createdAt),
     updated_at: toIsoString(row.updatedAt),
     attachments,
@@ -2036,19 +2540,25 @@ function normalizeCallableErrorForV2(error: unknown): HttpsErrorV2 {
 
 function sanitizeDtsAttachments(raw: unknown): Array<Record<string, unknown>> {
   if (!Array.isArray(raw)) return [];
-  const allowed = ["name", "path", "url", "uploadedAt", "contentType"];
   const output: Array<Record<string, unknown>> = [];
   for (const entry of raw) {
     if (!entry || typeof entry !== "object") continue;
     const src = entry as Record<string, unknown>;
     const clean: Record<string, unknown> = {};
-    for (const key of allowed) {
-      const value = src[key];
-      if (value != null) clean[key] = value;
-    }
-    if (Object.keys(clean).length > 0) {
-      output.push(clean);
-    }
+    const name = coerceString(src.name);
+    const path = normalizeDtsAttachmentPath(src.path);
+    const url = normalizeDtsAttachmentUrl(src.url);
+    const contentType = coerceString(src.contentType);
+    const uploadedAt = normalizeDtsAttachmentUploadedAt(src.uploadedAt);
+
+    if (name && name.length <= 160) clean.name = name;
+    if (path) clean.path = path;
+    if (url) clean.url = url;
+    if (contentType && contentType.length <= 120) clean.contentType = contentType;
+    if (uploadedAt) clean.uploadedAt = uploadedAt;
+
+    if (!clean.path && !clean.url) continue;
+    output.push(clean);
     if (output.length >= 10) break;
   }
   return output;
@@ -2065,6 +2575,13 @@ function normalizeTrackingNo(raw: unknown): string {
 
 function normalizeTrackingPin(raw: unknown): string {
   return String(raw ?? "").trim();
+}
+
+function invalidTrackingCredentialsError(): functions.https.HttpsError {
+  return new functions.https.HttpsError(
+    "permission-denied",
+    INVALID_TRACKING_CREDENTIALS_MESSAGE
+  );
 }
 
 function validateTrackingLookupInput(
@@ -2123,6 +2640,56 @@ function applyTrackLookupCors(
 function legacyPinHashFromDoc(pin: string, data: Record<string, unknown>): string {
   const salt = coerceString(data.publicPinSalt);
   return salt ? sha256(`${pin}:${salt}`) : sha256(pin);
+}
+
+function normalizeDtsAttachmentPath(value: unknown): string | null {
+  const text = coerceString(value);
+  if (!text) return null;
+  const normalized = text.replace(/^\/+/, "");
+  return DTS_ATTACHMENT_PATH_PATTERN.test(normalized) ? normalized : null;
+}
+
+function normalizeDtsAttachmentUrl(value: unknown): string | null {
+  const text = coerceString(value);
+  if (!text) return null;
+  try {
+    const parsed = new URL(text);
+    if (parsed.protocol !== "https:") return null;
+
+    let bucket: string | null = null;
+    let objectPath: string | null = null;
+    if (parsed.hostname === "firebasestorage.googleapis.com") {
+      const match = parsed.pathname.match(/^\/v0\/b\/([^/]+)\/o\/(.+)$/);
+      if (!match) return null;
+      bucket = decodeURIComponent(match[1] ?? "");
+      objectPath = decodeURIComponent(match[2] ?? "");
+    } else if (parsed.hostname === "storage.googleapis.com") {
+      const parts = parsed.pathname.split("/").filter(Boolean);
+      if (parts.length < 2) return null;
+      bucket = decodeURIComponent(parts[0] ?? "");
+      objectPath = decodeURIComponent(parts.slice(1).join("/"));
+    } else {
+      return null;
+    }
+
+    if (!bucket || !DTS_ATTACHMENT_BUCKET_PATTERN.test(bucket)) return null;
+    if (!objectPath || !DTS_ATTACHMENT_PATH_PATTERN.test(objectPath)) return null;
+    return parsed.toString();
+  } catch (_error) {
+    return null;
+  }
+}
+
+function normalizeDtsAttachmentUploadedAt(value: unknown): string | null {
+  if (!value) return null;
+  if (value instanceof admin.firestore.Timestamp) {
+    return value.toDate().toISOString();
+  }
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value.toISOString();
+  }
+  const parsed = new Date(String(value));
+  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
 }
 
 function isBcryptHash(hash: string): boolean {
@@ -2259,6 +2826,11 @@ function buildSanitizedTrackingResult(
     ? null
     : (dataRow.currentOfficeName ?? dataRow.currentOfficeId ?? null);
 
+  let createdAt: number | null = null;
+  if (dataRow.createdAt instanceof admin.firestore.Timestamp) {
+    createdAt = dataRow.createdAt.toMillis();
+  }
+
   let updatedAt: number | null = null;
   if (dataRow.updatedAt instanceof admin.firestore.Timestamp) {
     updatedAt = dataRow.updatedAt.toMillis();
@@ -2272,6 +2844,7 @@ function buildSanitizedTrackingResult(
     trackingNumber: trackingNo,
     title,
     status,
+    createdAt,
     updatedAt,
     lastUpdated: updatedAt,
     currentOfficeName,
@@ -2283,7 +2856,8 @@ function sanitizeTrackingTimelineEntry(
   row: Record<string, unknown>
 ): Record<string, unknown> | null {
   const notePublic = coerceString(row.notePublic);
-  const actionType = coerceString(row.actionType) ?? coerceString(row.type) ?? "Update";
+  if (!notePublic) return null;
+  const actionType = coerceString(row.actionType) ?? dtsEventLabel(coerceString(row.type) ?? "UPDATE");
   const officeName =
     coerceString(row.officeName) ??
     coerceString(row.toOfficeName) ??
@@ -2297,12 +2871,11 @@ function sanitizeTrackingTimelineEntry(
       ? row.timestamp.toMillis()
       : null);
 
-  if (!notePublic && !actionType) return null;
   return {
     timestamp,
     actionType,
     officeName,
-    notePublic: notePublic ?? "",
+    notePublic,
   };
 }
 
@@ -2393,10 +2966,7 @@ async function verifyPinWithRateLimit(
     );
   }
 
-  throw new functions.https.HttpsError(
-    "permission-denied",
-    "Invalid tracking PIN."
-  );
+  throw invalidTrackingCredentialsError();
 }
 
 function dtsEventLabel(type: string): string {
@@ -2969,6 +3539,30 @@ async function loadScopedReportsForActor(
     },
     nextCursor,
     generatedAt: new Date().toISOString(),
+  };
+}
+
+function dtsSavedDocumentSortTimestamp(
+  dataRow: Record<string, unknown>
+): number {
+  if (dataRow.updatedAt instanceof admin.firestore.Timestamp) {
+    return dataRow.updatedAt.toMillis();
+  }
+  if (dataRow.createdAt instanceof admin.firestore.Timestamp) {
+    return dataRow.createdAt.toMillis();
+  }
+  return 0;
+}
+
+function buildSanitizedSavedDocumentSummary(
+  docId: string,
+  dataRow: Record<string, unknown>
+): Record<string, unknown> {
+  const trackingNo = coerceString(dataRow.trackingNo) ?? docId;
+  const sanitized = buildSanitizedTrackingResult(trackingNo, dataRow);
+  return {
+    docId,
+    ...sanitized,
   };
 }
 
@@ -5026,6 +5620,461 @@ export const adminSaveJobDraft = onCallV2({region: REGION}, async (request) => {
   }
 });
 
+async function adminSaveDirectoryEntryHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const actor = await requireStaffContext(context);
+  await requireSystemWritable();
+  if (!isDirectoryManageRole(actor.role)) {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "Only admin or super_admin can manage municipal directory entries."
+    );
+  }
+
+  const payload = (data && typeof data === "object")
+    ? (data as Record<string, unknown>)
+    : {};
+  const id = coerceString(payload.id);
+  const status = normalizeLifecycleStatus(payload.status, "draft");
+  if (status !== "draft" && !isContentPublishRole(actor.role)) {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "Only admin or super_admin can publish or archive municipal directory entries."
+    );
+  }
+
+  const officeId = coerceString(payload.officeId);
+  const officeName = assertStringLength(
+    coerceString(payload.officeName),
+    "officeName",
+    1,
+    160
+  );
+  const contactName = assertStringLength(
+    coerceString(payload.contactName),
+    "contactName",
+    1,
+    120
+  );
+  const position = assertStringLength(
+    coerceString(payload.position),
+    "position",
+    1,
+    120
+  );
+  const phone = assertStringLength(
+    coerceString(payload.phone),
+    "phone",
+    1,
+    80
+  );
+  const email = assertOptionalStringLength(coerceString(payload.email), "email", 160);
+  const facebook = assertOptionalStringLength(coerceString(payload.facebook), "facebook", 300);
+  const address = assertOptionalStringLength(coerceString(payload.address), "address", 240);
+  const officeHours = assertOptionalStringLength(coerceString(payload.officeHours), "officeHours", 120);
+  const source = assertOptionalStringLength(coerceString(payload.source), "source", 40) ?? "manual";
+  const importBatchId = assertOptionalStringLength(coerceString(payload.importBatchId), "importBatchId", 80);
+  const lastVerifiedAt = parseDateField(payload.lastVerifiedAt);
+  const sortOrder = normalizeSortOrder(payload.sortOrder);
+
+  ensureActorOfficeScope(actor, officeId);
+
+  const targetRef = id
+    ? db.collection("directory_entries").doc(id)
+    : db.collection("directory_entries").doc();
+
+  if (id) {
+    const existing = await targetRef.get();
+    if (!existing.exists) {
+      throw new functions.https.HttpsError("not-found", "Directory entry not found.");
+    }
+  }
+
+  const actorName = actorDisplayName(actor);
+  const actorEmail =
+    coerceString(actor.profileData.email) ??
+    coerceString(context.auth?.token.email) ??
+    null;
+  const now = admin.firestore.FieldValue.serverTimestamp();
+  const payloadData: Record<string, unknown> = {
+    officeId: officeId ?? null,
+    officeName,
+    contactName,
+    position,
+    phone,
+    email: email ?? null,
+    facebook: facebook ?? null,
+    address: address ?? null,
+    officeHours: officeHours ?? null,
+    source,
+    importBatchId: importBatchId ?? null,
+    status,
+    isPublic: status === "published",
+    sortOrder,
+    lastVerifiedAt,
+    lastVerifiedByUid: actor.uid,
+    lastVerifiedByName: actorName,
+    searchKeywords: buildDirectorySearchKeywords(
+      officeName,
+      contactName,
+      position,
+      phone,
+      email,
+      facebook,
+      address
+    ),
+    updatedAt: now,
+    updatedByUid: actor.uid,
+    updatedByName: actorName,
+    updatedByEmail: actorEmail,
+  };
+
+  if (status === "published") {
+    payloadData.publishedAt = now;
+    payloadData.publishedByUid = actor.uid;
+    payloadData.publishedByName = actorName;
+  }
+  if (status === "archived") {
+    payloadData.archivedAt = now;
+    payloadData.archivedByUid = actor.uid;
+    payloadData.archivedByName = actorName;
+    payloadData.isPublic = false;
+  }
+  if (!id) {
+    payloadData.createdAt = now;
+    payloadData.createdByUid = actor.uid;
+    payloadData.createdByName = actorName;
+    payloadData.createdByEmail = actorEmail;
+  }
+
+  await targetRef.set(payloadData, {merge: true});
+  await addAuditLog({
+    action: id ? "directory_entry_updated" : "directory_entry_created",
+    entityType: "directory_entries",
+    entityId: targetRef.id,
+    officeId: officeId ?? actor.officeId ?? null,
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorName,
+    actorEmail,
+    after: {
+      status,
+      officeId: officeId ?? null,
+      officeName,
+      contactName,
+    },
+  });
+
+  return {
+    success: true,
+    id: targetRef.id,
+    status,
+  };
+}
+
+export const adminSaveDirectoryEntry = onCallV2({region: REGION}, async (request) => {
+  try {
+    return await adminSaveDirectoryEntryHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+async function adminImportDirectoryEntriesHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const actor = await requireStaffContext(context);
+  await requireSystemWritable();
+  if (!isDirectoryManageRole(actor.role)) {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "Only admin or super_admin can import municipal directory entries."
+    );
+  }
+
+  const payload = (data && typeof data === "object")
+    ? (data as Record<string, unknown>)
+    : {};
+  const rows = Array.isArray(payload.rows) ? payload.rows : null;
+  if (!rows || rows.length === 0) {
+    throw new functions.https.HttpsError("invalid-argument", "rows is required.");
+  }
+  if (rows.length > 500) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "You can import up to 500 directory rows per batch."
+    );
+  }
+
+  const importBatchId =
+    assertOptionalStringLength(coerceString(payload.importBatchId), "importBatchId", 80) ??
+    `DIRIMP-${Date.now()}-${crypto.randomBytes(3).toString("hex").toUpperCase()}`;
+  const actorName = actorDisplayName(actor);
+  const actorEmail =
+    coerceString(actor.profileData.email) ??
+    coerceString(context.auth?.token.email) ??
+    null;
+
+  let batch = db.batch();
+  let batchSize = 0;
+  let createdCount = 0;
+
+  async function commitBatch() {
+    if (batchSize === 0) return;
+    await batch.commit();
+    batch = db.batch();
+    batchSize = 0;
+  }
+
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index];
+    if (!row || typeof row !== "object") {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        `Row ${index + 1} is not a valid object.`
+      );
+    }
+    const item = row as Record<string, unknown>;
+    const officeId = coerceString(item.officeId);
+    const officeName = assertStringLength(
+      coerceString(item.officeName),
+      `rows[${index}].officeName`,
+      1,
+      160
+    );
+    const contactName = assertStringLength(
+      coerceString(item.contactName),
+      `rows[${index}].contactName`,
+      1,
+      120
+    );
+    const position = assertStringLength(
+      coerceString(item.position),
+      `rows[${index}].position`,
+      1,
+      120
+    );
+    const phone = assertStringLength(
+      coerceString(item.phone),
+      `rows[${index}].phone`,
+      1,
+      80
+    );
+    const email = assertOptionalStringLength(coerceString(item.email), `rows[${index}].email`, 160);
+    const facebook = assertOptionalStringLength(coerceString(item.facebook), `rows[${index}].facebook`, 300);
+    const address = assertOptionalStringLength(coerceString(item.address), `rows[${index}].address`, 240);
+    const officeHours = assertOptionalStringLength(coerceString(item.officeHours), `rows[${index}].officeHours`, 120);
+    const sortOrder = normalizeSortOrder(item.sortOrder, index);
+
+    ensureActorOfficeScope(actor, officeId);
+
+    const ref = db.collection("directory_entries").doc();
+    batch.set(ref, {
+      officeId: officeId ?? null,
+      officeName,
+      contactName,
+      position,
+      phone,
+      email: email ?? null,
+      facebook: facebook ?? null,
+      address: address ?? null,
+      officeHours: officeHours ?? null,
+      source: "excel_import",
+      importBatchId,
+      status: "draft",
+      isPublic: false,
+      sortOrder,
+      searchKeywords: buildDirectorySearchKeywords(
+        officeName,
+        contactName,
+        position,
+        phone,
+        email,
+        facebook,
+        address
+      ),
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdByUid: actor.uid,
+      createdByName: actorName,
+      createdByEmail: actorEmail,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedByUid: actor.uid,
+      updatedByName: actorName,
+      updatedByEmail: actorEmail,
+    });
+    batchSize += 1;
+    createdCount += 1;
+
+    if (batchSize >= 400) {
+      await commitBatch();
+    }
+  }
+
+  await commitBatch();
+  await addAuditLog({
+    action: "directory_entries_imported",
+    entityType: "directory_entries",
+    entityId: importBatchId,
+    officeId: actor.officeId ?? null,
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorName,
+    actorEmail,
+    after: {
+      importBatchId,
+      createdCount,
+    },
+  });
+
+  return {
+    success: true,
+    importBatchId,
+    createdCount,
+  };
+}
+
+export const adminImportDirectoryEntries = onCallV2({region: REGION}, async (request) => {
+  try {
+    return await adminImportDirectoryEntriesHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+async function adminSaveEmergencyHotlineHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const actor = await requireStaffContext(context);
+  await requireSystemWritable();
+  if (!isEmergencyHotlinesManageRole(actor.role)) {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "Only super_admin can manage emergency hotline records."
+    );
+  }
+
+  const payload = (data && typeof data === "object")
+    ? (data as Record<string, unknown>)
+    : {};
+  const id = coerceString(payload.id);
+  const status = normalizeLifecycleStatus(payload.status, "draft");
+  const label = assertStringLength(coerceString(payload.label), "label", 1, 120);
+  const group = assertStringLength(coerceString(payload.group), "group", 1, 80);
+  const description = assertOptionalStringLength(coerceString(payload.description), "description", 240);
+  const officeId = coerceString(payload.officeId);
+  const availabilityLabel = assertOptionalStringLength(coerceString(payload.availabilityLabel), "availabilityLabel", 120);
+  const notes = assertOptionalStringLength(coerceString(payload.notes), "notes", 240);
+  const contactNumbers = parsePhoneList(payload.contactNumbers, {maxItems: 8, maxLen: 80});
+  if (contactNumbers.length === 0) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "At least one contact number is required."
+    );
+  }
+  const sortOrder = normalizeSortOrder(payload.sortOrder);
+  const lastVerifiedAt = parseDateField(payload.lastVerifiedAt);
+  const showOnHomepage = Boolean(payload.showOnHomepage);
+
+  const targetRef = id
+    ? db.collection("emergency_hotlines").doc(id)
+    : db.collection("emergency_hotlines").doc();
+
+  if (id) {
+    const existing = await targetRef.get();
+    if (!existing.exists) {
+      throw new functions.https.HttpsError("not-found", "Emergency hotline record not found.");
+    }
+  }
+
+  const actorName = actorDisplayName(actor);
+  const actorEmail =
+    coerceString(actor.profileData.email) ??
+    coerceString(context.auth?.token.email) ??
+    null;
+  const now = admin.firestore.FieldValue.serverTimestamp();
+  const payloadData: Record<string, unknown> = {
+    label,
+    group,
+    description: description ?? null,
+    officeId: officeId ?? null,
+    availabilityLabel: availabilityLabel ?? null,
+    notes: notes ?? null,
+    contactNumbers,
+    showOnHomepage,
+    status,
+    isPublic: status === "published",
+    sortOrder,
+    lastVerifiedAt,
+    lastVerifiedByUid: actor.uid,
+    lastVerifiedByName: actorName,
+    searchKeywords: buildEmergencyHotlineSearchKeywords(
+      label,
+      group,
+      description,
+      contactNumbers,
+      notes
+    ),
+    updatedAt: now,
+    updatedByUid: actor.uid,
+    updatedByName: actorName,
+    updatedByEmail: actorEmail,
+  };
+
+  if (status === "published") {
+    payloadData.publishedAt = now;
+    payloadData.publishedByUid = actor.uid;
+    payloadData.publishedByName = actorName;
+  }
+  if (status === "archived") {
+    payloadData.archivedAt = now;
+    payloadData.archivedByUid = actor.uid;
+    payloadData.archivedByName = actorName;
+    payloadData.isPublic = false;
+  }
+  if (!id) {
+    payloadData.createdAt = now;
+    payloadData.createdByUid = actor.uid;
+    payloadData.createdByName = actorName;
+    payloadData.createdByEmail = actorEmail;
+  }
+
+  await targetRef.set(payloadData, {merge: true});
+  await addAuditLog({
+    action: id ? "emergency_hotline_updated" : "emergency_hotline_created",
+    entityType: "emergency_hotlines",
+    entityId: targetRef.id,
+    officeId: officeId ?? null,
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorName,
+    actorEmail,
+    after: {
+      status,
+      label,
+      group,
+      showOnHomepage,
+    },
+  });
+
+  return {
+    success: true,
+    id: targetRef.id,
+    status,
+  };
+}
+
+export const adminSaveEmergencyHotline = onCallV2({region: REGION}, async (request) => {
+  try {
+    return await adminSaveEmergencyHotlineHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
 async function adminSetEntityStatusHandler(
   data: unknown,
   context: CallableContextLike
@@ -5099,10 +6148,33 @@ async function adminSetEntityStatusHandler(
     if (!sourceSnap.exists) {
       throw new functions.https.HttpsError("not-found", "Job posting not found.");
     }
+  } else if (entityType === "directory_entries") {
+    await requireSystemWritable();
+    targetRef = db.collection("directory_entries").doc(entityId);
+    const sourceSnap = await targetRef.get();
+    if (!sourceSnap.exists) {
+      throw new functions.https.HttpsError("not-found", "Directory entry not found.");
+    }
+  } else if (entityType === "emergency_hotlines") {
+    await requireSystemWritable();
+    if (!isEmergencyHotlinesManageRole(actor.role)) {
+      throw new functions.https.HttpsError(
+        "permission-denied",
+        "Only super_admin can publish or archive emergency hotline records."
+      );
+    }
+    targetRef = db.collection("emergency_hotlines").doc(entityId);
+    const sourceSnap = await targetRef.get();
+    if (!sourceSnap.exists) {
+      throw new functions.https.HttpsError("not-found", "Emergency hotline record not found.");
+    }
   } else {
     throw new functions.https.HttpsError("invalid-argument", "Unsupported entity type.");
   }
 
+  if (entityType === "directory_entries" || entityType === "emergency_hotlines") {
+    basePatch.isPublic = status === "published";
+  }
   await targetRef.set(basePatch, {merge: true});
   await addAuditLog({
     action: `${auditEntityType}_${status}`,
@@ -5156,6 +6228,7 @@ async function adminUpdateReportStatusHandler(
   const reportRef = db.collection("reports").doc(reportId);
   const actorMeta = reportActorMeta(actor, context);
   let previousStatus = "submitted";
+  let timelineNote = "";
 
   await db.runTransaction(async (tx) => {
     const snap = await tx.get(reportRef);
@@ -5183,6 +6256,16 @@ async function adminUpdateReportStatusHandler(
       throw new functions.https.HttpsError(
         "failed-precondition",
         `Invalid status transition from ${previousStatus} to ${nextStatus}.`
+      );
+    }
+    if (
+      previousStatus !== nextStatus &&
+      statusRequiresResidentNote(nextStatus) &&
+      !notes
+    ) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        `A resident-visible note is required when marking feedback as ${nextStatus}.`
       );
     }
 
@@ -5222,14 +6305,26 @@ async function adminUpdateReportStatusHandler(
     message: `Status changed from ${previousStatus} to ${nextStatus}.`,
   });
 
+  timelineNote =
+    notes ||
+    `Status changed from ${prettyStatus(previousStatus)} to ${prettyStatus(nextStatus)}.`;
   const latestTimelineEvent = await addReportTimeline(reportId, {
     type: "STATUS_CHANGED",
     actorUid: actor.uid,
     actorRole: actor.role,
     actorName: actorMeta.lastActionByName,
-    notes: notes ?? null,
+    notes: timelineNote,
     fromStatus: previousStatus,
     toStatus: nextStatus,
+  });
+  const updatedReportSnapshot = await reportRef.get();
+  await sendFeedbackEmailNotification({
+    id: reportId,
+    ...(updatedReportSnapshot.data() ?? {}),
+  }, {
+    status: nextStatus,
+    note: timelineNote,
+    updatedAt: latestTimelineEvent.createdAt,
   });
 
   return {
@@ -5240,13 +6335,16 @@ async function adminUpdateReportStatusHandler(
   };
 }
 
-export const adminUpdateReportStatus = onCallV2({region: REGION}, async (request) => {
-  try {
-    return await adminUpdateReportStatusHandler(request.data, toCallableContextFromV2(request));
-  } catch (error) {
-    throw normalizeCallableErrorForV2(error);
+export const adminUpdateReportStatus = onCallV2(
+  {region: REGION, secrets: FEEDBACK_EMAIL_FUNCTION_SECRETS},
+  async (request) => {
+    try {
+      return await adminUpdateReportStatusHandler(request.data, toCallableContextFromV2(request));
+    } catch (error) {
+      throw normalizeCallableErrorForV2(error);
+    }
   }
-});
+);
 
 async function staffClaimReportHandler(
   data: unknown,
@@ -5338,6 +6436,17 @@ async function staffClaimReportHandler(
     fromStatus: previousStatus,
     toStatus: claimedStatus,
   });
+  if (claimedStatus !== previousStatus) {
+    const updatedReportSnapshot = await reportRef.get();
+    await sendFeedbackEmailNotification({
+      id: reportId,
+      ...(updatedReportSnapshot.data() ?? {}),
+    }, {
+      status: claimedStatus,
+      note: latestTimelineEvent.notes,
+      updatedAt: latestTimelineEvent.createdAt,
+    });
+  }
 
   return {
     success: true,
@@ -5349,13 +6458,16 @@ async function staffClaimReportHandler(
   };
 }
 
-export const staffClaimReport = onCallV2({region: REGION}, async (request) => {
-  try {
-    return await staffClaimReportHandler(request.data, toCallableContextFromV2(request));
-  } catch (error) {
-    throw normalizeCallableErrorForV2(error);
+export const staffClaimReport = onCallV2(
+  {region: REGION, secrets: FEEDBACK_EMAIL_FUNCTION_SECRETS},
+  async (request) => {
+    try {
+      return await staffClaimReportHandler(request.data, toCallableContextFromV2(request));
+    } catch (error) {
+      throw normalizeCallableErrorForV2(error);
+    }
   }
-});
+);
 
 async function adminAssignReportHandler(
   data: unknown,
@@ -5376,6 +6488,15 @@ async function adminAssignReportHandler(
     throw new functions.https.HttpsError("invalid-argument", "reportId is required.");
   }
   const assigneeUid = coerceString(payload.assigneeUid);
+  const requestedStatusRaw = coerceString(payload.status);
+  const requestedStatus = requestedStatusRaw ? normalizeReportStatusInput(requestedStatusRaw) : null;
+  const notes = coerceString(payload.notes);
+  if (notes && notes.length > 1000) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "notes must be 1000 characters or fewer."
+    );
+  }
   const reportRef = db.collection("reports").doc(reportId);
   const actorMeta = reportActorMeta(actor, context);
 
@@ -5384,6 +6505,8 @@ async function adminAssignReportHandler(
   let afterStatus = "submitted";
   let assignedToName: string | null = null;
   let assignedOfficeId: string | null = null;
+  let timelineNote = "";
+  let actionMessage = "";
 
   if (assigneeUid) {
     const targetProfile = await getUserProfile(assigneeUid);
@@ -5425,7 +6548,34 @@ async function adminAssignReportHandler(
     const shouldAutoAssignStatus = Boolean(assigneeUid) &&
       (beforeStatus === "submitted" || beforeStatus === "acknowledged" || beforeStatus === "in_review");
     const shouldReturnToQueue = !assigneeUid && beforeStatus === "assigned";
-    afterStatus = shouldAutoAssignStatus ? "assigned" : (shouldReturnToQueue ? "in_review" : beforeStatus);
+    const defaultStatus = shouldAutoAssignStatus ? "assigned" : (shouldReturnToQueue ? "in_review" : beforeStatus);
+    afterStatus = requestedStatus ?? defaultStatus;
+    if (!canTransitionReportStatus(beforeStatus, afterStatus)) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        `Invalid status transition from ${beforeStatus} to ${afterStatus}.`
+      );
+    }
+    if (
+      beforeStatus !== afterStatus &&
+      statusRequiresResidentNote(afterStatus) &&
+      !notes
+    ) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        `A resident-visible note is required when marking feedback as ${afterStatus}.`
+      );
+    }
+    actionMessage =
+      buildReportWorkflowSummary({
+        beforeStatus,
+        afterStatus,
+        beforeAssignedUid,
+        afterAssignedUid: assigneeUid ?? null,
+        assignedToName,
+      }) ||
+      (assigneeUid ? `Assigned to ${assignedToName}.` : "Removed assignee and returned to queue.");
+    timelineNote = notes || actionMessage;
 
     tx.set(
       reportRef,
@@ -5439,18 +6589,16 @@ async function adminAssignReportHandler(
       },
       {merge: true}
     );
-    const statusMessage = afterStatus !== beforeStatus
-      ? ` Status changed from ${beforeStatus} to ${afterStatus}.`
-      : "";
     tx.set(reportRef.collection("history").doc(), {
-      type: assigneeUid ? "assigned" : "unassigned",
+      type:
+        (beforeAssignedUid !== (assigneeUid ?? null) && afterStatus !== beforeStatus)
+          ? "workflow_updated"
+          : (assigneeUid ? "assigned" : "unassigned"),
       assignedToUid: assigneeUid ?? null,
       assignedToName: assigneeUid ? assignedToName : null,
       fromStatus: beforeStatus,
       toStatus: afterStatus,
-      message: assigneeUid
-        ? `Report assigned to ${assignedToName}.${statusMessage}`
-        : `Report unassigned.${statusMessage}`,
+      message: actionMessage,
       byUid: actor.uid,
       byName: actorMeta.lastActionByName,
       byRole: actor.role,
@@ -5459,7 +6607,10 @@ async function adminAssignReportHandler(
   });
 
   await addAuditLog({
-    action: assigneeUid ? "report_assigned" : "report_unassigned",
+    action:
+      (beforeAssignedUid !== (assigneeUid ?? null) && afterStatus !== beforeStatus)
+        ? "report_workflow_updated"
+        : (assigneeUid ? "report_assigned" : "report_unassigned"),
     entityType: "report",
     entityId: reportId,
     reportId,
@@ -5470,22 +6621,32 @@ async function adminAssignReportHandler(
     actorName: actorMeta.lastActionByName,
     before: {assignedToUid: beforeAssignedUid, status: beforeStatus},
     after: {assignedToUid: assigneeUid ?? null, status: afterStatus},
-    message: assigneeUid
-      ? `Assigned to ${assignedToName}.`
-      : "Report unassigned.",
+    message: actionMessage,
   });
 
   const latestTimelineEvent = await addReportTimeline(reportId, {
-    type: assigneeUid ? (beforeAssignedUid ? "REASSIGNED" : "ASSIGNED") : "UNASSIGNED",
+    type:
+      (beforeAssignedUid !== (assigneeUid ?? null) && afterStatus !== beforeStatus)
+        ? "WORKFLOW_UPDATED"
+        : (assigneeUid ? (beforeAssignedUid ? "REASSIGNED" : "ASSIGNED") : "UNASSIGNED"),
     actorUid: actor.uid,
     actorRole: actor.role,
     actorName: actorMeta.lastActionByName,
-    notes: assigneeUid
-      ? `Assigned to ${assignedToName}.`
-      : "Removed assignee and returned to queue.",
+    notes: timelineNote,
     fromStatus: beforeStatus,
     toStatus: afterStatus,
   });
+  if (afterStatus !== beforeStatus) {
+    const updatedReportSnapshot = await reportRef.get();
+    await sendFeedbackEmailNotification({
+      id: reportId,
+      ...(updatedReportSnapshot.data() ?? {}),
+    }, {
+      status: afterStatus,
+      note: latestTimelineEvent.notes,
+      updatedAt: latestTimelineEvent.createdAt,
+    });
+  }
 
   return {
     success: true,
@@ -5497,13 +6658,16 @@ async function adminAssignReportHandler(
   };
 }
 
-export const adminAssignReport = onCallV2({region: REGION}, async (request) => {
-  try {
-    return await adminAssignReportHandler(request.data, toCallableContextFromV2(request));
-  } catch (error) {
-    throw normalizeCallableErrorForV2(error);
+export const adminAssignReport = onCallV2(
+  {region: REGION, secrets: FEEDBACK_EMAIL_FUNCTION_SECRETS},
+  async (request) => {
+    try {
+      return await adminAssignReportHandler(request.data, toCallableContextFromV2(request));
+    } catch (error) {
+      throw normalizeCallableErrorForV2(error);
+    }
   }
-});
+);
 
 async function adminClaimNextReportHandler(
   data: unknown,
@@ -5635,6 +6799,15 @@ async function adminClaimNextReportHandler(
         fromStatus: claimResult.beforeStatus,
         toStatus: "assigned",
       });
+      const updatedReportSnapshot = await db.collection("reports").doc(claimResult.reportId).get();
+      await sendFeedbackEmailNotification({
+        id: claimResult.reportId,
+        ...(updatedReportSnapshot.data() ?? {}),
+      }, {
+        status: "assigned",
+        note: latestTimelineEvent.notes,
+        updatedAt: latestTimelineEvent.createdAt,
+      });
 
       return {
         success: true,
@@ -5650,13 +6823,16 @@ async function adminClaimNextReportHandler(
   throw new functions.https.HttpsError("not-found", "No available reports in queue.");
 }
 
-export const adminClaimNextReport = onCallV2({region: REGION}, async (request) => {
-  try {
-    return await adminClaimNextReportHandler(request.data, toCallableContextFromV2(request));
-  } catch (error) {
-    throw normalizeCallableErrorForV2(error);
+export const adminClaimNextReport = onCallV2(
+  {region: REGION, secrets: FEEDBACK_EMAIL_FUNCTION_SECRETS},
+  async (request) => {
+    try {
+      return await adminClaimNextReportHandler(request.data, toCallableContextFromV2(request));
+    } catch (error) {
+      throw normalizeCallableErrorForV2(error);
+    }
   }
-});
+);
 
 async function adminRequeueReportHandler(
   data: unknown,
@@ -5769,6 +6945,17 @@ async function adminRequeueReportHandler(
     fromStatus: result.previousStatus,
     toStatus: result.nextStatus,
   });
+  if (result.nextStatus !== result.previousStatus) {
+    const updatedReportSnapshot = await reportRef.get();
+    await sendFeedbackEmailNotification({
+      id: result.reportId,
+      ...(updatedReportSnapshot.data() ?? {}),
+    }, {
+      status: result.nextStatus,
+      note: latestTimelineEvent.notes,
+      updatedAt: latestTimelineEvent.createdAt,
+    });
+  }
 
   return {
     success: true,
@@ -5779,13 +6966,16 @@ async function adminRequeueReportHandler(
   };
 }
 
-export const adminRequeueReport = onCallV2({region: REGION}, async (request) => {
-  try {
-    return await adminRequeueReportHandler(request.data, toCallableContextFromV2(request));
-  } catch (error) {
-    throw normalizeCallableErrorForV2(error);
+export const adminRequeueReport = onCallV2(
+  {region: REGION, secrets: FEEDBACK_EMAIL_FUNCTION_SECRETS},
+  async (request) => {
+    try {
+      return await adminRequeueReportHandler(request.data, toCallableContextFromV2(request));
+    } catch (error) {
+      throw normalizeCallableErrorForV2(error);
+    }
   }
-});
+);
 
 function normalizePublicIssuePayload(
   payload: Record<string, unknown>
@@ -6238,9 +7428,14 @@ async function handleSubmitPublicFeedbackHttpRequest(
     });
 
     const ticketSnap = await db.collection("reports").doc(reportId).get();
-    const publicTicket = sanitizePublicReportTicket({
+    const ticketRow = {
       id: reportId,
       ...(ticketSnap.data() ?? {}),
+    };
+    const publicTicket = sanitizePublicReportTicket(ticketRow);
+    await sendFeedbackEmailNotification(ticketRow, {
+      status: "submitted",
+      updatedAt: now.toISOString(),
     });
 
     res.status(200).json({
@@ -6267,7 +7462,7 @@ async function handleSubmitPublicFeedbackHttpRequest(
 }
 
 export const submitPublicFeedback = onRequestV2(
-  {region: REGION},
+  {region: REGION, secrets: FEEDBACK_EMAIL_FUNCTION_SECRETS},
   handleSubmitPublicFeedbackHttpRequest
 );
 
@@ -7127,7 +8322,15 @@ export const opsRuntimeHealth = functions.https.onCall(async (data, context) => 
     "dtsUpdateStatus",
     "setTrackingPin",
     "dtsTrackByTrackingNo",
+    "dtsTrackByQrAndPin",
     "dtsTrackByToken",
+    "dtsSaveTrackedDocument",
+    "dtsOpenSavedDocument",
+    "dtsUnsaveTrackedDocument",
+    "dtsListMyDocuments",
+    "dtsListQrBatches",
+    "generateDtsQrCodes",
+    "dtsResolveQrForStaff",
     "exportDtsQrZip",
   ];
   return {
@@ -8038,6 +9241,7 @@ export const onReportNotify = functions.firestore
     const actorEmail = (after.lastActionByEmail ?? "") as string;
     const actorName = (after.lastActionByName ?? "") as string;
     const actorRole = (after.lastActionByRole ?? "") as string;
+    const workflowArtifactsHandledByCaller = Boolean(actorUid || actorName || actorRole);
     const reportOfficeId = coerceString(after.officeId ?? before.officeId);
 
     const beforeStatus = (before.status ?? "submitted") as string;
@@ -8080,37 +9284,39 @@ export const onReportNotify = functions.firestore
         )
         : "Report unassigned.";
 
-      await addHistory(reportId, {
-        type: "assignment_changed",
-        fromAssignedUid: beforeAssigned ?? null,
-        toAssignedUid: afterAssigned ?? null,
-        status: afterStatus,
-        message: assignmentMessage,
-      });
-      await addReportTimeline(reportId, {
-        type: assignmentTimelineType,
-        actorUid: actorUid || null,
-        actorRole: actorRole || null,
-        notes: assignmentMessage,
-        fromStatus: beforeStatus,
-        toStatus: afterStatus,
-      });
+      if (!workflowArtifactsHandledByCaller) {
+        await addHistory(reportId, {
+          type: "assignment_changed",
+          fromAssignedUid: beforeAssigned ?? null,
+          toAssignedUid: afterAssigned ?? null,
+          status: afterStatus,
+          message: assignmentMessage,
+        });
+        await addReportTimeline(reportId, {
+          type: assignmentTimelineType,
+          actorUid: actorUid || null,
+          actorRole: actorRole || null,
+          notes: assignmentMessage,
+          fromStatus: beforeStatus,
+          toStatus: afterStatus,
+        });
 
-      await addAuditLog({
-        action: "assignment_changed",
-        reportId,
-        reportTitle: title,
-        reportCategory: category,
-        status: afterStatus,
-        fromAssignedUid: beforeAssigned ?? null,
-        toAssignedUid: afterAssigned ?? null,
-        officeId: reportOfficeId ?? null,
-        actorUid: actorUid || null,
-        actorEmail: actorEmail || null,
-        actorName: actorName || null,
-        actorRole: actorRole || null,
-        message: assignmentMessage,
-      });
+        await addAuditLog({
+          action: "assignment_changed",
+          reportId,
+          reportTitle: title,
+          reportCategory: category,
+          status: afterStatus,
+          fromAssignedUid: beforeAssigned ?? null,
+          toAssignedUid: afterAssigned ?? null,
+          officeId: reportOfficeId ?? null,
+          actorUid: actorUid || null,
+          actorEmail: actorEmail || null,
+          actorName: actorName || null,
+          actorRole: actorRole || null,
+          message: assignmentMessage,
+        });
+      }
     }
 
     if (createdByUid && (statusChanged || assignedChanged)) {
@@ -8129,77 +9335,81 @@ export const onReportNotify = functions.firestore
     }
 
     if (statusChanged) {
-      await addHistory(reportId, {
-        type: "status_changed",
-        fromStatus: beforeStatus,
-        toStatus: afterStatus,
-        assignedToUid: afterAssigned ?? null,
-        message: `Status changed from ${prettyStatus(beforeStatus)} to ${prettyStatus(
-          afterStatus
-        )}.`,
-      });
-      await addReportTimeline(reportId, {
-        type: "STATUS_CHANGED",
-        actorUid: actorUid || null,
-        actorRole: actorRole || null,
-        notes: `Status changed from ${prettyStatus(beforeStatus)} to ${prettyStatus(
-          afterStatus
-        )}.`,
-        fromStatus: beforeStatus,
-        toStatus: afterStatus,
-      });
+      if (!workflowArtifactsHandledByCaller) {
+        await addHistory(reportId, {
+          type: "status_changed",
+          fromStatus: beforeStatus,
+          toStatus: afterStatus,
+          assignedToUid: afterAssigned ?? null,
+          message: `Status changed from ${prettyStatus(beforeStatus)} to ${prettyStatus(
+            afterStatus
+          )}.`,
+        });
+        await addReportTimeline(reportId, {
+          type: "STATUS_CHANGED",
+          actorUid: actorUid || null,
+          actorRole: actorRole || null,
+          notes: `Status changed from ${prettyStatus(beforeStatus)} to ${prettyStatus(
+            afterStatus
+          )}.`,
+          fromStatus: beforeStatus,
+          toStatus: afterStatus,
+        });
 
-      await addAuditLog({
-        action: "status_changed",
-        reportId,
-        reportTitle: title,
-        reportCategory: category,
-        fromStatus: beforeStatus,
-        toStatus: afterStatus,
-        status: afterStatus,
-        assignedToUid: afterAssigned ?? null,
-        officeId: reportOfficeId ?? null,
-        actorUid: actorUid || null,
-        actorEmail: actorEmail || null,
-        actorName: actorName || null,
-        actorRole: actorRole || null,
-        message: `Status changed from ${prettyStatus(beforeStatus)} to ${prettyStatus(
-          afterStatus
-        )}.`,
-      });
+        await addAuditLog({
+          action: "status_changed",
+          reportId,
+          reportTitle: title,
+          reportCategory: category,
+          fromStatus: beforeStatus,
+          toStatus: afterStatus,
+          status: afterStatus,
+          assignedToUid: afterAssigned ?? null,
+          officeId: reportOfficeId ?? null,
+          actorUid: actorUid || null,
+          actorEmail: actorEmail || null,
+          actorName: actorName || null,
+          actorRole: actorRole || null,
+          message: `Status changed from ${prettyStatus(beforeStatus)} to ${prettyStatus(
+            afterStatus
+          )}.`,
+        });
+      }
     }
 
     if (archivedChanged) {
       const msg = afterArchived ? "Report archived." : "Report restored.";
-      await addHistory(reportId, {
-        type: afterArchived ? "archived" : "restored",
-        status: afterStatus,
-        assignedToUid: afterAssigned ?? null,
-        message: msg,
-      });
-      await addReportTimeline(reportId, {
-        type: afterArchived ? "ARCHIVED" : "RESTORED",
-        actorUid: actorUid || null,
-        actorRole: actorRole || null,
-        notes: msg,
-        fromStatus: beforeStatus,
-        toStatus: afterStatus,
-      });
+      if (!workflowArtifactsHandledByCaller) {
+        await addHistory(reportId, {
+          type: afterArchived ? "archived" : "restored",
+          status: afterStatus,
+          assignedToUid: afterAssigned ?? null,
+          message: msg,
+        });
+        await addReportTimeline(reportId, {
+          type: afterArchived ? "ARCHIVED" : "RESTORED",
+          actorUid: actorUid || null,
+          actorRole: actorRole || null,
+          notes: msg,
+          fromStatus: beforeStatus,
+          toStatus: afterStatus,
+        });
 
-      await addAuditLog({
-        action: afterArchived ? "report_archived" : "report_restored",
-        reportId,
-        reportTitle: title,
-        reportCategory: category,
-        status: afterStatus,
-        assignedToUid: afterAssigned ?? null,
-        officeId: reportOfficeId ?? null,
-        actorUid: actorUid || null,
-        actorEmail: actorEmail || null,
-        actorName: actorName || null,
-        actorRole: actorRole || null,
-        message: msg,
-      });
+        await addAuditLog({
+          action: afterArchived ? "report_archived" : "report_restored",
+          reportId,
+          reportTitle: title,
+          reportCategory: category,
+          status: afterStatus,
+          assignedToUid: afterAssigned ?? null,
+          officeId: reportOfficeId ?? null,
+          actorUid: actorUid || null,
+          actorEmail: actorEmail || null,
+          actorName: actorName || null,
+          actorRole: actorRole || null,
+          message: msg,
+        });
+      }
     }
   });
 
@@ -8693,26 +9903,19 @@ async function dtsCreateTrackingRecordHandler(
     : {};
   const actor = await requireStaffContext(context);
   await requireFeatureWritable("documentTracking");
-  const trackingNo = coerceString(payload.trackingNo) ?? coerceString(payload.trackingNumber);
-  const pin = coerceString(payload.pin);
+  const {trackingNo, pin} = validateTrackingLookupInput(
+    payload.trackingNo ?? payload.trackingNumber,
+    payload.pin
+  );
   const title = coerceString(payload.title) ?? "";
+  const description = coerceString(payload.description) ?? "";
   const docType = coerceString(payload.docType) ?? "GENERAL";
   const requestedOfficeId = coerceString(payload.officeId);
   const requestedOfficeName = coerceString(payload.officeName);
+  const intendedOfficeId = coerceString(payload.intendedOfficeId);
+  const intendedOfficeName = coerceString(payload.intendedOfficeName);
+  const intakeNote = coerceString(payload.intakeNote) ?? "";
   const requestedQrCode = coerceString(payload.qrCode);
-
-  if (!trackingNo || !pin) {
-    throw new functions.https.HttpsError(
-      "invalid-argument",
-      "trackingNo/trackingNumber and pin are required."
-    );
-  }
-  if (pin.length < 4) {
-    throw new functions.https.HttpsError(
-      "invalid-argument",
-      "PIN must be at least 4 characters."
-    );
-  }
 
   const officeId =
     actor.role === "super_admin"
@@ -8748,45 +9951,52 @@ async function dtsCreateTrackingRecordHandler(
   const qrRef = requestedQrCode
     ? db.collection("dts_qr_codes").doc(requestedQrCode)
     : null;
+  let resolvedQrCode: string | null = null;
+  let resolvedBatchId: string | null = null;
 
   await db.runTransaction(async (tx) => {
-    let resolvedQrCode: string | null = requestedQrCode;
+    let qrRow: Record<string, unknown> | null = null;
     if (qrRef) {
       const qrSnap = await tx.get(qrRef);
-      if (!qrSnap.exists || coerceString(qrSnap.data()?.status) !== "unused") {
+      if (!qrSnap.exists) {
+        throw new functions.https.HttpsError(
+          "not-found",
+          "Requested QR code does not exist."
+        );
+      }
+      qrRow = qrSnap.data() ?? {};
+      if (coerceString(qrRow.status) !== "unused") {
         throw new functions.https.HttpsError(
           "failed-precondition",
           "Requested QR code is not available."
         );
       }
-    } else {
-      const qrCandidates = await tx.get(
-        db.collection("dts_qr_codes").where("status", "==", "unused").limit(1)
-      );
-      if (!qrCandidates.empty) {
-        resolvedQrCode = qrCandidates.docs[0].id;
-      }
+      resolvedQrCode = requestedQrCode;
+      resolvedBatchId = coerceString(qrRow.batchId);
     }
 
     tx.set(docRef, {
       qrCode: resolvedQrCode ?? null,
       trackingNo,
       title,
+      description,
       docType,
       status: "RECEIVED",
       currentOfficeId: officeId,
       currentOfficeName: officeName,
       currentCustodianUid: actor.uid,
+      intendedOfficeId: intendedOfficeId ?? null,
+      intendedOfficeName: intendedOfficeName ?? null,
       pendingTransfer: null,
       pinHash,
       publicPinHash: pinHash,
       pinHashAlgo: "bcrypt",
-      publicPinSalt: admin.firestore.FieldValue.delete(),
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       createdByUid: actor.uid,
       createdByName: actorName,
-      submittedByUid: actor.uid,
+      submittedByUid: null,
+      saveToResidentAccount: false,
     });
 
     tx.set(docRef.collection("timeline").doc(), {
@@ -8801,6 +10011,19 @@ async function dtsCreateTrackingRecordHandler(
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
+    if (intakeNote) {
+      tx.set(docRef.collection("timeline").doc(), {
+        type: "NOTE",
+        byUid: actor.uid,
+        byName: actorName,
+        status: "RECEIVED",
+        notePublic: null,
+        notes: intakeNote,
+        officeName,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }
+
     if (resolvedQrCode) {
       tx.set(db.collection("dts_qr_index").doc(resolvedQrCode), {
         docId: docRef.id,
@@ -8813,9 +10036,21 @@ async function dtsCreateTrackingRecordHandler(
           status: "used",
           docId: docRef.id,
           usedAt: admin.firestore.FieldValue.serverTimestamp(),
+          usedByUid: actor.uid,
         },
         {merge: true}
       );
+      if (resolvedBatchId) {
+        tx.set(
+          db.collection("dts_qr_batches").doc(resolvedBatchId),
+          {
+            unusedCount: admin.firestore.FieldValue.increment(-1),
+            usedCount: admin.firestore.FieldValue.increment(1),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          {merge: true}
+        );
+      }
     }
   });
 
@@ -8834,7 +10069,13 @@ async function dtsCreateTrackingRecordHandler(
     message: "Tracking record created.",
   });
 
-  return {success: true, id: docRef.id, trackingNo};
+  return {
+    success: true,
+    id: docRef.id,
+    trackingNo,
+    pin,
+    qrCode: resolvedQrCode,
+  };
 }
 
 export const dtsCreateTrackingRecord = onCallV2({region: REGION}, async (request) => {
@@ -8844,6 +10085,82 @@ export const dtsCreateTrackingRecord = onCallV2({region: REGION}, async (request
     throw normalizeCallableErrorForV2(error);
   }
 });
+
+export const dtsResolveQrForStaff = functions.https.onCall(
+  async (data, context) => {
+    const actor = await requireStaffContext(context);
+    await requireFeatureWritable("documentTracking");
+    const qrCode = coerceString(data?.qrCode);
+    if (!qrCode) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "qrCode is required."
+      );
+    }
+
+    const qrSnap = await db.collection("dts_qr_codes").doc(qrCode).get();
+    if (!qrSnap.exists) {
+      throw new functions.https.HttpsError("not-found", "QR code not found.");
+    }
+
+    const qrRow = qrSnap.data() ?? {};
+    const status = coerceString(qrRow.status) ?? "unused";
+    if (status === "voided") {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "This QR code has been voided."
+      );
+    }
+    if (status === "reserved") {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "This QR code is currently reserved."
+      );
+    }
+    if (status !== "used") {
+      return {
+        qrCode,
+        status: "unused",
+        batchId: coerceString(qrRow.batchId),
+        imagePath: coerceString(qrRow.imagePath),
+      };
+    }
+
+    const qrIndexSnap = await db.collection("dts_qr_index").doc(qrCode).get();
+    const docId = coerceString(qrRow.docId) ?? coerceString(qrIndexSnap.data()?.docId);
+    if (!docId) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "This QR code is marked used but no document is linked to it."
+      );
+    }
+
+    const docSnap = await db.collection("dts_documents").doc(docId).get();
+    if (!docSnap.exists) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "The linked document could not be found."
+      );
+    }
+    const docRow = docSnap.data() ?? {};
+    if (actor.role !== "super_admin" && !canOperateOnDtsDoc(actor, docRow)) {
+      throw new functions.https.HttpsError(
+        "permission-denied",
+        "You cannot access this document."
+      );
+    }
+
+    return {
+      qrCode,
+      status: "used",
+      docId,
+      trackingNo: coerceString(docRow.trackingNo) ?? "",
+      title: coerceString(docRow.title) ?? "",
+      currentOfficeId: coerceString(docRow.currentOfficeId),
+      currentOfficeName: coerceString(docRow.currentOfficeName),
+    };
+  }
+);
 
 export const dtsInitiateTransfer = functions.https.onCall(
   async (data, context) => {
@@ -8932,6 +10249,10 @@ export const dtsInitiateTransfer = functions.https.onCall(
         byName: actorName,
         fromOfficeId,
         toOfficeId,
+        toOfficeName: toOfficeName ?? null,
+        notePublic: toOfficeName
+          ? `Document transferred to ${toOfficeName}.`
+          : "Document transferred to the next office.",
         notes: toOfficeName
           ? `Transfer initiated to ${toOfficeName}.`
           : "Transfer initiated.",
@@ -9025,6 +10346,7 @@ export const dtsCancelTransfer = functions.https.onCall(
         byName: actorName,
         fromOfficeId: coerceString(pending.fromOfficeId),
         toOfficeId: coerceString(pending.toOfficeId),
+        notePublic: "Transfer cancelled. Document returned to the source office.",
         notes: "Transfer cancelled while in transit.",
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
@@ -9106,6 +10428,7 @@ export const dtsRejectTransfer = functions.https.onCall(
         byName: actorName,
         fromOfficeId: coerceString(pending.toOfficeId),
         toOfficeId: coerceString(pending.fromOfficeId),
+        notePublic: "Receiving office rejected the transfer. Document returned to the source office.",
         notes: `Transfer rejected: ${reason}`,
         attachments,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -9192,6 +10515,8 @@ export const dtsConfirmReceipt = functions.https.onCall(
         byUid: actor.uid,
         byName: actorName,
         toOfficeId,
+        toOfficeName,
+        notePublic: `Document received by ${toOfficeName}.`,
         notes: `Transfer confirmed by ${actorName}.`,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
@@ -9264,6 +10589,7 @@ export const dtsUpdateStatus = functions.https.onCall(
         byUid: actor.uid,
         byName: actorName,
         status,
+        notePublic: `Status updated to ${prettyDtsStatus(status)}.`,
         notes: `Status updated to ${prettyDtsStatus(status)} by ${actorName}.`,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
@@ -9562,7 +10888,7 @@ async function lookupDtsByTrackingNo(
     .get();
 
   if (snap.empty) {
-    throw new functions.https.HttpsError("not-found", "Document not found.");
+    throw invalidTrackingCredentialsError();
   }
 
   const doc = snap.docs[0];
@@ -9673,16 +10999,16 @@ export const dtsTrackByQrAndPin = functions.https.onCall(
 
     const qrSnap = await db.collection("dts_qr_index").doc(qrCode).get();
     if (!qrSnap.exists) {
-      throw new functions.https.HttpsError("not-found", "Document not found.");
+      throw invalidTrackingCredentialsError();
     }
     const docId = coerceString(qrSnap.data()?.docId);
     if (!docId) {
-      throw new functions.https.HttpsError("not-found", "Document not found.");
+      throw invalidTrackingCredentialsError();
     }
 
     const docSnap = await db.collection("dts_documents").doc(docId).get();
     if (!docSnap.exists) {
-      throw new functions.https.HttpsError("not-found", "Document not found.");
+      throw invalidTrackingCredentialsError();
     }
     const row = docSnap.data() ?? {};
     const trackingNo = coerceString(row.trackingNo);
@@ -9826,11 +11152,19 @@ export const dtsSaveTrackedDocument = functions.https.onCall(
     }
 
     const existingOwner = coerceString(dataRow.submittedByUid);
+    const createdByUid = coerceString(dataRow.createdByUid);
+    let allowResidentRelink = false;
     if (existingOwner && existingOwner !== context.auth.uid) {
-      throw new functions.https.HttpsError(
-        "failed-precondition",
-        "This document is already linked to another account."
-      );
+      if (dataRow.saveToResidentAccount !== true && createdByUid && existingOwner === createdByUid) {
+        const ownerProfile = await getUserProfile(existingOwner);
+        allowResidentRelink = isStaffRole(ownerProfile.role);
+      }
+      if (!allowResidentRelink) {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          "This document is already linked to another account."
+        );
+      }
     }
 
     await docRef.set(
@@ -9853,6 +11187,93 @@ export const dtsSaveTrackedDocument = functions.https.onCall(
       saved: true,
       docId: docRef.id,
       trackingNo,
+    };
+  }
+);
+
+/**
+ * =========================
+ * DTS LIST MY DOCUMENTS
+ * =========================
+ * Returns resident-safe summaries for account-linked DTS records.
+ */
+export const dtsListMyDocuments = functions.https.onCall(
+  async (_data, context) => {
+    await requireFeatureEnabled("documentTracking");
+    if (!context.auth) {
+      throw new functions.https.HttpsError("unauthenticated", "Auth required.");
+    }
+
+    const snap = await db
+      .collection("dts_documents")
+      .where("submittedByUid", "==", context.auth.uid)
+      .limit(100)
+      .get();
+
+    const normalizedDocuments = snap.docs
+      .map((doc) => {
+        const row = doc.data() ?? {};
+        if (row.saveToResidentAccount != true) {
+          return null;
+        }
+        return {
+          sortTs: dtsSavedDocumentSortTimestamp(row),
+          payload: buildSanitizedSavedDocumentSummary(doc.id, row),
+        };
+      })
+      .filter((item): item is {sortTs: number; payload: Record<string, unknown>} => item != null);
+
+    normalizedDocuments.sort((left, right) => right.sortTs - left.sortTs);
+
+    return {
+      documents: normalizedDocuments.map((item) => item.payload),
+    };
+  }
+);
+
+/**
+ * =========================
+ * DTS OPEN SAVED DOC
+ * =========================
+ * Reopens a resident-linked DTS record without re-entering the PIN.
+ */
+export const dtsOpenSavedDocument = functions.https.onCall(
+  async (data, context) => {
+    await requireFeatureEnabled("documentTracking");
+    if (!context.auth) {
+      throw new functions.https.HttpsError("unauthenticated", "Auth required.");
+    }
+
+    const docId = coerceString(data?.docId);
+    if (!docId) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "docId is required."
+      );
+    }
+
+    const docRef = db.collection("dts_documents").doc(docId);
+    const snap = await docRef.get();
+    if (!snap.exists) {
+      throw new functions.https.HttpsError("not-found", "Document not found.");
+    }
+
+    const row = snap.data() ?? {};
+    const ownerUid = coerceString(row.submittedByUid);
+    if (row.saveToResidentAccount !== true || ownerUid !== context.auth.uid) {
+      throw new functions.https.HttpsError(
+        "permission-denied",
+        "This saved document is not linked to your account."
+      );
+    }
+
+    const trackingNo = coerceString(row.trackingNo) ?? docId;
+    const sanitized = buildSanitizedTrackingResult(trackingNo, row);
+    const timeline = await loadPublicTrackingTimeline(docRef);
+    return {
+      ...sanitized,
+      timeline,
+      savedDocId: docId,
     };
   }
 );
@@ -9912,6 +11333,34 @@ export const dtsUnsaveTrackedDocument = functions.https.onCall(
 
 /**
  * =========================
+ * DTS QR BATCH LIST
+ * =========================
+ * Lists recent QR sticker batches for Super Admin management.
+ */
+export const dtsListQrBatches = functions.https.onCall(
+  async (data, context) => {
+    await requireFeatureWritable("documentTracking");
+    await requireSuperAdminContext(context);
+
+    const limitRaw = typeof data?.limit === "number" ? data.limit : 24;
+    const limit = Math.max(1, Math.min(100, Math.floor(limitRaw)));
+    const snapshot = await db
+      .collection("dts_qr_batches")
+      .orderBy("createdAt", "desc")
+      .limit(limit)
+      .get();
+
+    return {
+      items: snapshot.docs.map((doc) => ({
+        id: doc.id,
+        ...(doc.data() ?? {}),
+      })),
+    };
+  }
+);
+
+/**
+ * =========================
  * DTS QR GENERATION
  * =========================
  * Generates QR codes and stores them in Firestore + Storage.
@@ -9934,12 +11383,24 @@ export const generateDtsQrCodes = functions.https.onCall(
         "Only super_admin can generate QR codes."
       );
     }
+    const profile = await getUserProfile(context.auth.uid);
+    const actorName =
+      coerceString(profile.data.displayName) ??
+      coerceString(profile.data.email) ??
+      context.auth.uid;
 
     const countRaw = typeof data?.count === "number" ? data.count : 50;
     const prefix = coerceString(data?.prefix) ?? "DTS-QR";
+    const requestedBatchLabel = coerceString(data?.batchLabel);
     const count = Math.max(1, Math.min(200, Math.floor(countRaw)));
+    const batchRef = db.collection("dts_qr_batches").doc();
+    const batchId = batchRef.id;
+    const batchLabel =
+      requestedBatchLabel ??
+      `QR Batch ${new Date().toISOString().slice(0, 10)} ${batchId.slice(0, 6).toUpperCase()}`;
 
     const created: Array<{ code: string; path: string }> = [];
+    const seenCodes = new Set<string>();
     const bucket = admin.storage().bucket();
 
     let batch = db.batch();
@@ -9954,11 +11415,15 @@ export const generateDtsQrCodes = functions.https.onCall(
 
     while (created.length < count) {
       const code = randomCode(prefix);
+      if (seenCodes.has(code)) {
+        continue;
+      }
       const ref = db.collection("dts_qr_codes").doc(code);
       const snap = await ref.get();
       if (snap.exists) {
         continue;
       }
+      seenCodes.add(code);
 
       const path = `dts_qr_codes/${code}.png`;
       const png = await createQrPng(code);
@@ -9970,6 +11435,8 @@ export const generateDtsQrCodes = functions.https.onCall(
 
       batch.set(ref, {
         qrCode: code,
+        batchId,
+        batchLabel,
         status: "unused",
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         createdByUid: context.auth.uid,
@@ -9984,8 +11451,36 @@ export const generateDtsQrCodes = functions.https.onCall(
     }
 
     await commitBatch();
+    await batchRef.set({
+      batchId,
+      batchLabel,
+      prefix,
+      totalCount: created.length,
+      unusedCount: created.length,
+      usedCount: 0,
+      voidedCount: 0,
+      exportCount: 0,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdByUid: context.auth.uid,
+      status: "active",
+    });
+
+    await addAuditLog({
+      action: "dts_qr_batch_generated",
+      entityType: "dts_qr_batches",
+      entityId: batchId,
+      actorUid: context.auth.uid,
+      actorRole: callerRole,
+      actorOfficeId: null,
+      actorOfficeName: null,
+      actorName,
+      message: `Generated ${created.length} DTS QR codes.`,
+    });
 
     return {
+      batchId,
+      batchLabel,
       count: created.length,
       codes: created.map((c) => c.code),
       items: created,
@@ -10017,9 +11512,15 @@ export const exportDtsQrZip = functions.https.onCall(
         "Only super_admin can export QR codes."
       );
     }
+    const profile = await getUserProfile(context.auth.uid);
+    const actorName =
+      coerceString(profile.data.displayName) ??
+      coerceString(profile.data.email) ??
+      context.auth.uid;
 
     const bucket = admin.storage().bucket();
     let codes: string[] = [];
+    const batchId = coerceString(data?.batchId);
     if (Array.isArray(data?.codes)) {
       codes = data.codes
         .map((c: unknown) => (c ? String(c).trim() : ""))
@@ -10027,15 +11528,24 @@ export const exportDtsQrZip = functions.https.onCall(
     }
 
     if (codes.length === 0) {
-      const snap = await db
-        .collection("dts_qr_codes")
-        .orderBy("createdAt", "desc")
-        .limit(10)
-        .get();
-      codes = snap.docs.map((d) => d.id);
+      if (batchId) {
+        const batchSnap = await db
+          .collection("dts_qr_codes")
+          .where("batchId", "==", batchId)
+          .limit(100)
+          .get();
+        codes = batchSnap.docs.map((d) => d.id);
+      } else {
+        const snap = await db
+          .collection("dts_qr_codes")
+          .orderBy("createdAt", "desc")
+          .limit(10)
+          .get();
+        codes = snap.docs.map((d) => d.id);
+      }
     }
 
-    codes = codes.slice(0, 10);
+    codes = codes.slice(0, batchId ? 200 : 10);
     if (codes.length === 0) {
       throw new functions.https.HttpsError(
         "failed-precondition",
@@ -10069,6 +11579,27 @@ export const exportDtsQrZip = functions.https.onCall(
       metadata: { contentType: "application/zip" },
     });
 
+    if (batchId) {
+      await db.collection("dts_qr_batches").doc(batchId).set({
+        lastExportedAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastExportPath: exportPath,
+        exportCount: admin.firestore.FieldValue.increment(1),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, {merge: true});
+    }
+
+    await addAuditLog({
+      action: "dts_qr_batch_exported",
+      entityType: "dts_qr_batches",
+      entityId: batchId ?? exportPath,
+      actorUid: context.auth.uid,
+      actorRole: callerRole,
+      actorOfficeId: null,
+      actorOfficeName: null,
+      actorName,
+      message: `Exported ${exportedCodes.length} DTS QR codes for printing.`,
+    });
+
     let downloadUrl: string | null = null;
     try {
       const result = await bucket.file(exportPath).getSignedUrl({
@@ -10081,6 +11612,7 @@ export const exportDtsQrZip = functions.https.onCall(
     }
 
     return {
+      batchId,
       count: exportedCodes.length,
       path: exportPath,
       downloadUrl,

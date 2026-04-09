@@ -493,7 +493,9 @@ service cloud.firestore {
       allow delete: if activeUser() && isSuperAdmin() && featureEnabled("documentTracking") && canWriteFeatureData();
 
       match /timeline/{eventId} {
-        allow read: if signedInUser() && isStaff() && featureEnabled("documentTracking");
+        allow read: if featureEnabled("documentTracking")
+          && exists(/databases/$(database)/documents/dts_documents/$(docId))
+          && dtsCanRead(dtsDocById(docId).data);
         allow create, update, delete: if false;
       }
     }
@@ -506,6 +508,13 @@ service cloud.firestore {
 
     match /dts_qr_codes/{qrCode} {
       allow read: if signedInUser() && isStaff() && featureEnabled("documentTracking");
+      allow create: if false;
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    match /dts_qr_batches/{batchId} {
+      allow read: if activeUser() && isSuperAdmin() && featureEnabled("documentTracking");
       allow create: if false;
       allow update: if false;
       allow delete: if false;
@@ -605,6 +614,35 @@ service cloud.firestore {
         );
 
       // Privileged job mutations are callable-only.
+      allow create, update, delete: if false;
+    }
+
+    /** -------------------------
+     * MUNICIPAL DIRECTORY
+     * /directory_entries/{entryId}
+     * ------------------------- */
+    match /directory_entries/{entryId} {
+      allow read: if (signedInUser() && isStaff())
+        || (
+          featureEnabled("directory")
+          && resource.data.isPublic == true
+          && isPublishedStatus(resource.data.status)
+        );
+
+      allow create, update, delete: if false;
+    }
+
+    /** -------------------------
+     * EMERGENCY HOTLINES
+     * /emergency_hotlines/{hotlineId}
+     * ------------------------- */
+    match /emergency_hotlines/{hotlineId} {
+      allow read: if (signedInUser() && isStaff())
+        || (
+          resource.data.isPublic == true
+          && isPublishedStatus(resource.data.status)
+        );
+
       allow create, update, delete: if false;
     }
 

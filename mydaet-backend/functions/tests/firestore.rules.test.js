@@ -155,6 +155,20 @@ async function seedBaseData(testEnv) {
       currentCustodianUid: "mod2",
       updatedAt: new Date(),
     });
+    await db.doc("dts_documents/doc-1/timeline/event-1").set({
+      type: "STATUS_CHANGED",
+      notePublic: "Document received.",
+      byUid: "mod1",
+      officeName: "Office 1",
+      createdAt: nowIso(),
+    });
+    await db.doc("dts_documents/doc-2/timeline/event-1").set({
+      type: "STATUS_CHANGED",
+      notePublic: "Document received.",
+      byUid: "mod2",
+      officeName: "Office 2",
+      createdAt: nowIso(),
+    });
 
     await db.doc("civil_registry_requests/cr-1").set({
       fullName: "Test Citizen",
@@ -191,6 +205,38 @@ async function seedBaseData(testEnv) {
       title: "Engineer",
       status: "draft",
       officeId: "OFF-1",
+    });
+    await db.doc("directory_entries/dir-1").set({
+      officeId: "OFF-1",
+      officeName: "Office 1",
+      contactName: "Office Head",
+      position: "Head",
+      phone: "09170000000",
+      status: "draft",
+      isPublic: false,
+    });
+    await db.doc("directory_entries/dir-2").set({
+      officeId: "OFF-1",
+      officeName: "Office 1",
+      contactName: "Published Head",
+      position: "Head",
+      phone: "09171111111",
+      status: "published",
+      isPublic: true,
+    });
+    await db.doc("emergency_hotlines/hotline-1").set({
+      label: "COMCEN",
+      group: "Dispatch",
+      contactNumbers: ["(054) 472-3000"],
+      status: "draft",
+      isPublic: false,
+    });
+    await db.doc("emergency_hotlines/hotline-2").set({
+      label: "BFP",
+      group: "Fire",
+      contactNumbers: ["(054) 473-8472"],
+      status: "published",
+      isPublic: true,
     });
   });
 }
@@ -247,12 +293,6 @@ async function run() {
       isActive: true,
     }).firestore();
     const resident1Db = testEnv.authenticatedContext("resident1", {
-      role: "resident",
-      officeId: "",
-      officeName: "",
-      isActive: true,
-    }).firestore();
-    const resident2Db = testEnv.authenticatedContext("resident2", {
       role: "resident",
       officeId: "",
       officeName: "",
@@ -323,6 +363,17 @@ async function run() {
       adminDb.doc("jobs/job-1").set({status: "published"}, {merge: true})
     );
 
+    // Public contacts: staff can read drafts; public can read only published
+    // directory entries when the directory feature is enabled, while emergency
+    // hotlines remain publicly readable regardless of the directory toggle.
+    await assertSucceeds(adminDb.doc("directory_entries/dir-1").get());
+    await assertSucceeds(mod1Db.doc("directory_entries/dir-1").get());
+    await assertFails(publicDb.doc("directory_entries/dir-1").get());
+    await assertSucceeds(publicDb.doc("directory_entries/dir-2").get());
+    await assertSucceeds(adminDb.doc("emergency_hotlines/hotline-1").get());
+    await assertFails(publicDb.doc("emergency_hotlines/hotline-1").get());
+    await assertSucceeds(publicDb.doc("emergency_hotlines/hotline-2").get());
+
     // Staff reads for admin-managed content should remain available even when
     // the public feature toggle is off. Public readers still stay blocked.
     await testEnv.withSecurityRulesDisabled(async (context) => {
@@ -346,6 +397,7 @@ async function run() {
           news: false,
           transparency: false,
           jobs: false,
+          directory: false,
         },
       }, {merge: true});
     });
@@ -354,6 +406,8 @@ async function run() {
     await assertSucceeds(adminDb.doc("posts/post-news-hidden").get());
     await assertSucceeds(mod1Db.doc("posts/post-news-hidden").get());
     await assertFails(publicDb.doc("posts/post-news-published").get());
+    await assertFails(publicDb.doc("directory_entries/dir-2").get());
+    await assertSucceeds(publicDb.doc("emergency_hotlines/hotline-2").get());
 
     await testEnv.withSecurityRulesDisabled(async (context) => {
       await context.firestore().doc("system/settings").delete();
@@ -389,6 +443,8 @@ async function run() {
     await assertSucceeds(officeDb.doc("dts_documents/doc-1").get());
     await assertFails(officeDb.doc("dts_documents/doc-2").get());
     await assertSucceeds(adminDb.doc("dts_documents/doc-2").get());
+    await assertSucceeds(mod1Db.doc("dts_documents/doc-1/timeline/event-1").get());
+    await assertFails(mod1Db.doc("dts_documents/doc-2/timeline/event-1").get());
     await assertFails(
       mod1Db.doc("dts_documents/doc-1/timeline/event-2").set({
         type: "NOTE",
