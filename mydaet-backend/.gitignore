@@ -65,6 +65,18 @@ node_modules/
 # dotenv environment variables file
 .env
 
+# Service account key material (never commit)
+*service-account*.json
+*serviceAccount*.json
+*firebase-adminsdk-*.json
+*google-credentials*.json
+*gcp-key*.json
+*gcloud-key*.json
+
+# Keep required Firebase project config tracked
+!firebase.json
+!firestore.indexes.json
+
 # dataconnect generated files
 .dataconnect
 

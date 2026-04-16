@@ -8,3 +8,11 @@ typings/
 # Node.js dependency directory
 node_modules/
 *.local
+
+# Service account key material (never commit)
+*service-account*.json
+*serviceAccount*.json
+*firebase-adminsdk-*.json
+*google-credentials*.json
+*gcp-key*.json
+*gcloud-key*.json
