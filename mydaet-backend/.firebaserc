@@ -1,5 +1,7 @@
 {
   "projects": {
-    "default": "mydaet"
+    "dev": "mydaet-staging",
+    "staging": "mydaet-staging",
+    "prod": "mydaet"
   }
 }

@@ -228,6 +228,16 @@ service firebase.storage {
         && validAttachmentUpload(15);
     }
 
+    match /dts/{officePathId}/{docId}/{fileName} {
+      allow read: if canReadDts(docId);
+      allow write: if activeUser()
+        && isStaff()
+        && officeId() != null
+        && officePathId == officeId()
+        && dtsOfficeAllowed(docId)
+        && validAttachmentUpload(15);
+    }
+
     match /dts_qr_codes/{fileName} {
       allow read: if signedIn() && isStaff();
       allow write: if false;

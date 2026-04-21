@@ -121,10 +121,6 @@ service cloud.firestore {
       return data.keys().hasAny(["officeId"]) && data.officeId != null && data.officeId != "";
     }
 
-    function hasNonEmptyString(data, field) {
-      return data.keys().hasAny([field]) && data[field] is string && data[field] != "";
-    }
-
     function stringWithin(value, max) {
       return !(value is string) || value.size() <= max;
     }
@@ -214,6 +210,7 @@ service cloud.firestore {
             || (mapValueOrNull(data, "pendingTransfer") is map && officeId() != null && mapValueOrNull(data, "pendingTransfer").toOfficeId == officeId())
             || (mapValueOrNull(data, "pendingTransfer") is map && officeName() != null && mapValueOrNull(data, "pendingTransfer").toOfficeName != null && mapValueOrNull(data, "pendingTransfer").toOfficeName == officeName())
             || (mapValueOrNull(data, "pendingTransfer") is map && mapValueOrNull(data, "pendingTransfer").toUid != null && mapValueOrNull(data, "pendingTransfer").toUid == request.auth.uid)
+            || (data.activeDestinationOfficeIds is list && officeId() != null && data.activeDestinationOfficeIds.hasAny([officeId()]))
             || (data.currentCustodianUid != null && data.currentCustodianUid == request.auth.uid)
           )
         );
@@ -224,10 +221,6 @@ service cloud.firestore {
         isSuperAdmin()
         || dtsOfficeAllowed(data)
       );
-    }
-
-    function dtsQrDoc(qrCode) {
-      return get(/databases/$(database)/documents/dts_qr_codes/$(qrCode));
     }
 
     function dtsDocById(docId) {
@@ -498,12 +491,50 @@ service cloud.firestore {
           && dtsCanRead(dtsDocById(docId).data);
         allow create, update, delete: if false;
       }
+
+      match /destinations/{destinationId} {
+        allow read: if featureEnabled("documentTracking")
+          && exists(/databases/$(database)/documents/dts_documents/$(docId))
+          && dtsCanRead(dtsDocById(docId).data)
+          && (
+            isSuperAdmin()
+            || isMunicipalAdmin()
+            || (
+              isStaff()
+              && officeId() != null
+              && (
+                resource.data.toOfficeId == officeId()
+                || resource.data.sourceOfficeId == officeId()
+                || dtsDocById(docId).data.currentOfficeId == officeId()
+              )
+            )
+          );
+        allow create, update, delete: if false;
+      }
     }
 
     match /dts_qr_index/{qrCode} {
       allow read: if signedInUser() && isStaff() && featureEnabled("documentTracking");
       allow create: if false;
       allow update, delete: if false;
+    }
+
+    match /dts_alerts/{alertId} {
+      allow read: if featureEnabled("documentTracking")
+        && signedInUser()
+        && isStaff()
+        && (
+          isSuperAdmin()
+          || isMunicipalAdmin()
+          || (
+            officeId() != null
+            && (
+              resource.data.currentOfficeId == officeId()
+              || (resource.data.currentOfficeId == null && resource.data.currentOfficeName != null && officeName() != null && resource.data.currentOfficeName == officeName())
+            )
+          )
+        );
+      allow create, update, delete: if false;
     }
 
     match /dts_qr_codes/{qrCode} {
@@ -524,6 +555,39 @@ service cloud.firestore {
       allow read: if signedInUser() && isStaff() && featureEnabled("documentTracking");
       allow create, update: if false;
       allow delete: if false;
+    }
+
+    match /dts_templates/{templateId} {
+      allow read: if signedInUser() && isStaff() && featureEnabled("documentTracking");
+      allow create, update, delete: if false;
+    }
+
+    match /dts_routes/{routeId} {
+      allow read: if featureEnabled("documentTracking")
+        && signedInUser()
+        && isStaff()
+        && (
+          isSuperAdmin()
+          || isMunicipalAdmin()
+          || (
+            officeId() != null
+            && (
+              resource.data.fromOfficeId == officeId()
+              || resource.data.toOfficeId == officeId()
+            )
+          )
+        );
+      allow create, update, delete: if false;
+    }
+
+    match /dts_audit_logs/{auditId} {
+      allow read: if featureEnabled("documentTracking")
+        && signedInUser()
+        && (
+          isSuperAdmin()
+          || isMunicipalAdmin()
+        );
+      allow create, update, delete: if false;
     }
 
     /** -------------------------
