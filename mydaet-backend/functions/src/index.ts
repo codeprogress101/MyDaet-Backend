@@ -12,6 +12,7 @@ import * as crypto from "crypto";
 import * as qrcode from "qrcode";
 import AdmZip from "adm-zip";
 import bcrypt from "bcryptjs";
+import {PDFDocument, StandardFonts, rgb} from "pdf-lib";
 import {
   HttpsError as HttpsErrorV2,
   onCall as onCallV2,
@@ -38,6 +39,7 @@ const PUBLIC_REPORT_ALLOWED_ORIGINS = String(process.env.PUBLIC_REPORT_ALLOWED_O
 const CORS_MODE = String(process.env.CORS_MODE ?? "").trim().toLowerCase();
 const FUNCTIONS_EMULATOR_ENABLED =
   String(process.env.FUNCTIONS_EMULATOR ?? "").trim().toLowerCase() === "true";
+const APP_CHECK_MODE = String(process.env.APP_CHECK_MODE ?? "").trim().toLowerCase();
 const POST_COLLECTIONS = ["posts"] as const;
 const PUBLISHED_STATUS_VARIANTS = ["published", "Published", "PUBLISHED"] as const;
 const SYSTEM_SETTINGS_FEATURE_KEYS = [
@@ -56,6 +58,28 @@ const SYSTEM_SETTINGS_FEATURE_KEYS = [
 ] as const;
 type SystemFeatureKey = typeof SYSTEM_SETTINGS_FEATURE_KEYS[number];
 type SystemFeatureFlags = Record<SystemFeatureKey, boolean>;
+
+/*
+ * Callable App Check policy:
+ * - Emulator remains permissive for local development.
+ * - Deployed production defaults to enforced App Check.
+ * - Emergency toggle: APP_CHECK_MODE=off|permissive disables enforcement.
+ * - Explicit enable: APP_CHECK_MODE=on|strict|enforce.
+ */
+function strictAppCheckEnabled(): boolean {
+  if (FUNCTIONS_EMULATOR_ENABLED) return false;
+  if (["off", "open", "permissive"].includes(APP_CHECK_MODE)) return false;
+  if (["on", "strict", "enforce"].includes(APP_CHECK_MODE)) return true;
+  // Default to enforced outside emulator; use APP_CHECK_MODE=permissive for staged rollback.
+  return true;
+}
+
+const protectedCallableFunctions = strictAppCheckEnabled() ?
+  regionalFunctions.runWith({enforceAppCheck: true}) :
+  regionalFunctions;
+const protectedCallableV2Options = strictAppCheckEnabled() ?
+  {region: REGION, enforceAppCheck: true} :
+  {region: REGION};
 
 /**
  * Role definitions
@@ -92,6 +116,9 @@ const EMERGENCY_DUPLICATE_WINDOW_MS = 45 * 60 * 1000;
 const EMERGENCY_DUPLICATE_DISTANCE_METERS = 250;
 const FEEDBACK_EMAIL_APP_PASSWORD = defineSecret("FEEDBACK_EMAIL_APP_PASSWORD");
 const FEEDBACK_EMAIL_FUNCTION_SECRETS = [FEEDBACK_EMAIL_APP_PASSWORD];
+const protectedCallableV2FeedbackOptions = strictAppCheckEnabled() ?
+  {region: REGION, enforceAppCheck: true, secrets: FEEDBACK_EMAIL_FUNCTION_SECRETS} :
+  {region: REGION, secrets: FEEDBACK_EMAIL_FUNCTION_SECRETS};
 const FEEDBACK_EMAIL_SENDER = String(process.env.FEEDBACK_EMAIL_SENDER ?? "maogmangdaet.portal@gmail.com")
   .trim() || "maogmangdaet.portal@gmail.com";
 const FEEDBACK_EMAIL_SENDER_NAME =
@@ -1506,10 +1533,22 @@ function isAllowedPublicReportCorsOrigin(origin: string): boolean {
   return allowedOrigins.includes(origin);
 }
 
+function applyJsonEndpointSecurityHeaders(
+  res: functions.Response<unknown>
+): void {
+  // JSON API responses should never be cached by browsers/proxies.
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  res.set("Pragma", "no-cache");
+  // Harden response parsing and referrer leakage.
+  res.set("X-Content-Type-Options", "nosniff");
+  res.set("Referrer-Policy", "no-referrer");
+}
+
 function applyPublicReportCors(
   req: functions.https.Request,
   res: functions.Response<unknown>
 ): boolean {
+  applyJsonEndpointSecurityHeaders(res);
   const origin = String(req.headers.origin ?? "").trim();
   if (!origin) {
     // Non-browser clients (for example future mobile apps) may omit Origin.
@@ -1525,6 +1564,9 @@ function applyPublicReportCors(
   }
   res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+  // Explicitly keep credentialed browser cookies off public endpoints.
+  res.set("Access-Control-Allow-Credentials", "false");
+  res.set("Access-Control-Max-Age", "600");
   return true;
 }
 
@@ -2242,9 +2284,236 @@ async function createQrPng(value: string): Promise<Buffer> {
   });
 }
 
+function randomTrackingNo(): string {
+  const year = new Date().getFullYear();
+  const token = crypto.randomBytes(4).toString("hex").toUpperCase();
+  return `DTS-${year}-${token}`;
+}
+
+function randomTrackingPin(): string {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+async function generateUniqueTrackingNo(maxAttempts = 8): Promise<string> {
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const candidate = randomTrackingNo();
+    const duplicate = await db
+      .collection("dts_documents")
+      .where("trackingNo", "==", candidate)
+      .limit(1)
+      .get();
+    if (duplicate.empty) {
+      return candidate;
+    }
+  }
+  throw new functions.https.HttpsError(
+    "aborted",
+    "Unable to generate a unique tracking number. Retry."
+  );
+}
+
+function sanitizePdfFileName(input: string | null, fallback = "document.pdf"): string {
+  const base = (input ?? fallback)
+    .trim()
+    .replace(/[^a-zA-Z0-9._-]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  const normalized = base.length > 0 ? base : fallback;
+  if (normalized.toLowerCase().endsWith(".pdf")) {
+    return normalized;
+  }
+  return `${normalized}.pdf`;
+}
+
+function decodePdfBase64(input: unknown): Buffer {
+  const text = coerceString(input);
+  if (!text) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "fileBase64 is required."
+    );
+  }
+  const normalized = text.includes(",") ? text.split(",").pop() ?? "" : text;
+  let bytes: Buffer;
+  try {
+    bytes = Buffer.from(normalized, "base64");
+  } catch (_error) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "fileBase64 must be a valid base64-encoded PDF."
+    );
+  }
+  if (bytes.length === 0) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "Decoded PDF is empty."
+    );
+  }
+  if (bytes.length > DTS_INTERNAL_PDF_MAX_BYTES) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "PDF exceeds the 12 MB upload limit."
+    );
+  }
+  const header = bytes.subarray(0, 5).toString("utf8");
+  if (!header.startsWith("%PDF-")) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "Only PDF files are accepted."
+    );
+  }
+  return bytes;
+}
+
+async function buildStorageTokenUrl(filePath: string): Promise<string> {
+  const bucket = admin.storage().bucket();
+  const file = bucket.file(filePath);
+  try {
+    const [signed] = await file.getSignedUrl({
+      action: "read",
+      expires: Date.now() + 1000 * 60 * 60,
+    });
+    return signed;
+  } catch (_error) {
+    const [metadata] = await file.getMetadata();
+    const custom = metadata.metadata ?? {};
+    let token = coerceString(custom.firebaseStorageDownloadTokens);
+    if (token && token.includes(",")) {
+      token = token.split(",")[0].trim();
+    }
+    if (!token) {
+      token = crypto.randomUUID();
+      await file.setMetadata({
+        metadata: {
+          ...custom,
+          firebaseStorageDownloadTokens: token,
+        },
+      });
+    }
+    return `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/` +
+      `${encodeURIComponent(filePath)}?alt=media&token=${token}`;
+  }
+}
+
+async function buildStorageSignedReadUrl(
+  filePath: string,
+  expiresAtMs: number
+): Promise<string> {
+  const bucket = admin.storage().bucket();
+  const file = bucket.file(filePath);
+  const [signed] = await file.getSignedUrl({
+    action: "read",
+    expires: expiresAtMs,
+  });
+  return signed;
+}
+
+function normalizeGeneratedPdfPath(
+  docId: string,
+  value: unknown
+): string | null {
+  const candidate = coerceString(value);
+  if (!candidate) return null;
+  const normalized = candidate.replace(/\\/g, "/").replace(/^\/+/, "");
+  if (!normalized.toLowerCase().endsWith(".pdf")) return null;
+  const requiredPrefix = `dts_documents/${docId}/generated/`;
+  if (!normalized.startsWith(requiredPrefix)) return null;
+  return normalized;
+}
+
+async function stampInternalPdfDocument(
+  sourcePdf: Buffer,
+  trackingNo: string,
+  qrCode: string
+): Promise<Buffer> {
+  const pdf = await PDFDocument.load(sourcePdf, {ignoreEncryption: true});
+  if (pdf.getPageCount() === 0) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "PDF must contain at least one page."
+    );
+  }
+  const qrPng = await createQrPng(qrCode);
+  const qrImage = await pdf.embedPng(qrPng);
+  const font = await pdf.embedFont(StandardFonts.HelveticaBold);
+
+  // Use first-page stamp block only, placed in lower-right with <=0.5in margin.
+  const page = pdf.getPages()[0];
+  if (page) {
+    const {width, height} = page.getSize();
+    const rightMargin = Math.min(24, Math.max(12, width * 0.02));
+    const bottomMargin = Math.min(24, Math.max(10, height * 0.018));
+    const qrSize = 40;
+    const boxPadding = 2;
+    const boxWidth = qrSize + (boxPadding * 2);
+    const textSize = 4.3;
+    const textGap = 1.2;
+    const maxTextWidth = boxWidth - 4;
+    const fitLineToBox = (value: string): string => {
+      let out = value.trim();
+      while (
+        out.length > 4 &&
+        font.widthOfTextAtSize(out, textSize) > maxTextWidth
+      ) {
+        out = out.slice(0, -1);
+      }
+      return out;
+    };
+    const compactTracking = (value: string): string => {
+      const normalized = value.trim();
+      if (normalized.length <= 18) {
+        return normalized;
+      }
+      return `${normalized.slice(0, 10)}...${normalized.slice(-5)}`;
+    };
+    const line = fitLineToBox(compactTracking(trackingNo));
+    const captionHeight =
+      (line.length > 0 ? textSize + textGap : 0) +
+      2;
+    const boxHeight = qrSize + captionHeight + (boxPadding * 2) + 1;
+
+    const x = Math.max(8, width - rightMargin - boxWidth);
+    const y = Math.max(8, bottomMargin);
+    const qrX = x + ((boxWidth - qrSize) / 2);
+    const qrY = y + captionHeight + boxPadding + 1;
+
+    page.drawRectangle({
+      x,
+      y,
+      width: boxWidth,
+      height: boxHeight,
+      color: rgb(1, 1, 1),
+      borderColor: rgb(0.86, 0.89, 0.94),
+      borderWidth: 0.8,
+      opacity: 0.97,
+    });
+    page.drawImage(qrImage, {
+      x: qrX,
+      y: qrY,
+      width: qrSize,
+      height: qrSize,
+    });
+    if (line.length > 0) {
+      const lineWidth = font.widthOfTextAtSize(line, textSize);
+      page.drawText(line, {
+        x: x + ((boxWidth - lineWidth) / 2),
+        y: y + 2.2 + textSize + textGap,
+        size: textSize,
+        font,
+        color: rgb(0.06, 0.1, 0.18),
+      });
+    }
+  }
+
+  return Buffer.from(await pdf.save());
+}
+
 function dtsInstructions(status: string) {
   const normalized = status.toUpperCase();
   switch (normalized) {
+    case "DRAFT":
+      return "Your document is being prepared for final issuance.";
+    case "CREATED":
+      return "Your document was created and is ready for routing.";
     case "IN_TRANSIT":
       return "Your document is in transit to the next office.";
     case "WITH_OFFICE":
@@ -2257,6 +2526,8 @@ function dtsInstructions(status: string) {
       return "Your document is ready for release or pickup.";
     case "ARCHIVED":
       return "Your document has been archived.";
+    case "VOIDED":
+      return "This document was voided and replaced by records policy.";
     case "PULLED_OUT":
       return "Your document has been pulled out for review.";
     case "RECEIVED":
@@ -2285,6 +2556,8 @@ type CallableContextLike = {
 };
 
 const DTS_STATUSES = new Set([
+  "DRAFT",
+  "CREATED",
   "RECEIVED",
   "IN_TRANSIT",
   "WITH_OFFICE",
@@ -2292,14 +2565,43 @@ const DTS_STATUSES = new Set([
   "FOR_APPROVAL",
   "RELEASED",
   "ARCHIVED",
+  "VOIDED",
   "PULLED_OUT",
 ]);
 
 const DTS_PIN_MAX_ATTEMPTS = 10;
 const DTS_PIN_LOCK_MINUTES = 15;
+const DTS_RECEIPT_VERIFY_MAX_ATTEMPTS = 6;
+const DTS_RECEIPT_VERIFY_LOCK_MINUTES = 10;
+const DTS_RECEIPT_QR_SUFFIX_LENGTH = 6;
+const DTS_QR_RESERVATION_TTL_MINUTES = 15;
+const DTS_QR_RESERVATION_SWEEP_LIMIT = 500;
+const DTS_OVERDUE_ALERT_SWEEP_LIMIT = 300;
+const DTS_OVERDUE_ALERT_RENOTIFY_HOURS = 6;
 const DTS_TRACK_SESSION_TTL_HOURS = 12;
 const DTS_TRACK_SESSION_ROTATION_BYTES = 24;
 const DTS_PIN_BCRYPT_ROUNDS = 12;
+const DTS_INTERNAL_PDF_MAX_BYTES = 12 * 1024 * 1024;
+const DTS_TEMPLATE_FILE_MAX_BYTES = 12 * 1024 * 1024;
+const DTS_TEMPLATE_DEFAULT_QR_POSITION = "BOTTOM_RIGHT";
+const DTS_TEMPLATE_DEFAULT_QR_SIZE = 96;
+const DTS_MAX_SLA_HOURS = 720;
+const DTS_PRIORITY_LEVELS = new Set(["LOW", "NORMAL", "HIGH", "URGENT"]);
+const DTS_RECEIPT_VERIFICATION_METHODS = new Set(["MANUAL_INPUT", "SCAN"]);
+const DTS_DISTRIBUTION_MODES = new Set(["SINGLE", "MULTI"]);
+const DTS_DESTINATION_STATUSES = new Set([
+  "PENDING",
+  "IN_TRANSIT",
+  "RECEIVED",
+  "REJECTED",
+  "CANCELLED",
+]);
+const DTS_TEMPLATE_ALLOWED_QR_POSITIONS = new Set([
+  "BOTTOM_RIGHT",
+  "BOTTOM_LEFT",
+  "TOP_RIGHT",
+  "TOP_LEFT",
+]);
 const FUNCTIONS_BUILD_VERSION = "2026.02.20.1";
 
 function normalizeDtsStatus(raw: unknown, fallback = "RECEIVED"): string {
@@ -2320,14 +2622,242 @@ function prettyDtsStatus(status: string): string {
     .join(" ");
 }
 
+function normalizeDtsPriorityLevel(raw: unknown, fallback = "NORMAL"): string {
+  const normalized = String(raw ?? "")
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, "_");
+  if (DTS_PRIORITY_LEVELS.has(normalized)) {
+    return normalized;
+  }
+  return fallback;
+}
+
+function normalizeDtsDistributionMode(raw: unknown, fallback = "SINGLE"): string {
+  const normalized = String(raw ?? "")
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, "_");
+  if (DTS_DISTRIBUTION_MODES.has(normalized)) {
+    return normalized;
+  }
+  return fallback;
+}
+
+function normalizeDtsDestinationStatus(raw: unknown, fallback = "PENDING"): string {
+  const normalized = String(raw ?? "")
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, "_");
+  if (DTS_DESTINATION_STATUSES.has(normalized)) {
+    return normalized;
+  }
+  return fallback;
+}
+
+function parseDtsDueAt(raw: unknown): Date | null {
+  if (raw instanceof Date && Number.isFinite(raw.getTime())) {
+    return raw;
+  }
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    const fromEpoch = new Date(raw);
+    return Number.isFinite(fromEpoch.getTime()) ? fromEpoch : null;
+  }
+  if (typeof raw === "string" && raw.trim().length > 0) {
+    const parsed = new Date(raw.trim());
+    return Number.isFinite(parsed.getTime()) ? parsed : null;
+  }
+  return null;
+}
+
+const DTS_OVERDUE_TRACKED_STATUSES = new Set([
+  "CREATED",
+  "RECEIVED",
+  "WITH_OFFICE",
+  "IN_PROCESS",
+  "FOR_APPROVAL",
+  "IN_TRANSIT",
+  "PULLED_OUT",
+]);
+
+function dtsOverdueSeverity(hoursOverdue: number): "WARNING" | "HIGH" | "CRITICAL" {
+  if (hoursOverdue >= 72) {
+    return "CRITICAL";
+  }
+  if (hoursOverdue >= 24) {
+    return "HIGH";
+  }
+  return "WARNING";
+}
+
+function normalizeDtsVerificationValue(raw: unknown): string {
+  return String(raw ?? "").trim().toUpperCase();
+}
+
+function normalizeDtsVerificationMethod(raw: unknown): string {
+  const normalized = String(raw ?? "")
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, "_");
+  if (DTS_RECEIPT_VERIFICATION_METHODS.has(normalized)) {
+    return normalized;
+  }
+  return "MANUAL_INPUT";
+}
+
+function matchesDtsTrackingOrQr(
+  verificationValue: string,
+  trackingNo: string,
+  qrCode: string | null
+): boolean {
+  if (!verificationValue) {
+    return false;
+  }
+  if (verificationValue === trackingNo.trim().toUpperCase()) {
+    return true;
+  }
+  if (qrCode && verificationValue === qrCode.trim().toUpperCase()) {
+    return true;
+  }
+  return false;
+}
+
+function dtsQrSuffix(qrCode: string | null): string | null {
+  const normalized = normalizeDtsVerificationValue(qrCode);
+  if (!normalized) {
+    return null;
+  }
+  if (normalized.length <= DTS_RECEIPT_QR_SUFFIX_LENGTH) {
+    return normalized;
+  }
+  return normalized.slice(-DTS_RECEIPT_QR_SUFFIX_LENGTH);
+}
+
+function receiptAttemptScopeId(scope: string): string {
+  return scope
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9_-]+/g, "_")
+    .replace(/_+/g, "_")
+    .slice(0, 96);
+}
+
+function receiptAttemptDocId(scope: string, dimension: string, value: string): string {
+  const safeDimension = dimension
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9_-]+/g, "_");
+  const safeValue = value
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9_-]+/g, "_")
+    .slice(0, 64);
+  return `${receiptAttemptScopeId(scope)}__${safeDimension}__${safeValue || "UNKNOWN"}`;
+}
+
+function receiptAttemptContextIpHash(context: CallableContextLike): string {
+  const rawIp = context.rawRequest?.ip ?? "unknown";
+  return sha256(String(rawIp)).slice(0, 16).toUpperCase();
+}
+
+function buildReceiptAttemptRefs(
+  scope: string,
+  actorUid: string,
+  context: CallableContextLike
+): admin.firestore.DocumentReference[] {
+  const uid = actorUid.trim() || "unknown";
+  const ipHash = receiptAttemptContextIpHash(context);
+  return [
+    db.collection("dts_receipt_attempts").doc(receiptAttemptDocId(scope, "UID", uid)),
+    db.collection("dts_receipt_attempts").doc(receiptAttemptDocId(scope, "IP", ipHash)),
+  ];
+}
+
+async function assertReceiptVerificationNotLocked(
+  scope: string,
+  actorUid: string,
+  context: CallableContextLike
+): Promise<void> {
+  const refs = buildReceiptAttemptRefs(scope, actorUid, context);
+  const snaps = await Promise.all(refs.map((ref) => ref.get()));
+  const now = Date.now();
+  for (const snap of snaps) {
+    const row = (snap.data() ?? {}) as Record<string, unknown>;
+    const lockUntil = parseLockUntil(row);
+    if (lockUntil && lockUntil.getTime() > now) {
+      throw new functions.https.HttpsError(
+        "resource-exhausted",
+        "Too many invalid verification attempts. Please wait before trying again."
+      );
+    }
+  }
+}
+
+async function clearReceiptVerificationAttempts(
+  scope: string,
+  actorUid: string,
+  context: CallableContextLike
+): Promise<void> {
+  const refs = buildReceiptAttemptRefs(scope, actorUid, context);
+  const batch = db.batch();
+  for (const ref of refs) {
+    batch.set(
+      ref,
+      {
+        failCount: 0,
+        lockUntil: admin.firestore.FieldValue.delete(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      {merge: true}
+    );
+  }
+  await batch.commit();
+}
+
+async function registerReceiptVerificationFailure(
+  scope: string,
+  actorUid: string,
+  context: CallableContextLike
+): Promise<boolean> {
+  const refs = buildReceiptAttemptRefs(scope, actorUid, context);
+  const snaps = await Promise.all(refs.map((ref) => ref.get()));
+  const now = Date.now();
+  const lockUntil = new Date(now + DTS_RECEIPT_VERIFY_LOCK_MINUTES * 60 * 1000);
+  let locked = false;
+  const batch = db.batch();
+  for (const [index, ref] of refs.entries()) {
+    const row = (snaps[index].data() ?? {}) as Record<string, unknown>;
+    const previousFails = parseFailCount(row);
+    const nextFails = previousFails + 1;
+    const shouldLock = nextFails >= DTS_RECEIPT_VERIFY_MAX_ATTEMPTS;
+    locked = locked || shouldLock;
+    batch.set(
+      ref,
+      {
+        failCount: shouldLock ? 0 : nextFails,
+        lockUntil: shouldLock
+          ? admin.firestore.Timestamp.fromDate(lockUntil)
+          : admin.firestore.FieldValue.delete(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      {merge: true}
+    );
+  }
+  await batch.commit();
+  return locked;
+}
+
 const DTS_ALLOWED_TRANSITIONS: Record<string, Set<string>> = {
-  RECEIVED: new Set(["WITH_OFFICE", "IN_PROCESS", "FOR_APPROVAL", "IN_TRANSIT", "ARCHIVED"]),
-  WITH_OFFICE: new Set(["IN_PROCESS", "FOR_APPROVAL", "IN_TRANSIT", "RELEASED", "ARCHIVED", "PULLED_OUT"]),
-  IN_PROCESS: new Set(["WITH_OFFICE", "FOR_APPROVAL", "IN_TRANSIT", "RELEASED", "ARCHIVED"]),
-  FOR_APPROVAL: new Set(["WITH_OFFICE", "IN_PROCESS", "IN_TRANSIT", "RELEASED", "ARCHIVED"]),
+  DRAFT: new Set(["CREATED", "VOIDED"]),
+  CREATED: new Set(["IN_TRANSIT", "WITH_OFFICE", "IN_PROCESS", "FOR_APPROVAL", "VOIDED"]),
+  RECEIVED: new Set(["WITH_OFFICE", "IN_PROCESS", "FOR_APPROVAL", "IN_TRANSIT", "ARCHIVED", "VOIDED"]),
+  WITH_OFFICE: new Set(["IN_PROCESS", "FOR_APPROVAL", "IN_TRANSIT", "RELEASED", "ARCHIVED", "PULLED_OUT", "VOIDED"]),
+  IN_PROCESS: new Set(["WITH_OFFICE", "FOR_APPROVAL", "IN_TRANSIT", "RELEASED", "ARCHIVED", "VOIDED"]),
+  FOR_APPROVAL: new Set(["WITH_OFFICE", "IN_PROCESS", "IN_TRANSIT", "RELEASED", "ARCHIVED", "VOIDED"]),
   RELEASED: new Set(["ARCHIVED", "PULLED_OUT"]),
   ARCHIVED: new Set(["PULLED_OUT"]),
-  PULLED_OUT: new Set(["WITH_OFFICE", "IN_PROCESS", "FOR_APPROVAL", "RELEASED", "ARCHIVED"]),
+  VOIDED: new Set([]),
+  PULLED_OUT: new Set(["WITH_OFFICE", "IN_PROCESS", "FOR_APPROVAL", "RELEASED", "ARCHIVED", "VOIDED"]),
   IN_TRANSIT: new Set(["WITH_OFFICE"]),
 };
 
@@ -2440,6 +2970,261 @@ function dtsPendingTransfer(data: Record<string, unknown>) {
   return pending as Record<string, unknown>;
 }
 
+type DtsDestinationRecord = {
+  id: string;
+  docId: string;
+  toOfficeId: string | null;
+  toOfficeName: string | null;
+  toUid: string | null;
+  sourceOfficeId: string | null;
+  sourceOfficeName: string | null;
+  status: string;
+  previousStatus: string | null;
+  createdByUid: string | null;
+  createdByName: string | null;
+  createdAt: FirebaseFirestore.Timestamp | null;
+  dispatchedAt: FirebaseFirestore.Timestamp | null;
+  receivedAt: FirebaseFirestore.Timestamp | null;
+  rejectedAt: FirebaseFirestore.Timestamp | null;
+  cancelledAt: FirebaseFirestore.Timestamp | null;
+  reason: string | null;
+};
+
+type DtsDestinationSummary = {
+  total: number;
+  pending: number;
+  inTransit: number;
+  received: number;
+  rejected: number;
+  cancelled: number;
+  activeOfficeIds: string[];
+  allOfficeIds: string[];
+};
+
+type ApplyDestinationSummaryOptions = {
+  forceStatus?: string | null;
+  parentPatch?: Record<string, unknown>;
+};
+
+function uniqueSortedStrings(values: Array<string | null | undefined>): string[] {
+  const unique = new Set<string>();
+  for (const raw of values) {
+    const value = coerceString(raw);
+    if (value) {
+      unique.add(value);
+    }
+  }
+  return Array.from(unique).sort((left, right) => left.localeCompare(right));
+}
+
+function mapDtsDestinationRecord(
+  docId: string,
+  id: string,
+  row: Record<string, unknown>
+): DtsDestinationRecord {
+  return {
+    id,
+    docId,
+    toOfficeId: coerceString(row.toOfficeId),
+    toOfficeName: coerceString(row.toOfficeName),
+    toUid: coerceString(row.toUid),
+    sourceOfficeId: coerceString(row.sourceOfficeId),
+    sourceOfficeName: coerceString(row.sourceOfficeName),
+    status: normalizeDtsDestinationStatus(row.status),
+    previousStatus: coerceString(row.previousStatus),
+    createdByUid: coerceString(row.createdByUid),
+    createdByName: coerceString(row.createdByName),
+    createdAt: coerceTimestamp(row.createdAt),
+    dispatchedAt: coerceTimestamp(row.dispatchedAt),
+    receivedAt: coerceTimestamp(row.receivedAt),
+    rejectedAt: coerceTimestamp(row.rejectedAt),
+    cancelledAt: coerceTimestamp(row.cancelledAt),
+    reason: coerceString(row.reason),
+  };
+}
+
+function coerceTimestamp(value: unknown): FirebaseFirestore.Timestamp | null {
+  if (value instanceof admin.firestore.Timestamp) {
+    return value;
+  }
+  if (value instanceof Date) {
+    return admin.firestore.Timestamp.fromDate(value);
+  }
+  return null;
+}
+
+async function loadDtsDestinationRecords(
+  tx: FirebaseFirestore.Transaction,
+  docRef: FirebaseFirestore.DocumentReference
+): Promise<DtsDestinationRecord[]> {
+  const destinationSnap = await tx.get(docRef.collection("destinations"));
+  return destinationSnap.docs
+    .map((row) => mapDtsDestinationRecord(docRef.id, row.id, row.data() ?? {}))
+    .sort((left, right) => left.id.localeCompare(right.id));
+}
+
+function summarizeDtsDestinationRecords(
+  destinations: DtsDestinationRecord[]
+): DtsDestinationSummary {
+  let pending = 0;
+  let inTransit = 0;
+  let received = 0;
+  let rejected = 0;
+  let cancelled = 0;
+  for (const destination of destinations) {
+    switch (destination.status) {
+    case "PENDING":
+      pending += 1;
+      break;
+    case "IN_TRANSIT":
+      inTransit += 1;
+      break;
+    case "RECEIVED":
+      received += 1;
+      break;
+    case "REJECTED":
+      rejected += 1;
+      break;
+    case "CANCELLED":
+      cancelled += 1;
+      break;
+    default:
+      break;
+    }
+  }
+
+  const activeOfficeIds = uniqueSortedStrings(
+    destinations
+      .filter((destination) =>
+        destination.status === "PENDING" || destination.status === "IN_TRANSIT")
+      .map((destination) => destination.toOfficeId)
+  );
+  const allOfficeIds = uniqueSortedStrings(
+    destinations.map((destination) => destination.toOfficeId)
+  );
+
+  return {
+    total: destinations.length,
+    pending,
+    inTransit,
+    received,
+    rejected,
+    cancelled,
+    activeOfficeIds,
+    allOfficeIds,
+  };
+}
+
+function destinationToLegacyPendingTransfer(
+  destination: DtsDestinationRecord
+): Record<string, unknown> {
+  return {
+    fromOfficeId: destination.sourceOfficeId,
+    fromUid: destination.createdByUid,
+    toOfficeId: destination.toOfficeId,
+    toOfficeName: destination.toOfficeName,
+    toUid: destination.toUid,
+    previousStatus: normalizeDtsStatus(destination.previousStatus, "WITH_OFFICE"),
+    initiatedAt: destination.dispatchedAt ?? destination.createdAt ?? admin.firestore.FieldValue.serverTimestamp(),
+    destinationId: destination.id,
+  };
+}
+
+function buildLegacyPendingTransferFromDestinations(
+  destinations: DtsDestinationRecord[]
+): Record<string, unknown> | null {
+  const active = destinations.filter((row) => row.status === "IN_TRANSIT");
+  if (active.length !== 1) {
+    return null;
+  }
+  return destinationToLegacyPendingTransfer(active[0]);
+}
+
+function isDestinationReceiver(
+  actor: StaffContext,
+  destination: DtsDestinationRecord
+): boolean {
+  if (actor.role === "super_admin") {
+    return true;
+  }
+  if (destination.toUid && destination.toUid === actor.uid) {
+    return true;
+  }
+  if (actor.officeId && destination.toOfficeId && actor.officeId === destination.toOfficeId) {
+    return true;
+  }
+  return sameNormalizedName(actor.officeName, destination.toOfficeName);
+}
+
+function isDestinationSource(
+  actor: StaffContext,
+  destination: DtsDestinationRecord,
+  parentRow: Record<string, unknown>
+): boolean {
+  if (actor.role === "super_admin") {
+    return true;
+  }
+  if (destination.createdByUid && destination.createdByUid === actor.uid) {
+    return true;
+  }
+  if (actor.officeId && destination.sourceOfficeId && actor.officeId === destination.sourceOfficeId) {
+    return true;
+  }
+  if (sameNormalizedName(actor.officeName, destination.sourceOfficeName)) {
+    return true;
+  }
+  if (actor.officeId && coerceString(parentRow.currentOfficeId) === actor.officeId) {
+    return true;
+  }
+  return sameNormalizedName(actor.officeName, coerceString(parentRow.currentOfficeName));
+}
+
+function applyDtsDestinationSummaryToParent(
+  tx: FirebaseFirestore.Transaction,
+  docRef: FirebaseFirestore.DocumentReference,
+  parentRow: Record<string, unknown>,
+  destinations: DtsDestinationRecord[],
+  options: ApplyDestinationSummaryOptions = {}
+): {summary: DtsDestinationSummary; status: string} {
+  const summary = summarizeDtsDestinationRecords(destinations);
+  const currentStatus = normalizeDtsStatus(parentRow.status, "WITH_OFFICE");
+  const baseStatus = normalizeDtsStatus(
+    parentRow.distributionBaseStatus,
+    currentStatus === "IN_TRANSIT" ? "WITH_OFFICE" : currentStatus
+  );
+  let nextStatus = options.forceStatus == null
+    ? currentStatus
+    : normalizeDtsStatus(options.forceStatus, currentStatus);
+  const payload: Record<string, unknown> = {
+    distributionMode: summary.total > 1 ? "MULTI" : "SINGLE",
+    destTotal: summary.total,
+    destPending: summary.pending,
+    destInTransit: summary.inTransit,
+    destReceived: summary.received,
+    destRejected: summary.rejected,
+    destCancelled: summary.cancelled,
+    activeDestinationOfficeIds: summary.activeOfficeIds,
+    destinationOfficeIds: summary.allOfficeIds,
+    pendingTransfer: buildLegacyPendingTransferFromDestinations(destinations),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+  if (summary.inTransit > 0 && options.forceStatus == null) {
+    if (currentStatus !== "IN_TRANSIT") {
+      payload.distributionBaseStatus = currentStatus;
+    }
+    nextStatus = "IN_TRANSIT";
+    payload.currentCustodianUid = null;
+  } else if (summary.inTransit === 0 && currentStatus === "IN_TRANSIT" && options.forceStatus == null) {
+    nextStatus = baseStatus;
+  }
+  payload.status = nextStatus;
+  if (options.parentPatch) {
+    Object.assign(payload, options.parentPatch);
+  }
+  tx.set(docRef, payload, {merge: true});
+  return {summary, status: nextStatus};
+}
+
 function sameNormalizedName(a: string | null, b: string | null): boolean {
   if (!a || !b) return false;
   return a.trim().toLowerCase() === b.trim().toLowerCase();
@@ -2484,12 +3269,193 @@ function canOperateOnDtsDoc(
   return isIntendedDtsReceiver(actor, pending);
 }
 
+function findDestinationById(
+  destinations: DtsDestinationRecord[],
+  destinationId: string | null
+): DtsDestinationRecord | null {
+  if (!destinationId) {
+    return null;
+  }
+  return destinations.find((row) => row.id === destinationId) ?? null;
+}
+
+function findReceivingDestinationForActor(
+  destinations: DtsDestinationRecord[],
+  actor: StaffContext
+): DtsDestinationRecord | null {
+  const candidates = destinations.filter((row) =>
+    row.status === "IN_TRANSIT" && isDestinationReceiver(actor, row));
+  if (candidates.length === 1) {
+    return candidates[0];
+  }
+  return null;
+}
+
+function findSourceDestinationForActor(
+  destinations: DtsDestinationRecord[],
+  actor: StaffContext,
+  parentRow: Record<string, unknown>
+): DtsDestinationRecord | null {
+  const candidates = destinations.filter((row) =>
+    (row.status === "IN_TRANSIT" || row.status === "PENDING") &&
+      isDestinationSource(actor, row, parentRow));
+  if (candidates.length === 1) {
+    return candidates[0];
+  }
+  return null;
+}
+
 function actorDisplayName(actor: StaffContext): string {
   return (
     coerceString(actor.profileData.displayName) ??
     coerceString(actor.profileData.email) ??
     actor.uid
   );
+}
+
+type DtsTemplateRecord = {
+  id: string;
+  name: string;
+  officeId: string | null;
+  officeName: string | null;
+  fileUrl: string | null;
+  qrPosition: string;
+  qrSize: number;
+  version: number;
+  isActive: boolean;
+  fileBytes: number | null;
+  createdByUid: string | null;
+  updatedAt: Date | null;
+};
+
+function normalizeTemplateVersion(raw: unknown, fallback = 1): number {
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    return Math.max(1, Math.floor(raw));
+  }
+  if (typeof raw === "string") {
+    const parsed = Number.parseInt(raw.trim(), 10);
+    if (Number.isFinite(parsed)) {
+      return Math.max(1, parsed);
+    }
+  }
+  return fallback;
+}
+
+function normalizeTemplateQrPosition(raw: unknown): string {
+  const candidate = String(raw ?? "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z_]/g, "_");
+  if (DTS_TEMPLATE_ALLOWED_QR_POSITIONS.has(candidate)) {
+    return candidate;
+  }
+  return DTS_TEMPLATE_DEFAULT_QR_POSITION;
+}
+
+function normalizeTemplateQrSize(raw: unknown): number {
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    return Math.max(48, Math.min(220, Math.floor(raw)));
+  }
+  if (typeof raw === "string") {
+    const parsed = Number.parseInt(raw.trim(), 10);
+    if (Number.isFinite(parsed)) {
+      return Math.max(48, Math.min(220, parsed));
+    }
+  }
+  return DTS_TEMPLATE_DEFAULT_QR_SIZE;
+}
+
+function normalizeTemplateFileBytes(raw: unknown): number | null {
+  if (typeof raw === "number" && Number.isFinite(raw) && raw >= 0) {
+    return Math.floor(raw);
+  }
+  if (typeof raw === "string") {
+    const parsed = Number.parseInt(raw.trim(), 10);
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
+function sanitizeTemplateFileUrl(value: unknown): string {
+  const text = coerceString(value);
+  if (!text) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "Template fileUrl is required."
+    );
+  }
+  if (text.length > 2000) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "Template fileUrl is too long."
+    );
+  }
+  if (!text.startsWith("https://") && !text.startsWith("gs://")) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "Template fileUrl must be an HTTPS or gs:// URL."
+    );
+  }
+  const lower = text.toLowerCase();
+  if (!lower.includes(".pdf")) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "Template fileUrl must point to a PDF file."
+    );
+  }
+  return text;
+}
+
+function mapDtsTemplateRecord(
+  templateId: string,
+  row: Record<string, unknown>
+): DtsTemplateRecord {
+  const updatedAtEpoch = parseEpochMs(row.updatedAt ?? row.createdAt);
+  return {
+    id: templateId,
+    name: coerceString(row.name) ?? templateId,
+    officeId: coerceString(row.officeId),
+    officeName: coerceString(row.officeName),
+    fileUrl: coerceString(row.fileUrl),
+    qrPosition: normalizeTemplateQrPosition(row.qrPosition),
+    qrSize: normalizeTemplateQrSize(row.qrSize),
+    version: normalizeTemplateVersion(row.version, 1),
+    isActive: row.isActive !== false,
+    fileBytes: normalizeTemplateFileBytes(row.fileBytes),
+    createdByUid: coerceString(row.createdByUid),
+    updatedAt: updatedAtEpoch > 0 ? new Date(updatedAtEpoch) : null,
+  };
+}
+
+function canManageDtsTemplate(
+  actor: StaffContext,
+  template: DtsTemplateRecord
+): boolean {
+  if (actor.role === "super_admin" || actor.role === "admin") {
+    return true;
+  }
+  if (actor.role !== "office_admin") {
+    return false;
+  }
+  if (!actor.officeId || !template.officeId) {
+    return false;
+  }
+  return actor.officeId === template.officeId;
+}
+
+function assertDtsTemplateManager(actor: StaffContext): void {
+  if (
+    actor.role !== "super_admin" &&
+    actor.role !== "admin" &&
+    actor.role !== "office_admin"
+  ) {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "Only admin, super_admin, or office_admin can manage templates."
+    );
+  }
 }
 
 function toCallableContextFromV2(
@@ -2621,6 +3587,7 @@ function applyTrackLookupCors(
   req: functions.https.Request,
   res: functions.Response<unknown>
 ): boolean {
+  applyJsonEndpointSecurityHeaders(res);
   const origin = String(req.headers.origin ?? "").trim();
   if (!origin) {
     if (allowOriginWithoutAllowlist()) {
@@ -2634,6 +3601,8 @@ function applyTrackLookupCors(
   }
   res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.set("Access-Control-Allow-Credentials", "false");
+  res.set("Access-Control-Max-Age", "600");
   return true;
 }
 
@@ -2971,18 +3940,43 @@ async function verifyPinWithRateLimit(
 
 function dtsEventLabel(type: string): string {
   switch ((type || "").toUpperCase()) {
+    case "CREATED":
+      return "Created";
+    case "DOCUMENT_INTAKE":
+      return "Document intake";
+    case "DOCUMENT_CREATED":
+      return "Document created";
+    case "DOCUMENT_FINALIZED":
+      return "Document finalized";
+    case "DOCUMENT_ROUTED":
+      return "Routed";
     case "TRANSFER_INITIATED":
       return "Transfer initiated";
     case "TRANSFER_CONFIRMED":
       return "Transfer confirmed";
+    case "TRANSFER_CANCELLED":
+      return "Transfer cancelled";
+    case "TRANSFER_REJECTED":
+      return "Transfer rejected";
+    case "DOCUMENT_RECEIVED":
+      return "Received";
     case "STATUS_CHANGED":
       return "Status changed";
+    case "DOCUMENT_GENERATED":
+      return "Generated";
+    case "DOCUMENT_REGENERATED":
+      return "Regenerated";
+    case "DOCUMENT_REPRINTED":
+      return "Reprinted";
     case "RETURNED":
       return "Transfer returned";
     case "RELEASED":
       return "Released";
     case "ARCHIVED":
       return "Archived";
+    case "DOCUMENT_VOIDED":
+    case "VOIDED":
+      return "Voided";
     case "PULLED_OUT":
       return "Pulled out";
     case "NOTE":
@@ -3038,7 +4032,7 @@ export const onAuthUserCreated = functions.auth.user().onCreate(async (user) => 
  * GET MY CLAIMS
  * =========================
  */
-export const getMyClaims = functions.https.onCall(async (_data, context) => {
+export const getMyClaims = protectedCallableFunctions.https.onCall(async (_data, context) => {
   if (!context.auth) {
     throw new functions.https.HttpsError("unauthenticated", "Auth required.");
   }
@@ -3067,7 +4061,7 @@ export const getMyClaims = functions.https.onCall(async (_data, context) => {
  * =========================
  * Trusted online time source for clients.
  */
-export const getServerTime = functions.https.onCall(async (_data, context) => {
+export const getServerTime = protectedCallableFunctions.https.onCall(async (_data, context) => {
   if (!context.auth) {
     throw new functions.https.HttpsError("unauthenticated", "Auth required.");
   }
@@ -3232,7 +4226,7 @@ function buildWorkQueuePreviewFromReports(
  * Server-side scoped counts so admin UI does not depend on client-side
  * Firestore aggregation permissions.
  */
-export const adminDashboardSummary = functions.https.onCall(async (_data, context) => {
+export const adminDashboardSummary = protectedCallableFunctions.https.onCall(async (_data, context) => {
   const actor = await requireStaffContext(context);
 
   const reportsRef = db.collection("reports");
@@ -3690,11 +4684,11 @@ async function adminListReportsScopedHandler(
   };
 }
 
-export const adminListReportsScoped = functions.https.onCall(async (data, context) =>
+export const adminListReportsScoped = protectedCallableFunctions.https.onCall(async (data, context) =>
   adminListReportsScopedHandler(data, context)
 );
 
-export const adminListReportAssignees = functions.https.onCall(async (data, context) => {
+export const adminListReportAssignees = protectedCallableFunctions.https.onCall(async (data, context) => {
   const actor = await requireStaffContext(context);
   const payload = (data && typeof data === "object")
     ? (data as Record<string, unknown>)
@@ -3746,7 +4740,7 @@ async function adminReportsBootstrapHandler(
   };
 }
 
-export const adminReportsBootstrap = functions.https.onCall(async (data, context) =>
+export const adminReportsBootstrap = protectedCallableFunctions.https.onCall(async (data, context) =>
   adminReportsBootstrapHandler(data, context)
 );
 
@@ -4035,7 +5029,7 @@ async function staffListDirectContactsHandler(
   };
 }
 
-export const staffListDirectContacts = onCallV2({region: REGION}, async (request) => {
+export const staffListDirectContacts = onCallV2(protectedCallableV2Options, async (request) => {
   try {
     return await staffListDirectContactsHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -4106,7 +5100,7 @@ async function staffListDirectThreadsHandler(
   return {items};
 }
 
-export const staffListDirectThreads = onCallV2({region: REGION}, async (request) => {
+export const staffListDirectThreads = onCallV2(protectedCallableV2Options, async (request) => {
   try {
     return await staffListDirectThreadsHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -4275,7 +5269,7 @@ async function staffListDirectMessagesHandler(
   };
 }
 
-export const staffListDirectMessages = onCallV2({region: REGION}, async (request) => {
+export const staffListDirectMessages = onCallV2(protectedCallableV2Options, async (request) => {
   try {
     return await staffListDirectMessagesHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -4430,7 +5424,7 @@ async function staffSendDirectMessageHandler(
   };
 }
 
-export const staffSendDirectMessage = onCallV2({region: REGION}, async (request) => {
+export const staffSendDirectMessage = onCallV2(protectedCallableV2Options, async (request) => {
   try {
     return await staffSendDirectMessageHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -4480,7 +5474,7 @@ async function staffSetTypingStateHandler(
   return {success: true, isTyping};
 }
 
-export const staffSetTypingState = onCallV2({region: REGION}, async (request) => {
+export const staffSetTypingState = onCallV2(protectedCallableV2Options, async (request) => {
   try {
     return await staffSetTypingStateHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -4528,7 +5522,7 @@ async function staffPingPresenceHandler(
   return {success: true, state: nextState};
 }
 
-export const staffPingPresence = onCallV2({region: REGION}, async (request) => {
+export const staffPingPresence = onCallV2(protectedCallableV2Options, async (request) => {
   try {
     return await staffPingPresenceHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -5007,7 +6001,7 @@ async function adminWriteAuditLogHandler(
   return {success: true};
 }
 
-export const adminWriteAuditLog = onCallV2({region: REGION}, async (request) => {
+export const adminWriteAuditLog = onCallV2(protectedCallableV2Options, async (request) => {
   try {
     return await adminWriteAuditLogHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -5108,7 +6102,7 @@ async function adminUpdateSettingsHandler(
   };
 }
 
-export const adminUpdateSettings = onCallV2({region: REGION}, async (request) => {
+export const adminUpdateSettings = onCallV2(protectedCallableV2Options, async (request) => {
   try {
     return await adminUpdateSettingsHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -5157,7 +6151,7 @@ async function adminListFeatureSuggestionsHandler(
   };
 }
 
-export const adminListFeatureSuggestions = onCallV2({region: REGION}, async (request) => {
+export const adminListFeatureSuggestions = onCallV2(protectedCallableV2Options, async (request) => {
   try {
     return await adminListFeatureSuggestionsHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -5354,7 +6348,7 @@ async function adminSavePostDraftHandler(
   };
 }
 
-export const adminSavePostDraft = onCallV2({region: REGION}, async (request) => {
+export const adminSavePostDraft = onCallV2(protectedCallableV2Options, async (request) => {
   try {
     return await adminSavePostDraftHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -5483,7 +6477,7 @@ async function adminSavePublicDocDraftHandler(
   };
 }
 
-export const adminSavePublicDocDraft = onCallV2({region: REGION}, async (request) => {
+export const adminSavePublicDocDraft = onCallV2(protectedCallableV2Options, async (request) => {
   try {
     return await adminSavePublicDocDraftHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -5612,7 +6606,7 @@ async function adminSaveJobDraftHandler(
   };
 }
 
-export const adminSaveJobDraft = onCallV2({region: REGION}, async (request) => {
+export const adminSaveJobDraft = onCallV2(protectedCallableV2Options, async (request) => {
   try {
     return await adminSaveJobDraftHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -5774,7 +6768,7 @@ async function adminSaveDirectoryEntryHandler(
   };
 }
 
-export const adminSaveDirectoryEntry = onCallV2({region: REGION}, async (request) => {
+export const adminSaveDirectoryEntry = onCallV2(protectedCallableV2Options, async (request) => {
   try {
     return await adminSaveDirectoryEntryHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -5936,7 +6930,7 @@ async function adminImportDirectoryEntriesHandler(
   };
 }
 
-export const adminImportDirectoryEntries = onCallV2({region: REGION}, async (request) => {
+export const adminImportDirectoryEntries = onCallV2(protectedCallableV2Options, async (request) => {
   try {
     return await adminImportDirectoryEntriesHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -6067,7 +7061,7 @@ async function adminSaveEmergencyHotlineHandler(
   };
 }
 
-export const adminSaveEmergencyHotline = onCallV2({region: REGION}, async (request) => {
+export const adminSaveEmergencyHotline = onCallV2(protectedCallableV2Options, async (request) => {
   try {
     return await adminSaveEmergencyHotlineHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -6196,7 +7190,7 @@ async function adminSetEntityStatusHandler(
   };
 }
 
-export const adminSetEntityStatus = onCallV2({region: REGION}, async (request) => {
+export const adminSetEntityStatus = onCallV2(protectedCallableV2Options, async (request) => {
   try {
     return await adminSetEntityStatusHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -6336,7 +7330,7 @@ async function adminUpdateReportStatusHandler(
 }
 
 export const adminUpdateReportStatus = onCallV2(
-  {region: REGION, secrets: FEEDBACK_EMAIL_FUNCTION_SECRETS},
+  protectedCallableV2FeedbackOptions,
   async (request) => {
     try {
       return await adminUpdateReportStatusHandler(request.data, toCallableContextFromV2(request));
@@ -6459,7 +7453,7 @@ async function staffClaimReportHandler(
 }
 
 export const staffClaimReport = onCallV2(
-  {region: REGION, secrets: FEEDBACK_EMAIL_FUNCTION_SECRETS},
+  protectedCallableV2FeedbackOptions,
   async (request) => {
     try {
       return await staffClaimReportHandler(request.data, toCallableContextFromV2(request));
@@ -6659,7 +7653,7 @@ async function adminAssignReportHandler(
 }
 
 export const adminAssignReport = onCallV2(
-  {region: REGION, secrets: FEEDBACK_EMAIL_FUNCTION_SECRETS},
+  protectedCallableV2FeedbackOptions,
   async (request) => {
     try {
       return await adminAssignReportHandler(request.data, toCallableContextFromV2(request));
@@ -6824,7 +7818,7 @@ async function adminClaimNextReportHandler(
 }
 
 export const adminClaimNextReport = onCallV2(
-  {region: REGION, secrets: FEEDBACK_EMAIL_FUNCTION_SECRETS},
+  protectedCallableV2FeedbackOptions,
   async (request) => {
     try {
       return await adminClaimNextReportHandler(request.data, toCallableContextFromV2(request));
@@ -6967,7 +7961,7 @@ async function adminRequeueReportHandler(
 }
 
 export const adminRequeueReport = onCallV2(
-  {region: REGION, secrets: FEEDBACK_EMAIL_FUNCTION_SECRETS},
+  protectedCallableV2FeedbackOptions,
   async (request) => {
     try {
       return await adminRequeueReportHandler(request.data, toCallableContextFromV2(request));
@@ -7805,7 +8799,7 @@ async function adminListCivilRegistryRequestsHandler(
   };
 }
 
-export const adminListCivilRegistryRequests = onCallV2({region: REGION}, async (request) => {
+export const adminListCivilRegistryRequests = onCallV2(protectedCallableV2Options, async (request) => {
   try {
     return await adminListCivilRegistryRequestsHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -7862,7 +8856,7 @@ async function adminGetCivilRegistryRequestHandler(
   };
 }
 
-export const adminGetCivilRegistryRequest = onCallV2({region: REGION}, async (request) => {
+export const adminGetCivilRegistryRequest = onCallV2(protectedCallableV2Options, async (request) => {
   try {
     return await adminGetCivilRegistryRequestHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -7941,7 +8935,7 @@ async function adminCreateCivilRegistryWalkInHandler(
   };
 }
 
-export const adminCreateCivilRegistryWalkIn = onCallV2({region: REGION}, async (request) => {
+export const adminCreateCivilRegistryWalkIn = onCallV2(protectedCallableV2Options, async (request) => {
   try {
     return await adminCreateCivilRegistryWalkInHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -8033,7 +9027,7 @@ async function adminUpdateCivilRegistryStatusHandler(
   return {success: true, requestId, status: nextStatus};
 }
 
-export const adminUpdateCivilRegistryStatus = onCallV2({region: REGION}, async (request) => {
+export const adminUpdateCivilRegistryStatus = onCallV2(protectedCallableV2Options, async (request) => {
   try {
     return await adminUpdateCivilRegistryStatusHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -8120,7 +9114,7 @@ async function adminRecordCivilRegistryPaymentHandler(
   return {success: true, requestId, status: "Paid"};
 }
 
-export const adminRecordCivilRegistryPayment = onCallV2({region: REGION}, async (request) => {
+export const adminRecordCivilRegistryPayment = onCallV2(protectedCallableV2Options, async (request) => {
   try {
     return await adminRecordCivilRegistryPaymentHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -8214,7 +9208,7 @@ async function adminRecordCivilRegistryReleaseHandler(
   return {success: true, requestId, status: "Released"};
 }
 
-export const adminRecordCivilRegistryRelease = onCallV2({region: REGION}, async (request) => {
+export const adminRecordCivilRegistryRelease = onCallV2(protectedCallableV2Options, async (request) => {
   try {
     return await adminRecordCivilRegistryReleaseHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -8262,7 +9256,7 @@ async function adminCivilRegistrySummaryHandler(
   };
 }
 
-export const adminCivilRegistrySummary = onCallV2({region: REGION}, async (request) => {
+export const adminCivilRegistrySummary = onCallV2(protectedCallableV2Options, async (request) => {
   try {
     return await adminCivilRegistrySummaryHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -8276,7 +9270,7 @@ export const adminCivilRegistrySummary = onCallV2({region: REGION}, async (reque
  * =========================
  * Lightweight runtime/version signal for admin operational checks.
  */
-export const opsRuntimeHealth = functions.https.onCall(async (data, context) => {
+export const opsRuntimeHealth = protectedCallableFunctions.https.onCall(async (data, context) => {
   if (!context.auth) {
     throw new functions.https.HttpsError("unauthenticated", "Auth required.");
   }
@@ -8316,7 +9310,12 @@ export const opsRuntimeHealth = functions.https.onCall(async (data, context) => 
     "adminCreateCivilRegistryWalkIn",
     "adminCivilRegistrySummary",
     "dtsCreateTrackingRecord",
+    "dtsCreateDestinations",
+    "dtsDispatchDestinations",
     "dtsInitiateTransfer",
+    "dtsConfirmDestinationReceipt",
+    "dtsRejectDestination",
+    "dtsCancelDestination",
     "dtsConfirmReceipt",
     "dtsRejectTransfer",
     "dtsUpdateStatus",
@@ -8332,6 +9331,7 @@ export const opsRuntimeHealth = functions.https.onCall(async (data, context) => 
     "generateDtsQrCodes",
     "dtsResolveQrForStaff",
     "exportDtsQrZip",
+    "dtsGetGeneratedPdfAccess",
   ];
   return {
     nowIso: new Date().toISOString(),
@@ -8348,7 +9348,7 @@ export const opsRuntimeHealth = functions.https.onCall(async (data, context) => 
  * SET USER ROLE (super_admin only)
  * =========================
  */
-export const setUserRole = functions.https.onCall(async (data, context) => {
+export const setUserRole = protectedCallableFunctions.https.onCall(async (data, context) => {
   if (!context.auth) {
     throw new functions.https.HttpsError("unauthenticated", "Auth required.");
   }
@@ -8430,7 +9430,7 @@ export const setUserRole = functions.https.onCall(async (data, context) => {
  * USER MANAGEMENT (super_admin only)
  * =========================
  */
-export const adminListUsers = functions.https.onCall(async (data, context) => {
+export const adminListUsers = protectedCallableFunctions.https.onCall(async (data, context) => {
   const actor = await requireSuperAdminContext(context);
   const includeResidents = coerceBool(data?.includeResidents, false);
   const rawLimit = typeof data?.limit === "number" ? Math.floor(data.limit) : 200;
@@ -8532,7 +9532,7 @@ export const adminListUsers = functions.https.onCall(async (data, context) => {
   };
 });
 
-export const adminCreateUser = functions.https.onCall(async (data, context) => {
+export const adminCreateUser = protectedCallableFunctions.https.onCall(async (data, context) => {
   const actor = await requireSuperAdminContext(context);
   const actorName = actorDisplayName(actor);
   const email = coerceString(data?.email);
@@ -8615,7 +9615,7 @@ export const adminCreateUser = functions.https.onCall(async (data, context) => {
   return { success: true, uid: created.uid };
 });
 
-export const adminUpdateUser = functions.https.onCall(async (data, context) => {
+export const adminUpdateUser = protectedCallableFunctions.https.onCall(async (data, context) => {
   const actor = await requireSuperAdminContext(context);
   const actorName = actorDisplayName(actor);
   const uid = coerceString(data?.uid);
@@ -8706,7 +9706,7 @@ export const adminUpdateUser = functions.https.onCall(async (data, context) => {
   return { success: true };
 });
 
-export const adminSetUserSuspension = functions.https.onCall(async (data, context) => {
+export const adminSetUserSuspension = protectedCallableFunctions.https.onCall(async (data, context) => {
   const actor = await requireSuperAdminContext(context);
   const actorName = actorDisplayName(actor);
   const uid = coerceString(data?.uid);
@@ -8765,7 +9765,7 @@ export const adminSetUserSuspension = functions.https.onCall(async (data, contex
   return { success: true };
 });
 
-export const adminResetUserPassword = functions.https.onCall(async (data, context) => {
+export const adminResetUserPassword = protectedCallableFunctions.https.onCall(async (data, context) => {
   const actor = await requireSuperAdminContext(context);
   const actorName = actorDisplayName(actor);
   const uid = coerceString(data?.uid);
@@ -8811,7 +9811,7 @@ export const adminResetUserPassword = functions.https.onCall(async (data, contex
   return { success: true };
 });
 
-export const adminDeleteUser = functions.https.onCall(async (data, context) => {
+export const adminDeleteUser = protectedCallableFunctions.https.onCall(async (data, context) => {
   const actor = await requireSuperAdminContext(context);
   const actorName = actorDisplayName(actor);
   const uid = coerceString(data?.uid);
@@ -9707,6 +10707,201 @@ export const cleanupExpiredDtsTrackSessions = functions.pubsub
 
 /**
  * =========================
+ * DTS QR RESERVATION CLEANUP
+ * =========================
+ * Releases stale reserved QR stickers back to inventory so abandoned scans
+ * do not permanently brick physical sticker stock.
+ */
+export const cleanupExpiredDtsQrReservations = functions.pubsub
+  .schedule("every 15 minutes")
+  .timeZone("Asia/Manila")
+  .onRun(async () => {
+    const nowMs = Date.now();
+    const reservedSnap = await db
+      .collection("dts_qr_codes")
+      .where("status", "==", "reserved")
+      .limit(DTS_QR_RESERVATION_SWEEP_LIMIT)
+      .get();
+
+    if (reservedSnap.empty) {
+      functions.logger.info("cleanupExpiredDtsQrReservations completed", {
+        scanned: 0,
+        released: 0,
+      });
+      return null;
+    }
+
+    let releasedCount = 0;
+    let releasedToUnused = 0;
+    let releasedToUsed = 0;
+    let activeReservations = 0;
+    const touchedBatchIds = new Set<string>();
+    const setWrites: Array<{
+      ref: FirebaseFirestore.DocumentReference<FirebaseFirestore.DocumentData>;
+      data: Record<string, unknown>;
+      merge?: boolean;
+    }> = [];
+
+    for (const snap of reservedSnap.docs) {
+      const row = (snap.data() ?? {}) as Record<string, unknown>;
+      if (!isDtsQrReservationExpired(row, nowMs)) {
+        activeReservations += 1;
+        continue;
+      }
+      const patch = buildDtsQrReservationReleasePatch(row);
+      const nextStatus = normalizeDtsQrCodeStatus(patch.status);
+      if (nextStatus === "used") {
+        releasedToUsed += 1;
+      } else {
+        releasedToUnused += 1;
+      }
+      setWrites.push({
+        ref: snap.ref,
+        data: patch,
+        merge: true,
+      });
+      releasedCount += 1;
+      const batchId = coerceString(row.batchId);
+      if (batchId) {
+        touchedBatchIds.add(batchId);
+      }
+    }
+
+    if (setWrites.length > 0) {
+      await commitDtsQrReconcileWrites(setWrites, []);
+      for (const batchId of touchedBatchIds) {
+        try {
+          await reconcileDtsQrBatch(batchId, {
+            repairQrRows: true,
+            syncBatchCounters: true,
+          });
+        } catch (error) {
+          functions.logger.warn("cleanupExpiredDtsQrReservations reconcile failed", {
+            batchId,
+            error,
+          });
+        }
+      }
+    }
+
+    functions.logger.info("cleanupExpiredDtsQrReservations completed", {
+      scanned: reservedSnap.size,
+      activeReservations,
+      released: releasedCount,
+      releasedToUnused,
+      releasedToUsed,
+      touchedBatches: touchedBatchIds.size,
+      hitQueryLimit: reservedSnap.size === DTS_QR_RESERVATION_SWEEP_LIMIT,
+    });
+    return null;
+  });
+
+/**
+ * =========================
+ * DTS OVERDUE ESCALATION SWEEP
+ * =========================
+ * Periodically writes overdue alert records for DTS documents with due dates.
+ * This keeps overdue visibility available in dashboard alerts even if no user
+ * is actively browsing queue screens.
+ */
+export const escalateOverdueDtsDocuments = functions.pubsub
+  .schedule("every 15 minutes")
+  .timeZone("Asia/Manila")
+  .onRun(async () => {
+    const now = Date.now();
+    const nowTs = admin.firestore.Timestamp.fromMillis(now);
+    const trackedStatuses = Array.from(DTS_OVERDUE_TRACKED_STATUSES);
+    const snapshot = await db
+      .collection("dts_documents")
+      .where("status", "in", trackedStatuses)
+      .where("dueAt", "<=", nowTs)
+      .limit(DTS_OVERDUE_ALERT_SWEEP_LIMIT)
+      .get();
+
+    if (snapshot.empty) {
+      functions.logger.info("escalateOverdueDtsDocuments completed", {
+        scanned: 0,
+        alertsUpserted: 0,
+      });
+      return null;
+    }
+
+    let alertsUpserted = 0;
+    const minRenotifyMillis = DTS_OVERDUE_ALERT_RENOTIFY_HOURS * 60 * 60 * 1000;
+
+    for (const doc of snapshot.docs) {
+      const row = (doc.data() ?? {}) as Record<string, unknown>;
+      const dueAt = parseDtsDueAt(row.dueAt);
+      if (!dueAt) {
+        continue;
+      }
+      const status = normalizeDtsStatus(row.status, "RECEIVED");
+      if (!DTS_OVERDUE_TRACKED_STATUSES.has(status)) {
+        continue;
+      }
+
+      const overdueMillis = now - dueAt.getTime();
+      if (!Number.isFinite(overdueMillis) || overdueMillis <= 0) {
+        continue;
+      }
+
+      const hoursOverdue = Math.max(1, Math.floor(overdueMillis / (60 * 60 * 1000)));
+      const severity = dtsOverdueSeverity(hoursOverdue);
+      const alertRef = db.collection("dts_alerts").doc(`OVERDUE_${doc.id}`);
+      const existing = await alertRef.get();
+      const existingRow = (existing.data() ?? {}) as Record<string, unknown>;
+      const existingStatus = normalizeDtsStatus(existingRow.status, "");
+      const existingHoursRaw = Number(existingRow.hoursOverdue);
+      const existingHours = Number.isFinite(existingHoursRaw)
+        ? Math.max(0, Math.floor(existingHoursRaw))
+        : 0;
+      const lastNotifiedAt =
+        existingRow.lastNotifiedAt instanceof admin.firestore.Timestamp
+          ? existingRow.lastNotifiedAt.toDate()
+          : null;
+      const shouldRenotify =
+        !lastNotifiedAt ||
+        now - lastNotifiedAt.getTime() >= minRenotifyMillis ||
+        existingStatus !== status ||
+        hoursOverdue - existingHours >= 6;
+
+      if (!shouldRenotify && existing.exists) {
+        continue;
+      }
+
+      await alertRef.set(
+        {
+          alertType: "DTS_OVERDUE",
+          status: status,
+          severity: severity,
+          docId: doc.id,
+          trackingNo: coerceString(row.trackingNo) ?? doc.id,
+          title: coerceString(row.title) ?? null,
+          currentOfficeId: coerceString(row.currentOfficeId) ?? null,
+          currentOfficeName: coerceString(row.currentOfficeName) ?? null,
+          dueAt: admin.firestore.Timestamp.fromDate(dueAt),
+          hoursOverdue: hoursOverdue,
+          createdAt: existingRow.createdAt instanceof admin.firestore.Timestamp
+            ? existingRow.createdAt
+            : admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          lastNotifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+          resolved: false,
+        },
+        { merge: true }
+      );
+      alertsUpserted += 1;
+    }
+
+    functions.logger.info("escalateOverdueDtsDocuments completed", {
+      scanned: snapshot.size,
+      alertsUpserted,
+    });
+    return null;
+  });
+
+/**
+ * =========================
  * AD REACTIONS TRIGGER
  * =========================
  * Keeps aggregated like/dislike counts on /ads/{adId}
@@ -9782,12 +10977,23 @@ export const onDtsTimelineNotify = functions.firestore
     const eventType = coerceString(event.type) ?? "NOTE";
     const notifiableTypes = new Set([
       "RECEIVED",
+      "DOCUMENT_INTAKE",
+      "DOCUMENT_CREATED",
+      "DOCUMENT_FINALIZED",
+      "DOCUMENT_GENERATED",
+      "DOCUMENT_ROUTED",
+      "DOCUMENT_RECEIVED",
       "TRANSFER_INITIATED",
+      "TRANSFER_CANCELLED",
+      "TRANSFER_REJECTED",
       "TRANSFER_CONFIRMED",
       "STATUS_CHANGED",
+      "DOCUMENT_REGENERATED",
+      "DOCUMENT_REPRINTED",
       "RETURNED",
       "RELEASED",
       "ARCHIVED",
+      "DOCUMENT_VOIDED",
       "PULLED_OUT",
     ]);
     if (!notifiableTypes.has(eventType.toUpperCase())) return;
@@ -9797,6 +11003,7 @@ export const onDtsTimelineNotify = functions.firestore
     let actorEmail: string | null = null;
     let actorRole: string | null = null;
     let actorOfficeId: string | null = null;
+    let actorOfficeName: string | null = null;
     if (actorUid) {
       const actorSnap = await db.collection("users").doc(actorUid).get();
       const actor = actorSnap.data() ?? {};
@@ -9807,6 +11014,7 @@ export const onDtsTimelineNotify = functions.firestore
       actorEmail = coerceString(actor.email);
       actorRole = normalizeRole(actor.role);
       actorOfficeId = coerceString(actor.officeId);
+      actorOfficeName = coerceString(actor.officeName);
     }
 
     const when = snap.createTime?.toDate() ?? new Date();
@@ -9843,6 +11051,7 @@ export const onDtsTimelineNotify = functions.firestore
       actorEmail: actorEmail ?? null,
       actorRole: actorRole ?? null,
       actorOfficeId: actorOfficeId ?? null,
+      actorOfficeName: actorOfficeName ?? null,
       message: eventNotes != null && eventNotes.length > 0
         ? `DTS ${trackingNoText}: ${movementLabel}. ${eventNotes}`
         : `DTS ${trackingNoText}: ${movementLabel} by ${actorName} at ${whenLabel}.`,
@@ -9903,30 +11112,171 @@ async function dtsCreateTrackingRecordHandler(
     : {};
   const actor = await requireStaffContext(context);
   await requireFeatureWritable("documentTracking");
-  const {trackingNo, pin} = validateTrackingLookupInput(
-    payload.trackingNo ?? payload.trackingNumber,
-    payload.pin
-  );
   const title = coerceString(payload.title) ?? "";
   const description = coerceString(payload.description) ?? "";
   const docType = coerceString(payload.docType) ?? "GENERAL";
+  const originType = (coerceString(payload.originType) ?? "EXTERNAL")
+    .trim()
+    .toUpperCase() === "INTERNAL"
+    ? "INTERNAL"
+    : "EXTERNAL";
+  const shouldAutoIssueTracking =
+    originType === "INTERNAL" &&
+    coerceBool(payload.autoIssueTracking, true);
+  const trackingInput = payload.trackingNo ?? payload.trackingNumber;
+  const pinInput = payload.pin;
+  let trackingNo = "";
+  let pin = "";
+  if (shouldAutoIssueTracking) {
+    trackingNo = await generateUniqueTrackingNo();
+    pin = randomTrackingPin();
+  } else {
+    const validatedLookup = validateTrackingLookupInput(trackingInput, pinInput);
+    trackingNo = validatedLookup.trackingNo;
+    pin = validatedLookup.pin;
+  }
+  const requestedOriginOfficeId = coerceString(payload.originOfficeId);
+  const sourceName = coerceString(payload.sourceName);
+  const documentMode = (coerceString(payload.documentMode) ??
+    (originType === "INTERNAL" ? "QR_EMBEDDED" : "QR_STICKER"))
+    .trim()
+    .toUpperCase() === "QR_EMBEDDED"
+    ? "QR_EMBEDDED"
+    : "QR_STICKER";
+  const generatedFileUrl = coerceString(payload.generatedFileUrl);
+  const activeGeneratedVersionRaw = payload.activeGeneratedVersion;
+  const activeGeneratedVersion = typeof activeGeneratedVersionRaw === "number" &&
+    Number.isFinite(activeGeneratedVersionRaw)
+    ? Math.max(1, Math.floor(activeGeneratedVersionRaw))
+    : (typeof activeGeneratedVersionRaw === "string" &&
+      Number.isFinite(Number.parseInt(activeGeneratedVersionRaw, 10))
+      ? Math.max(1, Number.parseInt(activeGeneratedVersionRaw, 10))
+      : null);
   const requestedOfficeId = coerceString(payload.officeId);
   const requestedOfficeName = coerceString(payload.officeName);
   const intendedOfficeId = coerceString(payload.intendedOfficeId);
   const intendedOfficeName = coerceString(payload.intendedOfficeName);
   const intakeNote = coerceString(payload.intakeNote) ?? "";
-  const requestedQrCode = coerceString(payload.qrCode);
+  const isFastTrack = coerceBool(payload.isFastTrack, false);
+  const requestedPriority = normalizeDtsPriorityLevel(payload.priorityLevel);
+  let priorityLevel = isFastTrack ? requestedPriority : "NORMAL";
+  if (!DTS_PRIORITY_LEVELS.has(priorityLevel)) {
+    priorityLevel = "NORMAL";
+  }
+  const rawSlaHours = payload.slaHours;
+  let slaHours: number | null = null;
+  if (rawSlaHours != null && String(rawSlaHours).trim() !== "") {
+    const parsedSla = Number.parseInt(String(rawSlaHours).trim(), 10);
+    if (!Number.isFinite(parsedSla) || parsedSla < 1 || parsedSla > DTS_MAX_SLA_HOURS) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        `slaHours must be an integer between 1 and ${DTS_MAX_SLA_HOURS}.`
+      );
+    }
+    slaHours = parsedSla;
+  }
+  let dueAt = parseDtsDueAt(payload.dueAt);
+  if (isFastTrack && !dueAt && slaHours != null) {
+    dueAt = new Date(Date.now() + (slaHours * 60 * 60 * 1000));
+  }
+  if (!isFastTrack) {
+    dueAt = null;
+    slaHours = null;
+  }
+  if (isFastTrack && !dueAt) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "Fast-track records require a due date or SLA hours."
+    );
+  }
+  if (dueAt && dueAt.getTime() <= Date.now()) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "dueAt must be set in the future."
+    );
+  }
+  const verificationValue = normalizeDtsVerificationValue(payload.verificationValue);
+  const verificationMethod = normalizeDtsVerificationMethod(payload.verificationMethod);
+  const confirmPhysicalReceipt = coerceBool(payload.confirmPhysicalReceipt, false);
+  let requestedQrCode = coerceString(payload.qrCode)?.trim().toUpperCase() ?? null;
+  const receiptAttemptScope = `INTAKE_${trackingNo}`;
 
-  const officeId =
-    actor.role === "super_admin"
+  const resolvedOriginOfficeId = originType === "INTERNAL"
+    ? (actor.role === "super_admin"
+      ? (requestedOriginOfficeId ?? actor.officeId ?? requestedOfficeId)
+      : (actor.officeId ?? requestedOriginOfficeId ?? requestedOfficeId))
+    : null;
+  const officeId = originType === "INTERNAL"
+    ? resolvedOriginOfficeId
+    : (actor.role === "super_admin"
       ? requestedOfficeId
-      : (actor.officeId ?? requestedOfficeId);
+      : (actor.officeId ?? requestedOfficeId));
   if (!officeId) {
     throw new functions.https.HttpsError(
       "invalid-argument",
       "officeId is required to create tracking records."
     );
   }
+  if (originType === "INTERNAL" && documentMode !== "QR_EMBEDDED") {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "Internal documents must use QR_EMBEDDED mode."
+    );
+  }
+  if (originType === "EXTERNAL" && documentMode !== "QR_STICKER") {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "External intake documents must use QR_STICKER mode."
+    );
+  }
+  if (originType === "EXTERNAL") {
+    await assertReceiptVerificationNotLocked(receiptAttemptScope, actor.uid, context);
+    if (!confirmPhysicalReceipt) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "Physical receipt confirmation is required."
+      );
+    }
+    if (!verificationValue) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "Enter tracking number or QR code for receipt verification."
+      );
+    }
+    if (!requestedQrCode && verificationValue !== trackingNo) {
+      requestedQrCode = verificationValue;
+    }
+    if (!matchesDtsTrackingOrQr(verificationValue, trackingNo, requestedQrCode)) {
+      const locked = await registerReceiptVerificationFailure(
+        receiptAttemptScope,
+        actor.uid,
+        context
+      );
+      if (locked) {
+        throw new functions.https.HttpsError(
+          "resource-exhausted",
+          "Too many invalid verification attempts. Please wait before trying again."
+        );
+      }
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "Invalid tracking number or QR code."
+      );
+    }
+  }
+  if (originType === "EXTERNAL" && !requestedQrCode) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "qrCode is required for external intake records."
+    );
+  }
+  if (originType === "EXTERNAL" && sourceName && sourceName.length > 160) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "sourceName is too long."
+    );
+  }
+  const initialStatus = originType === "INTERNAL" ? "CREATED" : "RECEIVED";
   const officeName =
     requestedOfficeName ??
     actor.officeName ??
@@ -9953,106 +11303,281 @@ async function dtsCreateTrackingRecordHandler(
     : null;
   let resolvedQrCode: string | null = null;
   let resolvedBatchId: string | null = null;
+  let resolvedQrIndexRef:
+    FirebaseFirestore.DocumentReference<FirebaseFirestore.DocumentData> | null = null;
+  let resolvedQrIndexExists = false;
 
-  await db.runTransaction(async (tx) => {
-    let qrRow: Record<string, unknown> | null = null;
-    if (qrRef) {
-      const qrSnap = await tx.get(qrRef);
-      if (!qrSnap.exists) {
-        throw new functions.https.HttpsError(
-          "not-found",
-          "Requested QR code does not exist."
+  try {
+    await db.runTransaction(async (tx) => {
+      let qrRow: Record<string, unknown> | null = null;
+      if (qrRef) {
+        const qrSnap = await tx.get(qrRef);
+        if (!qrSnap.exists) {
+          throw new functions.https.HttpsError(
+            "not-found",
+            "Requested QR code does not exist."
+          );
+        }
+        qrRow = qrSnap.data() ?? {};
+        const qrStatus = normalizeDtsQrCodeStatus(qrRow.status) || "unused";
+        if (qrStatus === "voided") {
+          throw new functions.https.HttpsError(
+            "failed-precondition",
+            "Requested QR code has been voided."
+          );
+        }
+        if (qrStatus === "used") {
+          throw new functions.https.HttpsError(
+            "failed-precondition",
+            "Requested QR code is not available."
+          );
+        }
+        if (qrStatus === "reserved") {
+          const reservedByUid = coerceString(qrRow.reservedByUid);
+          if (!isDtsQrReservationExpired(qrRow) &&
+              reservedByUid &&
+              reservedByUid !== actor.uid) {
+            throw new functions.https.HttpsError(
+              "failed-precondition",
+              "Requested QR code is currently reserved by another staff member."
+            );
+          }
+        }
+        if (qrStatus !== "unused" && qrStatus !== "reserved") {
+          throw new functions.https.HttpsError(
+            "failed-precondition",
+            "Requested QR code is not available."
+          );
+        }
+        resolvedQrCode = requestedQrCode;
+        resolvedBatchId = coerceString(qrRow.batchId);
+      } else if (originType === "INTERNAL" && documentMode === "QR_EMBEDDED") {
+        const unusedQrSnap = await tx.get(
+          db.collection("dts_qr_codes")
+            .where("status", "==", "unused")
+            .limit(1)
         );
+        if (unusedQrSnap.empty) {
+          throw new functions.https.HttpsError(
+            "failed-precondition",
+            "No unused QR code is available for internal finalize."
+          );
+        }
+        const picked = unusedQrSnap.docs[0];
+        qrRow = picked.data() ?? {};
+        if (coerceString(qrRow.status) !== "unused") {
+          throw new functions.https.HttpsError(
+            "failed-precondition",
+            "Unable to reserve an unused QR code."
+          );
+        }
+        resolvedQrCode = picked.id;
+        resolvedBatchId = coerceString(qrRow.batchId);
       }
-      qrRow = qrSnap.data() ?? {};
-      if (coerceString(qrRow.status) !== "unused") {
-        throw new functions.https.HttpsError(
-          "failed-precondition",
-          "Requested QR code is not available."
+
+      if (resolvedQrCode) {
+        resolvedQrIndexRef = db.collection("dts_qr_index").doc(resolvedQrCode);
+        const qrIndexSnap = await tx.get(resolvedQrIndexRef);
+        resolvedQrIndexExists = qrIndexSnap.exists;
+        const indexedDocId = coerceString(qrIndexSnap.data()?.docId);
+        if (indexedDocId) {
+          throw new functions.https.HttpsError(
+            "failed-precondition",
+            "Requested QR code is already linked to a document."
+          );
+        }
+
+        const linkedDocSnap = await tx.get(
+          db.collection("dts_documents")
+            .where("qrCode", "==", resolvedQrCode)
+            .limit(1)
         );
+        if (!linkedDocSnap.empty) {
+          throw new functions.https.HttpsError(
+            "failed-precondition",
+            "Requested QR code is already associated with another tracking record."
+          );
+        }
       }
-      resolvedQrCode = requestedQrCode;
-      resolvedBatchId = coerceString(qrRow.batchId);
-    }
 
-    tx.set(docRef, {
-      qrCode: resolvedQrCode ?? null,
-      trackingNo,
-      title,
-      description,
-      docType,
-      status: "RECEIVED",
-      currentOfficeId: officeId,
-      currentOfficeName: officeName,
-      currentCustodianUid: actor.uid,
-      intendedOfficeId: intendedOfficeId ?? null,
-      intendedOfficeName: intendedOfficeName ?? null,
-      pendingTransfer: null,
-      pinHash,
-      publicPinHash: pinHash,
-      pinHashAlgo: "bcrypt",
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      createdByUid: actor.uid,
-      createdByName: actorName,
-      submittedByUid: null,
-      saveToResidentAccount: false,
-    });
+      tx.set(docRef, {
+        qrCode: resolvedQrCode ?? null,
+        trackingNo,
+        title,
+        description,
+        docType,
+        status: initialStatus,
+        isFastTrack,
+        priorityLevel,
+        dueAt: dueAt ? admin.firestore.Timestamp.fromDate(dueAt) : null,
+        slaHours: slaHours ?? null,
+        originType,
+        originOfficeId: resolvedOriginOfficeId ?? null,
+        sourceName: originType === "EXTERNAL" ? (sourceName ?? null) : null,
+        documentMode,
+        generatedFileUrl: generatedFileUrl ?? null,
+        activeGeneratedVersion: activeGeneratedVersion ?? null,
+        currentOfficeId: officeId,
+        currentOfficeName: officeName,
+        currentCustodianUid: actor.uid,
+        intendedOfficeId: intendedOfficeId ?? null,
+        intendedOfficeName: intendedOfficeName ?? null,
+        distributionMode: "SINGLE",
+        destTotal: 0,
+        destPending: 0,
+        destInTransit: 0,
+        destReceived: 0,
+        destRejected: 0,
+        destCancelled: 0,
+        activeDestinationOfficeIds: [],
+        destinationOfficeIds: [],
+        pendingTransfer: null,
+        pinHash,
+        publicPinHash: pinHash,
+        pinHashAlgo: "bcrypt",
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        createdByUid: actor.uid,
+        createdByName: actorName,
+        submittedByUid: null,
+        saveToResidentAccount: false,
+      });
 
-    tx.set(docRef.collection("timeline").doc(), {
-      type: "STATUS_CHANGED",
-      actionType: "received",
-      byUid: actor.uid,
-      byName: actorName,
-      status: "RECEIVED",
-      notePublic: "Document received.",
-      notes: `Document logged as received by ${actorName}.`,
-      officeName,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-
-    if (intakeNote) {
       tx.set(docRef.collection("timeline").doc(), {
-        type: "NOTE",
+        type: originType === "INTERNAL" ? "DOCUMENT_FINALIZED" : "DOCUMENT_INTAKE",
+        actionType: originType === "INTERNAL" ? "DOCUMENT_FINALIZED" : "DOCUMENT_INTAKE",
+        action: originType === "INTERNAL" ? "DOCUMENT_FINALIZED" : "DOCUMENT_INTAKE",
+        method: originType === "EXTERNAL" ? verificationMethod : null,
+        verificationMethod: originType === "EXTERNAL" ? verificationMethod : null,
         byUid: actor.uid,
         byName: actorName,
-        status: "RECEIVED",
-        notePublic: null,
-        notes: intakeNote,
+        byOfficeId: actor.officeId ?? officeId,
+        byOfficeName: actor.officeName ?? officeName,
+        officeId,
+        status: initialStatus,
+        notePublic: originType === "INTERNAL"
+          ? "Document finalized."
+          : "Document received.",
+        notes: originType === "INTERNAL"
+          ? `Document finalized by ${actorName}.`
+          : `Document logged as received by ${actorName} (${verificationMethod}).`,
         officeName,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
-    }
 
-    if (resolvedQrCode) {
-      tx.set(db.collection("dts_qr_index").doc(resolvedQrCode), {
-        docId: docRef.id,
-        trackingNo,
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-      tx.set(
-        db.collection("dts_qr_codes").doc(resolvedQrCode),
-        {
-          status: "used",
-          docId: docRef.id,
-          usedAt: admin.firestore.FieldValue.serverTimestamp(),
-          usedByUid: actor.uid,
-        },
-        {merge: true}
-      );
-      if (resolvedBatchId) {
-        tx.set(
-          db.collection("dts_qr_batches").doc(resolvedBatchId),
-          {
-            unusedCount: admin.firestore.FieldValue.increment(-1),
-            usedCount: admin.firestore.FieldValue.increment(1),
+      if (isFastTrack) {
+        tx.set(docRef.collection("timeline").doc(), {
+          type: "PRIORITY_SET",
+          actionType: "DOCUMENT_PRIORITY_SET",
+          action: "DOCUMENT_PRIORITY_SET",
+          byUid: actor.uid,
+          byName: actorName,
+          byOfficeId: actor.officeId ?? officeId,
+          byOfficeName: actor.officeName ?? officeName,
+          officeId,
+          status: initialStatus,
+          notePublic: "This document is prioritized for expedited handling.",
+          notes: dueAt
+            ? `Fast-track set to ${priorityLevel}. Due ${dueAt.toISOString()}${slaHours ? ` (SLA ${slaHours}h).` : "."}`
+            : `Fast-track set to ${priorityLevel}.`,
+          officeName,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      }
+
+      if (intakeNote) {
+        tx.set(docRef.collection("timeline").doc(), {
+          type: "NOTE",
+          actionType: "NOTE_ADDED",
+          action: "NOTE_ADDED",
+          byUid: actor.uid,
+          byName: actorName,
+          byOfficeId: actor.officeId ?? officeId,
+          byOfficeName: actor.officeName ?? officeName,
+          officeId,
+          status: initialStatus,
+          notePublic: null,
+          notes: intakeNote,
+          officeName,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      }
+
+      if (resolvedQrCode) {
+        const qrIndexRef = resolvedQrIndexRef ??
+          db.collection("dts_qr_index").doc(resolvedQrCode);
+        if (resolvedQrIndexExists) {
+          tx.set(qrIndexRef, {
+            docId: docRef.id,
+            trackingNo,
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          }, {merge: true});
+        } else {
+          tx.create(qrIndexRef, {
+            docId: docRef.id,
+            trackingNo,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        }
+        tx.set(
+          db.collection("dts_qr_codes").doc(resolvedQrCode),
+          {
+            status: "used",
+            docId: docRef.id,
+            usedAt: admin.firestore.FieldValue.serverTimestamp(),
+            usedByUid: actor.uid,
+            reservedAt: admin.firestore.FieldValue.delete(),
+            reservedByUid: admin.firestore.FieldValue.delete(),
+            reservationExpiresAt: admin.firestore.FieldValue.delete(),
           },
           {merge: true}
         );
+        if (resolvedBatchId) {
+          tx.set(
+            db.collection("dts_qr_batches").doc(resolvedBatchId),
+            {
+              unusedCount: admin.firestore.FieldValue.increment(-1),
+              usedCount: admin.firestore.FieldValue.increment(1),
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            {merge: true}
+          );
+        }
+      }
+    });
+  } catch (error) {
+    if (originType === "EXTERNAL") {
+      const code = (error as {code?: string})?.code ?? "";
+      const message = (error as {message?: string})?.message ?? "";
+      const isVerificationFailure =
+        code === "not-found" ||
+        code === "failed-precondition" ||
+        (code === "invalid-argument" && /tracking number|qr/i.test(message));
+      if (isVerificationFailure) {
+        const locked = await registerReceiptVerificationFailure(
+          receiptAttemptScope,
+          actor.uid,
+          context
+        );
+        if (locked) {
+          throw new functions.https.HttpsError(
+            "resource-exhausted",
+            "Too many invalid verification attempts. Please wait before trying again."
+          );
+        }
+        throw new functions.https.HttpsError(
+          "invalid-argument",
+          "Invalid tracking number or QR code."
+        );
       }
     }
-  });
+    throw error;
+  }
+
+  if (originType === "EXTERNAL") {
+    await clearReceiptVerificationAttempts(receiptAttemptScope, actor.uid, context);
+  }
 
   await addAuditLog({
     action: "tracking_created",
@@ -10066,7 +11591,7 @@ async function dtsCreateTrackingRecordHandler(
     actorOfficeId: actor.officeId ?? null,
     actorOfficeName: actor.officeName ?? null,
     actorName,
-    message: "Tracking record created.",
+    message: `Tracking record created (${originType.toLowerCase()}).`,
   });
 
   return {
@@ -10074,11 +11599,18 @@ async function dtsCreateTrackingRecordHandler(
     id: docRef.id,
     trackingNo,
     pin,
+    status: initialStatus,
+    originType,
+    documentMode,
     qrCode: resolvedQrCode,
+    isFastTrack,
+    priorityLevel,
+    dueAt: dueAt ? dueAt.toISOString() : null,
+    slaHours,
   };
 }
 
-export const dtsCreateTrackingRecord = onCallV2({region: REGION}, async (request) => {
+export const dtsCreateTrackingRecord = onCallV2(protectedCallableV2Options, async (request) => {
   try {
     return await dtsCreateTrackingRecordHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -10086,7 +11618,927 @@ export const dtsCreateTrackingRecord = onCallV2({region: REGION}, async (request
   }
 });
 
-export const dtsResolveQrForStaff = functions.https.onCall(
+export const dtsReserveAndCreateTrackingRecord = onCallV2(
+  protectedCallableV2Options,
+  async (request) => {
+    try {
+      // Atomic entrypoint for intake: reserve/validate QR and create record
+      // inside the same server transaction path.
+      return await dtsCreateTrackingRecordHandler(
+        request.data,
+        toCallableContextFromV2(request)
+      );
+    } catch (error) {
+      throw normalizeCallableErrorForV2(error);
+    }
+  }
+);
+
+async function dtsListTemplatesHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const payload = (data && typeof data === "object") ?
+    (data as Record<string, unknown>) :
+    {};
+  const actor = await requireStaffContext(context);
+  await requireFeatureWritable("documentTracking");
+  const includeInactive = coerceBool(payload.includeInactive, false);
+  const requestedOfficeId = coerceString(payload.officeId);
+  const requestedLimit = normalizeTemplateVersion(payload.limit, 60);
+  const limitRows = Math.max(1, Math.min(240, requestedLimit));
+
+  const officeScope = (actor.role === "super_admin" || actor.role === "admin") ?
+    requestedOfficeId :
+    (actor.officeId ?? requestedOfficeId);
+
+  let query: FirebaseFirestore.Query<FirebaseFirestore.DocumentData> = db
+    .collection("dts_templates")
+    .limit(limitRows);
+  if (officeScope) {
+    query = query.where("officeId", "==", officeScope);
+  }
+  if (!includeInactive) {
+    query = query.where("isActive", "==", true);
+  }
+
+  const snap = await query.get();
+  const items = snap.docs
+    .map((row) => mapDtsTemplateRecord(row.id, row.data() ?? {}))
+    .filter((row) => {
+      if (actor.role === "super_admin" || actor.role === "admin") {
+        return true;
+      }
+      if (!actor.officeId) return false;
+      return row.officeId === actor.officeId;
+    })
+    .sort((left, right) => {
+      const leftTs = left.updatedAt?.getTime() ?? 0;
+      const rightTs = right.updatedAt?.getTime() ?? 0;
+      if (leftTs !== rightTs) return rightTs - leftTs;
+      return left.name.toLowerCase().localeCompare(right.name.toLowerCase());
+    })
+    .map((row) => ({
+      id: row.id,
+      name: row.name,
+      officeId: row.officeId,
+      officeName: row.officeName,
+      fileUrl: row.fileUrl,
+      qrPosition: row.qrPosition,
+      qrSize: row.qrSize,
+      version: row.version,
+      isActive: row.isActive,
+      fileBytes: row.fileBytes,
+      updatedAt: row.updatedAt ? row.updatedAt.toISOString() : null,
+    }));
+
+  return {
+    success: true,
+    items,
+  };
+}
+
+export const dtsListTemplates = onCallV2(protectedCallableV2Options, async (request) => {
+  try {
+    return await dtsListTemplatesHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+async function dtsCreateTemplateHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const payload = (data && typeof data === "object") ?
+    (data as Record<string, unknown>) :
+    {};
+  const actor = await requireStaffContext(context);
+  assertDtsTemplateManager(actor);
+  await requireFeatureWritable("documentTracking");
+
+  const name = coerceString(payload.name);
+  if (!name || name.length > 120) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "Template name is required and must be 120 chars or less."
+    );
+  }
+  const fileUrl = sanitizeTemplateFileUrl(payload.fileUrl);
+  const fileBytes = normalizeTemplateFileBytes(payload.fileBytes);
+  if (fileBytes != null && fileBytes > DTS_TEMPLATE_FILE_MAX_BYTES) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "Template file exceeds the 12 MB upload limit."
+    );
+  }
+  const requestedOfficeId = coerceString(payload.officeId);
+  const requestedOfficeName = coerceString(payload.officeName);
+  let officeId = actor.officeId ?? null;
+  if (actor.role === "super_admin" || actor.role === "admin") {
+    officeId = requestedOfficeId ?? officeId;
+  } else if (requestedOfficeId && requestedOfficeId !== actor.officeId) {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "You cannot create templates outside your office."
+    );
+  }
+  if (!officeId) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "officeId is required for template creation."
+    );
+  }
+
+  const officeName = requestedOfficeName ??
+    actor.officeName ??
+    coerceString((await db.collection("offices").doc(officeId).get()).data()?.name) ??
+    officeId;
+  const qrPosition = normalizeTemplateQrPosition(payload.qrPosition);
+  const qrSize = normalizeTemplateQrSize(payload.qrSize);
+  const templateRef = db.collection("dts_templates").doc();
+  const actorName = actorDisplayName(actor);
+
+  await templateRef.set({
+    name,
+    officeId,
+    officeName,
+    fileUrl,
+    fileBytes: fileBytes ?? null,
+    qrPosition,
+    qrSize,
+    version: 1,
+    isActive: true,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    createdByUid: actor.uid,
+    createdByName: actorName,
+    updatedByUid: actor.uid,
+    updatedByName: actorName,
+  });
+
+  await addAuditLog({
+    action: "dts_template_created",
+    entityType: "dts_templates",
+    entityId: templateRef.id,
+    officeId,
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorOfficeId: actor.officeId ?? null,
+    actorOfficeName: actor.officeName ?? null,
+    actorName,
+    message: `Template created: ${name}.`,
+  });
+
+  return {
+    success: true,
+    item: {
+      id: templateRef.id,
+      name,
+      officeId,
+      officeName,
+      fileUrl,
+      fileBytes: fileBytes ?? null,
+      qrPosition,
+      qrSize,
+      version: 1,
+      isActive: true,
+    },
+  };
+}
+
+export const dtsCreateTemplate = onCallV2(protectedCallableV2Options, async (request) => {
+  try {
+    return await dtsCreateTemplateHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+async function dtsUpdateTemplateHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const payload = (data && typeof data === "object") ?
+    (data as Record<string, unknown>) :
+    {};
+  const actor = await requireStaffContext(context);
+  assertDtsTemplateManager(actor);
+  await requireFeatureWritable("documentTracking");
+
+  const templateId = coerceString(payload.templateId);
+  if (!templateId) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "templateId is required."
+    );
+  }
+  const templateRef = db.collection("dts_templates").doc(templateId);
+  const templateSnap = await templateRef.get();
+  if (!templateSnap.exists) {
+    throw new functions.https.HttpsError("not-found", "Template not found.");
+  }
+  const current = mapDtsTemplateRecord(templateSnap.id, templateSnap.data() ?? {});
+  if (!canManageDtsTemplate(actor, current)) {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "You cannot update this template."
+    );
+  }
+
+  const requestedOfficeId = coerceString(payload.officeId);
+  if (requestedOfficeId && requestedOfficeId !== current.officeId) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "Template office scope cannot be changed."
+    );
+  }
+
+  const updates: Record<string, unknown> = {};
+  const nextName = coerceString(payload.name);
+  if (nextName != null) {
+    if (nextName.length > 120) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "Template name must be 120 chars or less."
+      );
+    }
+    updates.name = nextName;
+  }
+
+  const nextFileUrlRaw = payload.fileUrl;
+  const hasFileUrlUpdate = nextFileUrlRaw != null;
+  const nextFileUrl = hasFileUrlUpdate ?
+    sanitizeTemplateFileUrl(nextFileUrlRaw) :
+    current.fileUrl;
+  if (hasFileUrlUpdate) {
+    updates.fileUrl = nextFileUrl;
+  }
+
+  const nextQrPositionRaw = payload.qrPosition;
+  const hasQrPositionUpdate = nextQrPositionRaw != null;
+  const nextQrPosition = hasQrPositionUpdate ?
+    normalizeTemplateQrPosition(nextQrPositionRaw) :
+    current.qrPosition;
+  if (hasQrPositionUpdate) {
+    updates.qrPosition = nextQrPosition;
+  }
+
+  const nextQrSizeRaw = payload.qrSize;
+  const hasQrSizeUpdate = nextQrSizeRaw != null;
+  const nextQrSize = hasQrSizeUpdate ?
+    normalizeTemplateQrSize(nextQrSizeRaw) :
+    current.qrSize;
+  if (hasQrSizeUpdate) {
+    updates.qrSize = nextQrSize;
+  }
+
+  const fileBytes = normalizeTemplateFileBytes(payload.fileBytes);
+  if (fileBytes != null) {
+    if (fileBytes > DTS_TEMPLATE_FILE_MAX_BYTES) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "Template file exceeds the 12 MB upload limit."
+      );
+    }
+    updates.fileBytes = fileBytes;
+  }
+
+  const layoutChanged = hasFileUrlUpdate || hasQrPositionUpdate || hasQrSizeUpdate;
+  const nextVersion = layoutChanged ? current.version + 1 : current.version;
+  if (layoutChanged) {
+    updates.version = nextVersion;
+  }
+  updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
+  updates.updatedByUid = actor.uid;
+  updates.updatedByName = actorDisplayName(actor);
+
+  await templateRef.set(updates, {merge: true});
+
+  await addAuditLog({
+    action: "dts_template_updated",
+    entityType: "dts_templates",
+    entityId: templateId,
+    officeId: current.officeId ?? actor.officeId ?? null,
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorOfficeId: actor.officeId ?? null,
+    actorOfficeName: actor.officeName ?? null,
+    actorName: actorDisplayName(actor),
+    message: layoutChanged ?
+      `Template updated with version bump to v${nextVersion}.` :
+      "Template metadata updated.",
+  });
+
+  const merged = {
+    id: templateId,
+    name: (updates.name as string | undefined) ?? current.name,
+    officeId: current.officeId,
+    officeName: current.officeName,
+    fileUrl: (updates.fileUrl as string | undefined) ?? current.fileUrl,
+    fileBytes: (updates.fileBytes as number | undefined) ?? current.fileBytes,
+    qrPosition: (updates.qrPosition as string | undefined) ?? current.qrPosition,
+    qrSize: (updates.qrSize as number | undefined) ?? current.qrSize,
+    version: nextVersion,
+    isActive: current.isActive,
+  };
+
+  return {
+    success: true,
+    item: merged,
+  };
+}
+
+export const dtsUpdateTemplate = onCallV2(protectedCallableV2Options, async (request) => {
+  try {
+    return await dtsUpdateTemplateHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+async function dtsDeactivateTemplateHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const payload = (data && typeof data === "object") ?
+    (data as Record<string, unknown>) :
+    {};
+  const actor = await requireStaffContext(context);
+  assertDtsTemplateManager(actor);
+  await requireFeatureWritable("documentTracking");
+
+  const templateId = coerceString(payload.templateId);
+  if (!templateId) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "templateId is required."
+    );
+  }
+
+  const templateRef = db.collection("dts_templates").doc(templateId);
+  const templateSnap = await templateRef.get();
+  if (!templateSnap.exists) {
+    throw new functions.https.HttpsError("not-found", "Template not found.");
+  }
+  const current = mapDtsTemplateRecord(templateSnap.id, templateSnap.data() ?? {});
+  if (!canManageDtsTemplate(actor, current)) {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "You cannot deactivate this template."
+    );
+  }
+
+  await templateRef.set({
+    isActive: false,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedByUid: actor.uid,
+    updatedByName: actorDisplayName(actor),
+  }, {merge: true});
+
+  await addAuditLog({
+    action: "dts_template_deactivated",
+    entityType: "dts_templates",
+    entityId: templateId,
+    officeId: current.officeId ?? actor.officeId ?? null,
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorOfficeId: actor.officeId ?? null,
+    actorOfficeName: actor.officeName ?? null,
+    actorName: actorDisplayName(actor),
+    message: `Template deactivated: ${current.name}.`,
+  });
+
+  return {
+    success: true,
+    templateId,
+    isActive: false,
+  };
+}
+
+export const dtsDeactivateTemplate = onCallV2(protectedCallableV2Options, async (request) => {
+  try {
+    return await dtsDeactivateTemplateHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+async function dtsPreviewInternalPdfHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const payload = (data && typeof data === "object") ?
+    (data as Record<string, unknown>) :
+    {};
+  const actor = await requireStaffContext(context);
+  await requireFeatureWritable("documentTracking");
+
+  const requestedOfficeId = coerceString(payload.officeId);
+  const officeId = (actor.role === "super_admin" || actor.role === "admin") ?
+    (requestedOfficeId ?? actor.officeId) :
+    (actor.officeId ?? requestedOfficeId);
+  if (!officeId) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "officeId is required for internal preview."
+    );
+  }
+
+  const sourcePdf = decodePdfBase64(payload.fileBase64);
+  const fileName = sanitizePdfFileName(coerceString(payload.fileName));
+  const previewTrackingNo = coerceString(payload.trackingNo) ??
+    `PREVIEW-${Date.now().toString().slice(-8)}`;
+  const previewQrCode = coerceString(payload.qrCode) ??
+    `PREVIEW-${crypto.randomBytes(3).toString("hex").toUpperCase()}`;
+  const parsed = await PDFDocument.load(sourcePdf, {ignoreEncryption: true});
+  const pageCount = parsed.getPageCount();
+  if (pageCount <= 0) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "PDF must contain at least one page."
+    );
+  }
+  const stamped = await stampInternalPdfDocument(
+    sourcePdf,
+    previewTrackingNo,
+    previewQrCode
+  );
+  const previewPath = `dts_previews/${actor.uid}/${Date.now()}-${crypto.randomBytes(3).toString("hex")}-${fileName}`;
+  const bucket = admin.storage().bucket();
+  const previewFile = bucket.file(previewPath);
+  await previewFile.save(stamped, {
+    metadata: {
+      contentType: "application/pdf",
+      cacheControl: "private, max-age=300",
+    },
+  });
+
+  const expiresAtMs = Date.now() + 1000 * 60 * 15;
+  let previewDownloadUrl: string | null = null;
+  try {
+    previewDownloadUrl = await buildStorageSignedReadUrl(previewPath, expiresAtMs);
+  } catch (error) {
+    console.warn("dtsPreviewInternalPdf: signed URL generation failed; using token URL fallback", {
+      error,
+    });
+    previewDownloadUrl = await buildStorageTokenUrl(previewPath);
+  }
+
+  return {
+    success: true,
+    fileName,
+    pageCount,
+    originalBytes: sourcePdf.length,
+    stampedBytes: stamped.length,
+    trackingNoPreview: previewTrackingNo,
+    qrCodePreview: previewQrCode,
+    previewFilePath: previewPath,
+    previewDownloadUrl,
+    previewExpiresAt: new Date(expiresAtMs).toISOString(),
+  };
+}
+
+export const dtsPreviewInternalPdf = onCallV2(protectedCallableV2Options, async (request) => {
+  try {
+    return await dtsPreviewInternalPdfHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+async function dtsStampInternalPdfHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const payload = (data && typeof data === "object") ?
+    (data as Record<string, unknown>) :
+    {};
+  const actor = await requireStaffContext(context);
+  await requireFeatureWritable("documentTracking");
+
+  const docId = coerceString(payload.docId);
+  if (!docId) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "docId is required."
+    );
+  }
+  const docRef = db.collection("dts_documents").doc(docId);
+  const docSnap = await docRef.get();
+  if (!docSnap.exists) {
+    throw new functions.https.HttpsError("not-found", "Document not found.");
+  }
+  const docRow = docSnap.data() ?? {};
+  if (!canOperateOnDtsDoc(actor, docRow)) {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "You cannot stamp this document."
+    );
+  }
+  const originType = (coerceString(docRow.originType) ?? "EXTERNAL")
+    .trim()
+    .toUpperCase();
+  if (originType !== "INTERNAL") {
+    throw new functions.https.HttpsError(
+      "failed-precondition",
+      "PDF stamping is available only for internal documents."
+    );
+  }
+  const status = normalizeDtsStatus(docRow.status, "CREATED");
+  if (status === "ARCHIVED" || status === "VOIDED") {
+    throw new functions.https.HttpsError(
+      "failed-precondition",
+      "Archived or voided records cannot be restamped."
+    );
+  }
+  const trackingNo = coerceString(docRow.trackingNo);
+  const qrCode = coerceString(docRow.qrCode);
+  if (!trackingNo || !qrCode) {
+    throw new functions.https.HttpsError(
+      "failed-precondition",
+      "Document is missing tracking number or QR assignment."
+    );
+  }
+
+  const idempotencyKey = coerceString(payload.idempotencyKey);
+  const requestRef = idempotencyKey ?
+    docRef.collection("generation_requests").doc(sha256(idempotencyKey).slice(0, 40)) :
+    null;
+  if (requestRef) {
+    try {
+      await requestRef.create({
+        status: "processing",
+        createdByUid: actor.uid,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    } catch (_error) {
+      const existing = await requestRef.get();
+      const row = existing.data() ?? {};
+      if (coerceString(row.status) === "completed" && row.result) {
+        return row.result;
+      }
+      throw new functions.https.HttpsError(
+        "aborted",
+        "A finalize request is already in progress for this action."
+      );
+    }
+  }
+
+  try {
+    const sourcePdf = decodePdfBase64(payload.fileBase64);
+    const safeFileName = sanitizePdfFileName(coerceString(payload.fileName));
+    const stampedPdf = await stampInternalPdfDocument(sourcePdf, trackingNo, qrCode);
+    const currentVersion = Number.isFinite(Number(docRow.activeGeneratedVersion)) ?
+      Math.max(0, Number(docRow.activeGeneratedVersion)) :
+      0;
+    const nextVersion = currentVersion + 1;
+    const bucket = admin.storage().bucket();
+    const versionPath = `dts_documents/${docId}/generated/v${nextVersion}`;
+    const originalPath = `${versionPath}/original_${safeFileName}`;
+    const stampedPath = `${versionPath}/stamped_${safeFileName}`;
+    await bucket.file(originalPath).save(sourcePdf, {
+      metadata: {
+        contentType: "application/pdf",
+        metadata: {
+          dtsDocId: docId,
+          trackingNo,
+          generatedVersion: String(nextVersion),
+          source: "internal_pdf_original",
+        },
+      },
+    });
+    await bucket.file(stampedPath).save(stampedPdf, {
+      metadata: {
+        contentType: "application/pdf",
+        metadata: {
+          dtsDocId: docId,
+          trackingNo,
+          qrCode,
+          generatedVersion: String(nextVersion),
+          source: "internal_pdf_stamped",
+        },
+      },
+    });
+    let generatedFileUrl: string | null = null;
+    try {
+      generatedFileUrl = await buildStorageSignedReadUrl(
+        stampedPath,
+        Date.now() + 1000 * 60 * 15
+      );
+    } catch (error) {
+      if (FUNCTIONS_EMULATOR_ENABLED) {
+        generatedFileUrl = await buildStorageTokenUrl(stampedPath);
+      } else {
+        console.warn("dtsStampInternalPdf: signed URL generation failed", {
+          docId,
+          stampedPath,
+          error,
+        });
+      }
+    }
+
+    const timelineAttachments: Array<Record<string, unknown>> = [
+      {
+        name: `Stamped ${safeFileName}`,
+        path: stampedPath,
+        contentType: "application/pdf",
+        uploadedAt: new Date().toISOString(),
+      },
+      {
+        name: `Original ${safeFileName}`,
+        path: originalPath,
+        contentType: "application/pdf",
+        uploadedAt: new Date().toISOString(),
+      },
+    ];
+    const generatedAtIso = new Date().toISOString();
+    const generatedFileEntry: Record<string, unknown> = {
+      version: nextVersion,
+      fileName: safeFileName,
+      stampedPath,
+      stampedUrl: generatedFileUrl,
+      originalPath,
+      generatedAt: generatedAtIso,
+      generatedByUid: actor.uid,
+      generatedByName: actorDisplayName(actor),
+    };
+
+    await db.runTransaction(async (tx) => {
+      const currentSnap = await tx.get(docRef);
+      if (!currentSnap.exists) {
+        throw new functions.https.HttpsError("not-found", "Document not found.");
+      }
+      const currentRow = currentSnap.data() ?? {};
+      if (coerceString(currentRow.qrCode) !== qrCode) {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          "QR assignment changed. Retry stamping."
+        );
+      }
+      const existingGeneratedFiles = Array.isArray(currentRow.generatedFiles) ?
+        currentRow.generatedFiles
+          .filter((item: unknown) => Boolean(item) && typeof item === "object")
+          .map((item: unknown) => ({...(item as Record<string, unknown>)})) :
+        [];
+      const nextGeneratedFiles = [...existingGeneratedFiles, generatedFileEntry]
+        .filter((item) => {
+          const stamped = coerceString(item.stampedPath);
+          const original = coerceString(item.originalPath);
+          return Boolean(stamped || original);
+        })
+        .sort((left, right) => {
+          const leftVersion = Number.isFinite(Number(left.version)) ?
+            Number(left.version) :
+            0;
+          const rightVersion = Number.isFinite(Number(right.version)) ?
+            Number(right.version) :
+            0;
+          if (leftVersion !== rightVersion) {
+            return rightVersion - leftVersion;
+          }
+          const leftGeneratedAt = Date.parse(coerceString(left.generatedAt) ?? "");
+          const rightGeneratedAt = Date.parse(coerceString(right.generatedAt) ?? "");
+          return (Number.isFinite(rightGeneratedAt) ? rightGeneratedAt : 0) -
+            (Number.isFinite(leftGeneratedAt) ? leftGeneratedAt : 0);
+        })
+        .slice(0, 32);
+      tx.set(docRef, {
+        generatedFilePath: stampedPath,
+        originalUploadPath: originalPath,
+        generatedFileUrl,
+        activeGeneratedVersion: nextVersion,
+        generatedFiles: nextGeneratedFiles,
+        generatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        generatedByUid: actor.uid,
+        generatedByName: actorDisplayName(actor),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, {merge: true});
+      tx.set(docRef.collection("timeline").doc(), {
+        type: nextVersion > 1 ? "DOCUMENT_REGENERATED" : "DOCUMENT_GENERATED",
+        actionType: nextVersion > 1 ? "DOCUMENT_REGENERATED" : "DOCUMENT_GENERATED",
+        action: nextVersion > 1 ? "DOCUMENT_REGENERATED" : "DOCUMENT_GENERATED",
+        byUid: actor.uid,
+        byName: actorDisplayName(actor),
+        byOfficeId: actor.officeId ?? coerceString(currentRow.currentOfficeId) ?? null,
+        byOfficeName: actor.officeName ?? coerceString(currentRow.currentOfficeName) ?? null,
+        officeId: coerceString(currentRow.currentOfficeId) ?? actor.officeId ?? null,
+        status: normalizeDtsStatus(currentRow.status, "CREATED"),
+        notePublic: "Document print copy prepared.",
+        notes: nextVersion > 1
+          ? `Regenerated stamped PDF version ${nextVersion}.`
+          : `Generated stamped PDF version ${nextVersion}.`,
+        officeName: coerceString(currentRow.currentOfficeName) ?? actor.officeName ?? null,
+        generatedVersion: nextVersion,
+        attachments: timelineAttachments,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    });
+
+    await addAuditLog({
+      action: "dts_internal_pdf_stamped",
+      entityType: "dts_documents",
+      entityId: docId,
+      dtsDocId: docId,
+      dtsTrackingNo: trackingNo,
+      officeId: actor.officeId ?? coerceString(docRow.currentOfficeId) ?? null,
+      actorUid: actor.uid,
+      actorRole: actor.role,
+      actorOfficeId: actor.officeId ?? null,
+      actorOfficeName: actor.officeName ?? null,
+      actorName: actorDisplayName(actor),
+      message: `Generated stamped PDF version ${nextVersion}.`,
+    });
+
+    const response = {
+      success: true,
+      docId,
+      trackingNo,
+      qrCode,
+      activeGeneratedVersion: nextVersion,
+      generatedFilePath: stampedPath,
+      generatedFileUrl,
+      originalUploadPath: originalPath,
+      fileName: safeFileName,
+    };
+    if (requestRef) {
+      await requestRef.set({
+        status: "completed",
+        result: response,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, {merge: true});
+    }
+    return response;
+  } catch (error) {
+    if (requestRef) {
+      await requestRef.set({
+        status: "failed",
+        error: error instanceof Error ? error.message : String(error),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, {merge: true});
+    }
+    throw error;
+  }
+}
+
+export const dtsStampInternalPdf = onCallV2(protectedCallableV2Options, async (request) => {
+  try {
+    return await dtsStampInternalPdfHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+async function dtsGetGeneratedPdfAccessHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const payload = (data && typeof data === "object") ?
+    (data as Record<string, unknown>) :
+    {};
+  const actor = await requireStaffContext(context);
+  await requireFeatureWritable("documentTracking");
+  const docId = coerceString(payload.docId) ?? coerceString(payload.trackingId);
+  const action = (coerceString(payload.action) ?? "open").toLowerCase();
+  if (!docId) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "docId is required."
+    );
+  }
+  if (!["open", "preview", "download"].includes(action)) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "action must be open, preview, or download."
+    );
+  }
+
+  const docRef = db.collection("dts_documents").doc(docId);
+  const docSnap = await docRef.get();
+  if (!docSnap.exists) {
+    throw new functions.https.HttpsError("not-found", "Document not found.");
+  }
+  const docRow = docSnap.data() ?? {};
+  if (actor.role !== "super_admin" && !canOperateOnDtsDoc(actor, docRow)) {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "You cannot access generated files for this document."
+    );
+  }
+
+  const fallbackPathFromUrl = (() => {
+    const urlText = coerceString(docRow.generatedFileUrl);
+    if (!urlText) return null;
+    try {
+      const parsed = new URL(urlText);
+      const marker = "/o/";
+      const idx = parsed.pathname.indexOf(marker);
+      if (idx < 0) return null;
+      const encodedPath = parsed.pathname.slice(idx + marker.length);
+      if (!encodedPath) return null;
+      return decodeURIComponent(encodedPath);
+    } catch (_error) {
+      return null;
+    }
+  })();
+
+  const requestedPathInput = coerceString(payload.path);
+  const requestedPath = requestedPathInput ?
+    normalizeGeneratedPdfPath(docId, requestedPathInput) :
+    null;
+  if (requestedPathInput && !requestedPath) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "path must point to a generated PDF under this document."
+    );
+  }
+  const generatedFilePath = normalizeGeneratedPdfPath(
+    docId,
+    requestedPath ?? (docRow.generatedFilePath ?? fallbackPathFromUrl)
+  );
+  if (!generatedFilePath) {
+    throw new functions.https.HttpsError(
+      "failed-precondition",
+      "No generated PDF is available for this record."
+    );
+  }
+
+  const bucket = admin.storage().bucket();
+  const file = bucket.file(generatedFilePath);
+  const [exists] = await file.exists();
+  if (!exists) {
+    throw new functions.https.HttpsError(
+      "not-found",
+      "Generated PDF file not found in storage."
+    );
+  }
+
+  const expiresAtMs = Date.now() + 1000 * 60 * 15;
+  let downloadUrl: string | null = null;
+  try {
+    downloadUrl = await buildStorageSignedReadUrl(generatedFilePath, expiresAtMs);
+  } catch (error) {
+    console.warn("dtsGetGeneratedPdfAccess: signed URL generation failed; using token URL fallback", {
+      error,
+    });
+    downloadUrl = await buildStorageTokenUrl(generatedFilePath);
+  }
+
+  await addAuditLog({
+    action: "dts_generated_pdf_access",
+    entityType: "dts_documents",
+    entityId: docId,
+    dtsDocId: docId,
+    dtsTrackingNo: coerceString(docRow.trackingNo),
+    officeId: coerceString(docRow.currentOfficeId),
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorOfficeId: actor.officeId ?? null,
+    actorOfficeName: actor.officeName ?? null,
+    actorName: actorDisplayName(actor),
+    message: `Generated PDF ${action} access issued.`,
+  });
+
+  if (action !== "preview") {
+    const resolvedOfficeId = coerceString(docRow.currentOfficeId) ?? actor.officeId ?? null;
+    const resolvedOfficeName = coerceString(docRow.currentOfficeName) ?? actor.officeName ?? null;
+    await docRef.collection("timeline").add({
+      type: "DOCUMENT_REPRINTED",
+      actionType: "DOCUMENT_REPRINTED",
+      action: "DOCUMENT_REPRINTED",
+      byUid: actor.uid,
+      byName: actorDisplayName(actor),
+      byOfficeId: actor.officeId ?? resolvedOfficeId,
+      byOfficeName: actor.officeName ?? resolvedOfficeName,
+      officeId: resolvedOfficeId,
+      officeName: resolvedOfficeName,
+      status: normalizeDtsStatus(docRow.status, "CREATED"),
+      generatedFilePath,
+      notePublic: "Generated PDF opened for printing.",
+      notes: `Generated PDF ${action} access issued.`,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  }
+
+  return {
+    success: true,
+    docId,
+    action,
+    generatedFilePath,
+    downloadUrl,
+    expiresAt: new Date(expiresAtMs).toISOString(),
+  };
+}
+
+export const dtsGetGeneratedPdfAccess = onCallV2(protectedCallableV2Options, async (request) => {
+  try {
+    return await dtsGetGeneratedPdfAccessHandler(request.data, toCallableContextFromV2(request));
+  } catch (error) {
+    throw normalizeCallableErrorForV2(error);
+  }
+});
+
+export const dtsResolveQrForStaff = protectedCallableFunctions.https.onCall(
   async (data, context) => {
     const actor = await requireStaffContext(context);
     await requireFeatureWritable("documentTracking");
@@ -10098,49 +12550,101 @@ export const dtsResolveQrForStaff = functions.https.onCall(
       );
     }
 
-    const qrSnap = await db.collection("dts_qr_codes").doc(qrCode).get();
+    const qrRef = db.collection("dts_qr_codes").doc(qrCode);
+    const qrSnap = await qrRef.get();
     if (!qrSnap.exists) {
       throw new functions.https.HttpsError("not-found", "QR code not found.");
     }
 
     const qrRow = qrSnap.data() ?? {};
-    const status = coerceString(qrRow.status) ?? "unused";
+    const status = normalizeDtsQrCodeStatus(qrRow.status) || "unused";
+    const batchId = coerceString(qrRow.batchId);
     if (status === "voided") {
       throw new functions.https.HttpsError(
         "failed-precondition",
         "This QR code has been voided."
       );
     }
-    if (status === "reserved") {
-      throw new functions.https.HttpsError(
-        "failed-precondition",
-        "This QR code is currently reserved."
-      );
-    }
-    if (status !== "used") {
-      return {
-        qrCode,
-        status: "unused",
-        batchId: coerceString(qrRow.batchId),
-        imagePath: coerceString(qrRow.imagePath),
-      };
+    const qrIndexSnap = await db.collection("dts_qr_index").doc(qrCode).get();
+    const docIdFromCode = coerceString(qrRow.docId);
+    const docIdFromIndex = coerceString(qrIndexSnap.data()?.docId);
+    let docId = docIdFromCode ?? docIdFromIndex;
+    if (!docId) {
+      const linkedDocSnap = await db
+        .collection("dts_documents")
+        .where("qrCode", "==", qrCode)
+        .limit(1)
+        .get();
+      if (!linkedDocSnap.empty) {
+        docId = linkedDocSnap.docs[0].id;
+      }
     }
 
-    const qrIndexSnap = await db.collection("dts_qr_index").doc(qrCode).get();
-    const docId = coerceString(qrRow.docId) ?? coerceString(qrIndexSnap.data()?.docId);
+    if (!docId && (status === "used" || qrIndexSnap.exists || docIdFromCode)) {
+      const cleanupBatch = db.batch();
+      cleanupBatch.set(qrSnap.ref, {
+        status: "unused",
+        docId: admin.firestore.FieldValue.delete(),
+        usedAt: admin.firestore.FieldValue.delete(),
+        usedByUid: admin.firestore.FieldValue.delete(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, {merge: true});
+      if (qrIndexSnap.exists) {
+        cleanupBatch.delete(qrIndexSnap.ref);
+      }
+      await cleanupBatch.commit();
+      if (batchId) {
+        await reconcileDtsQrBatch(batchId, {
+          repairQrRows: true,
+          syncBatchCounters: true,
+        });
+      }
+    }
+
     if (!docId) {
-      throw new functions.https.HttpsError(
-        "failed-precondition",
-        "This QR code is marked used but no document is linked to it."
-      );
+      const reserved = await reserveDtsQrForIntake(qrCode, actor.uid);
+      if (reserved.status === "used") {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          "Requested QR code is already associated with another tracking record."
+        );
+      }
+      return {
+        qrCode,
+        status: "reserved",
+        batchId: reserved.batchId,
+        imagePath: reserved.imagePath,
+        reservedByUid: actor.uid,
+        reservationExpiresAt: reserved.reservationExpiresAt,
+      };
     }
 
     const docSnap = await db.collection("dts_documents").doc(docId).get();
     if (!docSnap.exists) {
-      throw new functions.https.HttpsError(
-        "failed-precondition",
-        "The linked document could not be found."
-      );
+      const cleanupBatch = db.batch();
+      cleanupBatch.set(qrSnap.ref, {
+        status: "unused",
+        docId: admin.firestore.FieldValue.delete(),
+        usedAt: admin.firestore.FieldValue.delete(),
+        usedByUid: admin.firestore.FieldValue.delete(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, {merge: true});
+      if (qrIndexSnap.exists) {
+        cleanupBatch.delete(qrIndexSnap.ref);
+      }
+      await cleanupBatch.commit();
+      if (batchId) {
+        await reconcileDtsQrBatch(batchId, {
+          repairQrRows: true,
+          syncBatchCounters: true,
+        });
+      }
+      return {
+        qrCode,
+        status: "unused",
+        batchId,
+        imagePath: coerceString(qrRow.imagePath),
+      };
     }
     const docRow = docSnap.data() ?? {};
     if (actor.role !== "super_admin" && !canOperateOnDtsDoc(actor, docRow)) {
@@ -10150,11 +12654,48 @@ export const dtsResolveQrForStaff = functions.https.onCall(
       );
     }
 
+    const canonicalTrackingNo = coerceString(docRow.trackingNo) ?? "";
+    const needsQrPatch =
+      status !== "used" ||
+      docIdFromCode !== docId;
+    const needsIndexPatch =
+      !qrIndexSnap.exists ||
+      docIdFromIndex !== docId ||
+      coerceString(qrIndexSnap.data()?.trackingNo) !== canonicalTrackingNo;
+    if (needsQrPatch || needsIndexPatch) {
+      const patchBatch = db.batch();
+      if (needsQrPatch) {
+        patchBatch.set(qrSnap.ref, {
+          status: "used",
+          docId,
+          usedAt: qrRow.usedAt ?? admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }, {merge: true});
+      }
+      if (needsIndexPatch) {
+        patchBatch.set(qrIndexSnap.ref, {
+          docId,
+          trackingNo: canonicalTrackingNo,
+          createdAt: qrIndexSnap.exists ?
+            (qrIndexSnap.data()?.createdAt ?? admin.firestore.FieldValue.serverTimestamp()) :
+            admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }, {merge: true});
+      }
+      await patchBatch.commit();
+      if (batchId) {
+        await reconcileDtsQrBatch(batchId, {
+          repairQrRows: true,
+          syncBatchCounters: true,
+        });
+      }
+    }
+
     return {
       qrCode,
       status: "used",
       docId,
-      trackingNo: coerceString(docRow.trackingNo) ?? "",
+      trackingNo: canonicalTrackingNo,
       title: coerceString(docRow.title) ?? "",
       currentOfficeId: coerceString(docRow.currentOfficeId),
       currentOfficeName: coerceString(docRow.currentOfficeName),
@@ -10162,117 +12703,979 @@ export const dtsResolveQrForStaff = functions.https.onCall(
   }
 );
 
-export const dtsInitiateTransfer = functions.https.onCall(
+type DtsRequestedDestination = {
+  toOfficeId: string;
+  toOfficeName: string | null;
+  toUid: string | null;
+};
+
+function parseRequestedDestinations(
+  raw: unknown,
+  fallback: DtsRequestedDestination | null = null
+): DtsRequestedDestination[] {
+  const source = Array.isArray(raw) ? raw : (fallback ? [fallback] : []);
+  const dedupe = new Set<string>();
+  const rows: DtsRequestedDestination[] = [];
+  for (const item of source) {
+    const map = (item && typeof item === "object") ?
+      (item as Record<string, unknown>) :
+      {};
+    const toOfficeId = coerceString(map.toOfficeId);
+    if (!toOfficeId) {
+      continue;
+    }
+    const key = `${toOfficeId}::${coerceString(map.toUid) ?? ""}`;
+    if (dedupe.has(key)) {
+      continue;
+    }
+    dedupe.add(key);
+    rows.push({
+      toOfficeId,
+      toOfficeName: coerceString(map.toOfficeName),
+      toUid: coerceString(map.toUid),
+    });
+    if (rows.length >= 40) {
+      break;
+    }
+  }
+  return rows;
+}
+
+async function hydrateDestinationOfficeNames(
+  destinations: DtsRequestedDestination[]
+): Promise<DtsRequestedDestination[]> {
+  const officeCache = new Map<string, string>();
+  return Promise.all(
+    destinations.map(async (destination) => {
+      const cachedName = officeCache.get(destination.toOfficeId);
+      const knownName = destination.toOfficeName ?? cachedName ?? null;
+      if (knownName) {
+        return {
+          ...destination,
+          toOfficeName: knownName,
+        };
+      }
+      const officeSnap = await db.collection("offices").doc(destination.toOfficeId).get();
+      const resolvedName = coerceString(officeSnap.data()?.name) ?? destination.toOfficeId;
+      officeCache.set(destination.toOfficeId, resolvedName);
+      return {
+        ...destination,
+        toOfficeName: resolvedName,
+      };
+    })
+  );
+}
+
+function assertDtsSourceOfficeForDistribution(
+  actor: StaffContext,
+  row: Record<string, unknown>
+): void {
+  if (actor.role === "super_admin" || actor.role === "admin") {
+    return;
+  }
+  const currentOfficeId = coerceString(row.currentOfficeId);
+  const currentOfficeName = coerceString(row.currentOfficeName);
+  if (actor.officeId && currentOfficeId && actor.officeId === currentOfficeId) {
+    return;
+  }
+  if (sameNormalizedName(actor.officeName, currentOfficeName)) {
+    return;
+  }
+  throw new functions.https.HttpsError(
+    "permission-denied",
+    "Only the source office can manage destinations."
+  );
+}
+
+async function dtsCreateDestinationsHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const payload = (data && typeof data === "object") ?
+    (data as Record<string, unknown>) :
+    {};
+  const actor = await requireStaffContext(context);
+  await requireFeatureWritable("documentTracking");
+  const docId = coerceString(payload.docId);
+  const fallbackDestination = coerceString(payload.toOfficeId)
+    ? {
+        toOfficeId: coerceString(payload.toOfficeId) as string,
+        toOfficeName: coerceString(payload.toOfficeName),
+        toUid: coerceString(payload.toUid),
+      }
+    : null;
+  const requestedDestinations = parseRequestedDestinations(
+    payload.destinations,
+    fallbackDestination
+  );
+  if (!docId || requestedDestinations.length === 0) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "docId and at least one destination are required."
+    );
+  }
+
+  const hydratedDestinations =
+    await hydrateDestinationOfficeNames(requestedDestinations);
+  const actorName = actorDisplayName(actor);
+  const docRef = db.collection("dts_documents").doc(docId);
+  const createdRows: Array<Record<string, unknown>> = [];
+  let summaryResult: DtsDestinationSummary = {
+    total: 0,
+    pending: 0,
+    inTransit: 0,
+    received: 0,
+    rejected: 0,
+    cancelled: 0,
+    activeOfficeIds: [],
+    allOfficeIds: [],
+  };
+
+  await db.runTransaction(async (tx) => {
+    const docSnap = await tx.get(docRef);
+    if (!docSnap.exists) {
+      throw new functions.https.HttpsError("not-found", "Document not found.");
+    }
+    const row = docSnap.data() ?? {};
+    assertDtsSourceOfficeForDistribution(actor, row);
+    const currentStatus = normalizeDtsStatus(row.status, "WITH_OFFICE");
+    if (currentStatus === "RELEASED" ||
+      currentStatus === "ARCHIVED" ||
+      currentStatus === "VOIDED") {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "Destinations cannot be modified for released, archived, or voided documents."
+      );
+    }
+
+    const existingRows = await loadDtsDestinationRecords(tx, docRef);
+    const existingKeys = new Map<string, DtsDestinationRecord>();
+    for (const destination of existingRows) {
+      const key = `${destination.toOfficeId ?? ""}::${destination.toUid ?? ""}`;
+      if (!existingKeys.has(key)) {
+        existingKeys.set(key, destination);
+      }
+    }
+
+    for (const destination of hydratedDestinations) {
+      const key = `${destination.toOfficeId}::${destination.toUid ?? ""}`;
+      const existing = existingKeys.get(key);
+      if (existing &&
+        existing.status !== "CANCELLED" &&
+        existing.status !== "REJECTED") {
+        throw new functions.https.HttpsError(
+          "already-exists",
+          `Destination already exists for ${destination.toOfficeName ?? destination.toOfficeId}.`
+        );
+      }
+      const destinationRef = docRef.collection("destinations").doc();
+      tx.set(destinationRef, {
+        docId: docRef.id,
+        trackingNo: coerceString(row.trackingNo),
+        toOfficeId: destination.toOfficeId,
+        toOfficeName: destination.toOfficeName ?? destination.toOfficeId,
+        toUid: destination.toUid,
+        sourceOfficeId: coerceString(row.currentOfficeId),
+        sourceOfficeName: coerceString(row.currentOfficeName),
+        status: "PENDING",
+        previousStatus: normalizeDtsStatus(row.status, "WITH_OFFICE"),
+        createdByUid: actor.uid,
+        createdByName: actorName,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, {merge: true});
+      existingRows.push({
+        id: destinationRef.id,
+        docId: docRef.id,
+        toOfficeId: destination.toOfficeId,
+        toOfficeName: destination.toOfficeName ?? destination.toOfficeId,
+        toUid: destination.toUid,
+        sourceOfficeId: coerceString(row.currentOfficeId),
+        sourceOfficeName: coerceString(row.currentOfficeName),
+        status: "PENDING",
+        previousStatus: normalizeDtsStatus(row.status, "WITH_OFFICE"),
+        createdByUid: actor.uid,
+        createdByName: actorName,
+        createdAt: null,
+        dispatchedAt: null,
+        receivedAt: null,
+        rejectedAt: null,
+        cancelledAt: null,
+        reason: null,
+      });
+      createdRows.push({
+        id: destinationRef.id,
+        toOfficeId: destination.toOfficeId,
+        toOfficeName: destination.toOfficeName ?? destination.toOfficeId,
+        status: "PENDING",
+      });
+    }
+
+    const applied = applyDtsDestinationSummaryToParent(tx, docRef, row, existingRows, {
+      parentPatch: {
+        distributionMode: existingRows.length > 1 ? "MULTI" : "SINGLE",
+      },
+    });
+    summaryResult = applied.summary;
+
+    tx.set(docRef.collection("timeline").doc(), {
+      type: "DESTINATIONS_UPDATED",
+      actionType: "DESTINATIONS_UPDATED",
+      action: "DESTINATIONS_UPDATED",
+      byUid: actor.uid,
+      byName: actorName,
+      byOfficeId: actor.officeId ?? coerceString(row.currentOfficeId) ?? null,
+      byOfficeName: actor.officeName ?? coerceString(row.currentOfficeName) ?? null,
+      officeId: coerceString(row.currentOfficeId) ?? actor.officeId ?? null,
+      officeName: coerceString(row.currentOfficeName) ?? actor.officeName ?? null,
+      status: applied.status,
+      notePublic: `Destination set updated (${createdRows.length} added).`,
+      notes: `Added ${createdRows.length} destination${createdRows.length === 1 ? "" : "s"} for distributed routing.`,
+      destinationCount: existingRows.length,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  });
+
+  await addAuditLog({
+    action: "dts_destinations_created",
+    entityType: "dts_documents",
+    entityId: docId,
+    dtsDocId: docId,
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorOfficeId: actor.officeId ?? null,
+    actorOfficeName: actor.officeName ?? null,
+    actorName,
+    message: `Added ${createdRows.length} destination${createdRows.length === 1 ? "" : "s"} to document.`,
+  });
+
+  return {
+    success: true,
+    created: createdRows,
+    summary: {
+      total: summaryResult.total,
+      pending: summaryResult.pending,
+      inTransit: summaryResult.inTransit,
+      received: summaryResult.received,
+      rejected: summaryResult.rejected,
+      cancelled: summaryResult.cancelled,
+    },
+  };
+}
+
+async function dtsDispatchDestinationsHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const payload = (data && typeof data === "object") ?
+    (data as Record<string, unknown>) :
+    {};
+  const actor = await requireStaffContext(context);
+  await requireFeatureWritable("documentTracking");
+  const docId = coerceString(payload.docId);
+  const destinationIds = parseStringList(payload.destinationIds, {
+    maxItems: 60,
+    maxLen: 120,
+  });
+  if (!docId) {
+    throw new functions.https.HttpsError("invalid-argument", "docId is required.");
+  }
+
+  const actorName = actorDisplayName(actor);
+  const docRef = db.collection("dts_documents").doc(docId);
+  let dispatchedCount = 0;
+
+  await db.runTransaction(async (tx) => {
+    const docSnap = await tx.get(docRef);
+    if (!docSnap.exists) {
+      throw new functions.https.HttpsError("not-found", "Document not found.");
+    }
+    const row = docSnap.data() ?? {};
+    assertDtsSourceOfficeForDistribution(actor, row);
+    const currentStatus = normalizeDtsStatus(row.status, "WITH_OFFICE");
+    if (currentStatus === "RELEASED" ||
+      currentStatus === "ARCHIVED" ||
+      currentStatus === "VOIDED") {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "Released, archived, or voided documents cannot be dispatched."
+      );
+    }
+
+    const existingRows = await loadDtsDestinationRecords(tx, docRef);
+    if (existingRows.length === 0) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "Create at least one destination before dispatch."
+      );
+    }
+    const selectedRows = destinationIds.length === 0 ?
+      existingRows.filter((rowItem) => rowItem.status === "PENDING") :
+      existingRows.filter((rowItem) => destinationIds.includes(rowItem.id));
+    if (selectedRows.length === 0) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "No pending destinations are available for dispatch."
+      );
+    }
+
+    const nextRows = existingRows.map((destination) => {
+      const shouldDispatch = selectedRows.some((selected) => selected.id === destination.id);
+      if (!shouldDispatch) {
+        return destination;
+      }
+      if (destination.status !== "PENDING") {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          "Only pending destinations can be dispatched."
+        );
+      }
+      if (!isDestinationSource(actor, destination, row)) {
+        throw new functions.https.HttpsError(
+          "permission-denied",
+          "Only the source office can dispatch this destination."
+        );
+      }
+      const destinationRef = docRef.collection("destinations").doc(destination.id);
+      tx.set(destinationRef, {
+        status: "IN_TRANSIT",
+        previousStatus:
+          destination.previousStatus ?? normalizeDtsStatus(row.status, "WITH_OFFICE"),
+        dispatchedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastActionByUid: actor.uid,
+        lastActionByName: actorName,
+        lastActionOfficeId: actor.officeId ?? coerceString(row.currentOfficeId) ?? null,
+        lastActionOfficeName: actor.officeName ?? coerceString(row.currentOfficeName) ?? null,
+      }, {merge: true});
+      dispatchedCount += 1;
+      return {
+        ...destination,
+        status: "IN_TRANSIT",
+        previousStatus:
+          destination.previousStatus ?? normalizeDtsStatus(row.status, "WITH_OFFICE"),
+      };
+    });
+
+    const applied = applyDtsDestinationSummaryToParent(tx, docRef, row, nextRows, {
+      parentPatch: {
+        distributionMode: nextRows.length > 1 ? "MULTI" : "SINGLE",
+      },
+    });
+
+    tx.set(docRef.collection("timeline").doc(), {
+      type: "DOCUMENT_ROUTED",
+      actionType: "DOCUMENT_ROUTED",
+      action: "DOCUMENT_ROUTED",
+      byUid: actor.uid,
+      byName: actorName,
+      byOfficeId: actor.officeId ?? coerceString(row.currentOfficeId) ?? null,
+      byOfficeName: actor.officeName ?? coerceString(row.currentOfficeName) ?? null,
+      officeId: coerceString(row.currentOfficeId) ?? actor.officeId ?? null,
+      officeName: coerceString(row.currentOfficeName) ?? actor.officeName ?? null,
+      status: applied.status,
+      fromStatus: normalizeDtsStatus(row.status, "WITH_OFFICE"),
+      toStatus: applied.status,
+      destinationCount: dispatchedCount,
+      notePublic: dispatchedCount === 1 ?
+        "Document transfer started." :
+        `Document dispatched to ${dispatchedCount} destinations.`,
+      notes: dispatchedCount === 1 ?
+        "Destination dispatched." :
+        `${dispatchedCount} destinations were dispatched.`,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  });
+
+  await addAuditLog({
+    action: "dts_destinations_dispatched",
+    entityType: "dts_documents",
+    entityId: docId,
+    dtsDocId: docId,
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorOfficeId: actor.officeId ?? null,
+    actorOfficeName: actor.officeName ?? null,
+    actorName,
+    message: `Dispatched ${dispatchedCount} destination${dispatchedCount === 1 ? "" : "s"}.`,
+  });
+
+  return {
+    success: true,
+    dispatchedCount,
+  };
+}
+
+async function dtsConfirmDestinationReceiptHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const payload = (data && typeof data === "object") ?
+    (data as Record<string, unknown>) :
+    {};
+  const actor = await requireStaffContext(context);
+  await requireFeatureWritable("documentTracking");
+  const docId = coerceString(payload.docId);
+  const destinationId = coerceString(payload.destinationId);
+  const verificationValue = normalizeDtsVerificationValue(payload.verificationValue);
+  const verificationMethod = normalizeDtsVerificationMethod(payload.verificationMethod);
+  const confirmPhysicalReceipt = coerceBool(payload.confirmPhysicalReceipt, false);
+  if (!docId) {
+    throw new functions.https.HttpsError("invalid-argument", "docId is required.");
+  }
+  if (!confirmPhysicalReceipt) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "Physical receipt confirmation is required."
+    );
+  }
+  if (!verificationValue) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "Invalid tracking number or QR code."
+    );
+  }
+
+  const attemptScope = `DEST_RECEIVE_${docId}_${destinationId ?? "AUTO"}`;
+  await assertReceiptVerificationNotLocked(attemptScope, actor.uid, context);
+  const actorName = actorDisplayName(actor);
+  const docRef = db.collection("dts_documents").doc(docId);
+  let resolvedDestinationId: string | null = null;
+
+  try {
+    await db.runTransaction(async (tx) => {
+      const docSnap = await tx.get(docRef);
+      if (!docSnap.exists) {
+        throw new functions.https.HttpsError("not-found", "Document not found.");
+      }
+      const row = docSnap.data() ?? {};
+      const existingRows = await loadDtsDestinationRecords(tx, docRef);
+      if (existingRows.length === 0) {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          "No destination transfer found for this document."
+        );
+      }
+      const chosen = destinationId ?
+        findDestinationById(existingRows, destinationId) :
+        findReceivingDestinationForActor(existingRows, actor);
+      if (!chosen) {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          destinationId ?
+            "Destination transfer not found." :
+            "Select a destination transfer before confirming receipt."
+        );
+      }
+      resolvedDestinationId = chosen.id;
+      if (!isDestinationReceiver(actor, chosen)) {
+        throw new functions.https.HttpsError(
+          "permission-denied",
+          "You are not authorized to receive this destination."
+        );
+      }
+      if (chosen.status === "RECEIVED") {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          "Destination already received."
+        );
+      }
+      if (chosen.status !== "IN_TRANSIT") {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          "Destination is not in transit."
+        );
+      }
+
+      const trackingNo = coerceString(row.trackingNo) ?? "";
+      const qrCode = coerceString(row.qrCode);
+      const expectedQrSuffix = dtsQrSuffix(qrCode);
+      if (expectedQrSuffix) {
+        if (verificationValue !== expectedQrSuffix) {
+          throw new functions.https.HttpsError(
+            "invalid-argument",
+            "Invalid tracking number or QR code."
+          );
+        }
+      } else if (!matchesDtsTrackingOrQr(verificationValue, trackingNo, qrCode)) {
+        throw new functions.https.HttpsError(
+          "invalid-argument",
+          "Invalid tracking number or QR code."
+        );
+      }
+
+      const destinationRef = docRef.collection("destinations").doc(chosen.id);
+      tx.set(destinationRef, {
+        status: "RECEIVED",
+        receivedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        reason: admin.firestore.FieldValue.delete(),
+        verificationMethod,
+        verifiedByUid: actor.uid,
+        verifiedByName: actorName,
+        lastActionByUid: actor.uid,
+        lastActionByName: actorName,
+        lastActionOfficeId: actor.officeId ?? chosen.toOfficeId ?? null,
+        lastActionOfficeName: actor.officeName ?? chosen.toOfficeName ?? null,
+      }, {merge: true});
+
+      const nextRows = existingRows.map((destination) =>
+        destination.id === chosen.id ?
+          {
+            ...destination,
+            status: "RECEIVED",
+          } :
+          destination
+      );
+      const singleDestinationFlow =
+        normalizeDtsDistributionMode(row.distributionMode) === "SINGLE" ||
+        nextRows.length <= 1;
+      const applied = applyDtsDestinationSummaryToParent(tx, docRef, row, nextRows, {
+        forceStatus: singleDestinationFlow ? "WITH_OFFICE" : null,
+        parentPatch: singleDestinationFlow ?
+          {
+            currentOfficeId: chosen.toOfficeId,
+            currentOfficeName: chosen.toOfficeName,
+            currentCustodianUid: actor.uid,
+            pendingTransfer: null,
+          } :
+          undefined,
+      });
+
+      tx.set(docRef.collection("timeline").doc(), {
+        type: "DOCUMENT_RECEIVED",
+        actionType: "DOCUMENT_RECEIVED",
+        action: "DOCUMENT_RECEIVED",
+        destinationId: chosen.id,
+        method: verificationMethod,
+        verificationMethod,
+        byUid: actor.uid,
+        byName: actorName,
+        byOfficeId: actor.officeId ?? chosen.toOfficeId ?? null,
+        byOfficeName: actor.officeName ?? chosen.toOfficeName ?? null,
+        toOfficeId: chosen.toOfficeId,
+        toOfficeName: chosen.toOfficeName,
+        officeId: chosen.toOfficeId,
+        officeName: chosen.toOfficeName,
+        fromStatus: "IN_TRANSIT",
+        toStatus: singleDestinationFlow ? "WITH_OFFICE" : applied.status,
+        status: singleDestinationFlow ? "WITH_OFFICE" : applied.status,
+        notePublic: chosen.toOfficeName ?
+          `Document received by ${chosen.toOfficeName}.` :
+          "Document received by destination office.",
+        notes: `Destination receipt confirmed by ${actorName} (${verificationMethod}).`,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    });
+  } catch (error) {
+    const code = (error as {code?: string})?.code ?? "";
+    if (code === "invalid-argument") {
+      const locked = await registerReceiptVerificationFailure(
+        attemptScope,
+        actor.uid,
+        context
+      );
+      if (locked) {
+        throw new functions.https.HttpsError(
+          "resource-exhausted",
+          "Too many invalid verification attempts. Please wait before trying again."
+        );
+      }
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "Invalid tracking number or QR code."
+      );
+    }
+    throw error;
+  }
+
+  await clearReceiptVerificationAttempts(attemptScope, actor.uid, context);
+
+  await addAuditLog({
+    action: "dts_destination_received",
+    entityType: "dts_documents",
+    entityId: docId,
+    dtsDocId: docId,
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorOfficeId: actor.officeId ?? null,
+    actorOfficeName: actor.officeName ?? null,
+    actorName,
+    message: `Destination receipt confirmed${resolvedDestinationId ? ` (${resolvedDestinationId})` : ""}.`,
+  });
+
+  return {
+    success: true,
+    destinationId: resolvedDestinationId,
+  };
+}
+
+async function dtsRejectDestinationHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const payload = (data && typeof data === "object") ?
+    (data as Record<string, unknown>) :
+    {};
+  const actor = await requireStaffContext(context);
+  await requireFeatureWritable("documentTracking");
+  const docId = coerceString(payload.docId);
+  const destinationId = coerceString(payload.destinationId);
+  const reason = coerceString(payload.reason);
+  if (!docId || !reason) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "docId and reason are required."
+    );
+  }
+
+  const actorName = actorDisplayName(actor);
+  const docRef = db.collection("dts_documents").doc(docId);
+  let resolvedDestinationId: string | null = null;
+
+  await db.runTransaction(async (tx) => {
+    const docSnap = await tx.get(docRef);
+    if (!docSnap.exists) {
+      throw new functions.https.HttpsError("not-found", "Document not found.");
+    }
+    const row = docSnap.data() ?? {};
+    const existingRows = await loadDtsDestinationRecords(tx, docRef);
+    if (existingRows.length === 0) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "No destination transfer found for this document."
+      );
+    }
+    const chosen = destinationId ?
+      findDestinationById(existingRows, destinationId) :
+      findReceivingDestinationForActor(existingRows, actor);
+    if (!chosen) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        destinationId ?
+          "Destination transfer not found." :
+          "Select a destination transfer before rejecting."
+      );
+    }
+    resolvedDestinationId = chosen.id;
+    if (!isDestinationReceiver(actor, chosen)) {
+      throw new functions.https.HttpsError(
+        "permission-denied",
+        "You are not the receiving office for this transfer."
+      );
+    }
+    if (chosen.status !== "IN_TRANSIT") {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "Destination is not currently in transit."
+      );
+    }
+
+    const destinationRef = docRef.collection("destinations").doc(chosen.id);
+    tx.set(destinationRef, {
+      status: "REJECTED",
+      reason,
+      rejectedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      lastActionByUid: actor.uid,
+      lastActionByName: actorName,
+      lastActionOfficeId: actor.officeId ?? chosen.toOfficeId ?? null,
+      lastActionOfficeName: actor.officeName ?? chosen.toOfficeName ?? null,
+    }, {merge: true});
+
+    const nextRows = existingRows.map((destination) =>
+      destination.id === chosen.id ?
+        {
+          ...destination,
+          status: "REJECTED",
+          reason,
+        } :
+        destination
+    );
+    const singleDestinationFlow =
+      normalizeDtsDistributionMode(row.distributionMode) === "SINGLE" ||
+      nextRows.length <= 1;
+    const applied = applyDtsDestinationSummaryToParent(tx, docRef, row, nextRows, {
+      forceStatus: singleDestinationFlow ?
+        normalizeDtsStatus(chosen.previousStatus, "WITH_OFFICE") :
+        null,
+      parentPatch: singleDestinationFlow ?
+        {
+          currentOfficeId: chosen.sourceOfficeId ?? coerceString(row.currentOfficeId),
+          currentOfficeName: chosen.sourceOfficeName ?? coerceString(row.currentOfficeName),
+          pendingTransfer: null,
+        } :
+        undefined,
+    });
+
+    tx.set(docRef.collection("timeline").doc(), {
+      type: "TRANSFER_REJECTED",
+      actionType: "TRANSFER_REJECTED",
+      action: "TRANSFER_REJECTED",
+      destinationId: chosen.id,
+      byUid: actor.uid,
+      byName: actorName,
+      byOfficeId: actor.officeId ?? chosen.toOfficeId ?? null,
+      byOfficeName: actor.officeName ?? chosen.toOfficeName ?? null,
+      fromOfficeId: chosen.toOfficeId,
+      toOfficeId: chosen.sourceOfficeId,
+      reason,
+      fromStatus: "IN_TRANSIT",
+      toStatus: applied.status,
+      officeId: chosen.sourceOfficeId ?? coerceString(row.currentOfficeId) ?? null,
+      officeName: chosen.sourceOfficeName ?? coerceString(row.currentOfficeName) ?? null,
+      status: applied.status,
+      notePublic: "Receiving office rejected the transfer destination.",
+      notes: `Transfer rejected: ${reason}`,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  });
+
+  await addAuditLog({
+    action: "dts_destination_rejected",
+    entityType: "dts_documents",
+    entityId: docId,
+    dtsDocId: docId,
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorOfficeId: actor.officeId ?? null,
+    actorOfficeName: actor.officeName ?? null,
+    actorName,
+    message: `Destination rejected${resolvedDestinationId ? ` (${resolvedDestinationId})` : ""}.`,
+  });
+
+  return {
+    success: true,
+    destinationId: resolvedDestinationId,
+  };
+}
+
+async function dtsCancelDestinationHandler(
+  data: unknown,
+  context: CallableContextLike
+) {
+  const payload = (data && typeof data === "object") ?
+    (data as Record<string, unknown>) :
+    {};
+  const actor = await requireStaffContext(context);
+  await requireFeatureWritable("documentTracking");
+  const docId = coerceString(payload.docId);
+  const destinationId = coerceString(payload.destinationId);
+  const reason = coerceString(payload.reason);
+  if (!docId || !reason) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "docId and reason are required."
+    );
+  }
+
+  const actorName = actorDisplayName(actor);
+  const docRef = db.collection("dts_documents").doc(docId);
+  let resolvedDestinationId: string | null = null;
+
+  await db.runTransaction(async (tx) => {
+    const docSnap = await tx.get(docRef);
+    if (!docSnap.exists) {
+      throw new functions.https.HttpsError("not-found", "Document not found.");
+    }
+    const row = docSnap.data() ?? {};
+    const existingRows = await loadDtsDestinationRecords(tx, docRef);
+    if (existingRows.length === 0) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "No destination transfer found for this document."
+      );
+    }
+    const chosen = destinationId ?
+      findDestinationById(existingRows, destinationId) :
+      findSourceDestinationForActor(existingRows, actor, row);
+    if (!chosen) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        destinationId ?
+          "Destination transfer not found." :
+          "Select a destination transfer before cancelling."
+      );
+    }
+    resolvedDestinationId = chosen.id;
+    if (!isDestinationSource(actor, chosen, row)) {
+      throw new functions.https.HttpsError(
+        "permission-denied",
+        "Only the source office can cancel this destination."
+      );
+    }
+    if (chosen.status !== "IN_TRANSIT" && chosen.status !== "PENDING") {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "Only pending or in-transit destinations can be cancelled."
+      );
+    }
+
+    const destinationRef = docRef.collection("destinations").doc(chosen.id);
+    tx.set(destinationRef, {
+      status: "CANCELLED",
+      reason,
+      cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      lastActionByUid: actor.uid,
+      lastActionByName: actorName,
+      lastActionOfficeId: actor.officeId ?? chosen.sourceOfficeId ?? null,
+      lastActionOfficeName: actor.officeName ?? chosen.sourceOfficeName ?? null,
+    }, {merge: true});
+
+    const nextRows = existingRows.map((destination) =>
+      destination.id === chosen.id ?
+        {
+          ...destination,
+          status: "CANCELLED",
+          reason,
+        } :
+        destination
+    );
+    const singleDestinationFlow =
+      normalizeDtsDistributionMode(row.distributionMode) === "SINGLE" ||
+      nextRows.length <= 1;
+    const applied = applyDtsDestinationSummaryToParent(tx, docRef, row, nextRows, {
+      forceStatus: singleDestinationFlow ?
+        normalizeDtsStatus(chosen.previousStatus, "WITH_OFFICE") :
+        null,
+      parentPatch: singleDestinationFlow ?
+        {
+          pendingTransfer: null,
+          currentCustodianUid: actor.uid,
+        } :
+        undefined,
+    });
+
+    tx.set(docRef.collection("timeline").doc(), {
+      type: "TRANSFER_CANCELLED",
+      actionType: "TRANSFER_CANCELLED",
+      action: "TRANSFER_CANCELLED",
+      destinationId: chosen.id,
+      byUid: actor.uid,
+      byName: actorName,
+      byOfficeId: actor.officeId ?? chosen.sourceOfficeId ?? null,
+      byOfficeName: actor.officeName ?? chosen.sourceOfficeName ?? null,
+      fromOfficeId: chosen.sourceOfficeId,
+      toOfficeId: chosen.toOfficeId,
+      reason,
+      fromStatus: chosen.status,
+      toStatus: applied.status,
+      officeId: chosen.sourceOfficeId ?? coerceString(row.currentOfficeId) ?? null,
+      officeName: chosen.sourceOfficeName ?? coerceString(row.currentOfficeName) ?? null,
+      status: applied.status,
+      notePublic: "Destination transfer cancelled.",
+      notes: `Transfer cancelled: ${reason}`,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  });
+
+  await addAuditLog({
+    action: "dts_destination_cancelled",
+    entityType: "dts_documents",
+    entityId: docId,
+    dtsDocId: docId,
+    actorUid: actor.uid,
+    actorRole: actor.role,
+    actorOfficeId: actor.officeId ?? null,
+    actorOfficeName: actor.officeName ?? null,
+    actorName,
+    message: `Destination cancelled${resolvedDestinationId ? ` (${resolvedDestinationId})` : ""}.`,
+  });
+
+  return {
+    success: true,
+    destinationId: resolvedDestinationId,
+  };
+}
+
+export const dtsCreateDestinations = protectedCallableFunctions.https.onCall(
+  async (data, context) => dtsCreateDestinationsHandler(data, context)
+);
+
+export const dtsDispatchDestinations = protectedCallableFunctions.https.onCall(
+  async (data, context) => dtsDispatchDestinationsHandler(data, context)
+);
+
+export const dtsConfirmDestinationReceipt = protectedCallableFunctions.https.onCall(
+  async (data, context) => dtsConfirmDestinationReceiptHandler(data, context)
+);
+
+export const dtsRejectDestination = protectedCallableFunctions.https.onCall(
+  async (data, context) => dtsRejectDestinationHandler(data, context)
+);
+
+export const dtsCancelDestination = protectedCallableFunctions.https.onCall(
+  async (data, context) => dtsCancelDestinationHandler(data, context)
+);
+
+export const dtsInitiateTransfer = protectedCallableFunctions.https.onCall(
   async (data, context) => {
-    const actor = await requireStaffContext(context);
-    await requireFeatureWritable("documentTracking");
     const docId = coerceString(data?.docId);
     const toOfficeId = coerceString(data?.toOfficeId);
-    const toOfficeName = coerceString(data?.toOfficeName);
-    const toUid = coerceString(data?.toUid);
-
     if (!docId || !toOfficeId) {
       throw new functions.https.HttpsError(
         "invalid-argument",
         "docId and toOfficeId are required."
       );
     }
+    const toOfficeName = coerceString(data?.toOfficeName);
+    const toUid = coerceString(data?.toUid);
 
-    const docRef = db.collection("dts_documents").doc(docId);
-    const actorName = actorDisplayName(actor);
-
-    await db.runTransaction(async (tx) => {
-      const snap = await tx.get(docRef);
-      if (!snap.exists) {
-        throw new functions.https.HttpsError("not-found", "Document not found.");
-      }
-
-      const row = snap.data() ?? {};
-      if (!canOperateOnDtsDoc(actor, row)) {
-        throw new functions.https.HttpsError(
-          "permission-denied",
-          "You cannot transfer this document."
-        );
-      }
-
-      if (dtsPendingTransfer(row)) {
-        throw new functions.https.HttpsError(
-          "failed-precondition",
-          "Document already has a pending transfer."
-        );
-      }
-
-      const fromOfficeId = coerceString(row.currentOfficeId);
-      if (!fromOfficeId) {
-        throw new functions.https.HttpsError(
-          "failed-precondition",
-          "Document current office is missing."
-        );
-      }
-
-      const previousStatus = normalizeDtsStatus(row.status, "WITH_OFFICE");
-      if (previousStatus === "IN_TRANSIT") {
-        throw new functions.https.HttpsError(
-          "failed-precondition",
-          "Document is already in transit."
-        );
-      }
-      if (previousStatus === "RELEASED" || previousStatus === "ARCHIVED") {
-        throw new functions.https.HttpsError(
-          "failed-precondition",
-          "Released or archived documents cannot be transferred."
-        );
-      }
-      tx.set(
-        docRef,
-        {
-          pendingTransfer: {
-            fromOfficeId,
-            fromUid: actor.uid,
+    await dtsCreateDestinationsHandler(
+      {
+        docId,
+        destinations: [
+          {
             toOfficeId,
             toOfficeName,
             toUid,
-            previousStatus,
-            initiatedAt: admin.firestore.FieldValue.serverTimestamp(),
           },
-          status: "IN_TRANSIT",
-          currentCustodianUid: null,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        },
-        {merge: true}
-      );
-
-      const timelineRef = docRef.collection("timeline").doc();
-      tx.set(timelineRef, {
-        type: "TRANSFER_INITIATED",
-        byUid: actor.uid,
-        byName: actorName,
-        fromOfficeId,
-        toOfficeId,
-        toOfficeName: toOfficeName ?? null,
-        notePublic: toOfficeName
-          ? `Document transferred to ${toOfficeName}.`
-          : "Document transferred to the next office.",
-        notes: toOfficeName
-          ? `Transfer initiated to ${toOfficeName}.`
-          : "Transfer initiated.",
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-    });
+        ],
+      },
+      context
+    );
+    await dtsDispatchDestinationsHandler(
+      {
+        docId,
+        destinationIds: [],
+      },
+      context
+    );
 
     return {success: true};
   }
 );
 
-export const dtsCancelTransfer = functions.https.onCall(
+export const dtsCancelTransfer = protectedCallableFunctions.https.onCall(
   async (data, context) => {
     const actor = await requireStaffContext(context);
     await requireFeatureWritable("documentTracking");
     const docId = coerceString(data?.docId);
-    if (!docId) {
+    const destinationId = coerceString(data?.destinationId);
+    const reason = coerceString(data?.reason);
+    if (!docId || !reason) {
       throw new functions.https.HttpsError(
         "invalid-argument",
-        "docId is required."
+        "docId and reason are required."
+      );
+    }
+    if (destinationId) {
+      return dtsCancelDestinationHandler(
+        {docId, destinationId, reason},
+        context
+      );
+    }
+    const destinationProbe = await db
+      .collection("dts_documents")
+      .doc(docId)
+      .collection("destinations")
+      .limit(1)
+      .get();
+    if (!destinationProbe.empty) {
+      return dtsCancelDestinationHandler(
+        {docId, reason},
+        context
       );
     }
 
@@ -10341,13 +13744,23 @@ export const dtsCancelTransfer = functions.https.onCall(
 
       const timelineRef = docRef.collection("timeline").doc();
       tx.set(timelineRef, {
-        type: "RETURNED",
+        type: "TRANSFER_CANCELLED",
+        actionType: "TRANSFER_CANCELLED",
+        action: "TRANSFER_CANCELLED",
         byUid: actor.uid,
         byName: actorName,
+        byOfficeId: actor.officeId ?? fromOfficeId,
+        byOfficeName: actor.officeName ?? coerceString(row.currentOfficeName) ?? null,
         fromOfficeId: coerceString(pending.fromOfficeId),
         toOfficeId: coerceString(pending.toOfficeId),
+        reason,
+        fromStatus: "IN_TRANSIT",
+        toStatus: previousStatus,
+        officeId: fromOfficeId,
+        officeName: coerceString(row.currentOfficeName) ?? actor.officeName ?? null,
+        status: previousStatus,
         notePublic: "Transfer cancelled. Document returned to the source office.",
-        notes: "Transfer cancelled while in transit.",
+        notes: `Transfer cancelled while in transit: ${reason}`,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
     });
@@ -10356,11 +13769,12 @@ export const dtsCancelTransfer = functions.https.onCall(
   }
 );
 
-export const dtsRejectTransfer = functions.https.onCall(
+export const dtsRejectTransfer = protectedCallableFunctions.https.onCall(
   async (data, context) => {
     const actor = await requireStaffContext(context);
     await requireFeatureWritable("documentTracking");
     const docId = coerceString(data?.docId);
+    const destinationId = coerceString(data?.destinationId);
     const reason = coerceString(data?.reason);
     const attachments = sanitizeDtsAttachments(data?.attachments);
 
@@ -10368,6 +13782,24 @@ export const dtsRejectTransfer = functions.https.onCall(
       throw new functions.https.HttpsError(
         "invalid-argument",
         "docId and reason are required."
+      );
+    }
+    if (destinationId) {
+      return dtsRejectDestinationHandler(
+        {docId, destinationId, reason},
+        context
+      );
+    }
+    const destinationProbe = await db
+      .collection("dts_documents")
+      .doc(docId)
+      .collection("destinations")
+      .limit(1)
+      .get();
+    if (!destinationProbe.empty) {
+      return dtsRejectDestinationHandler(
+        {docId, reason},
+        context
       );
     }
 
@@ -10423,11 +13855,21 @@ export const dtsRejectTransfer = functions.https.onCall(
 
       const timelineRef = docRef.collection("timeline").doc();
       tx.set(timelineRef, {
-        type: "RETURNED",
+        type: "TRANSFER_REJECTED",
+        actionType: "TRANSFER_REJECTED",
+        action: "TRANSFER_REJECTED",
         byUid: actor.uid,
         byName: actorName,
+        byOfficeId: actor.officeId ?? coerceString(pending.toOfficeId) ?? null,
+        byOfficeName: actor.officeName ?? coerceString(pending.toOfficeName) ?? null,
         fromOfficeId: coerceString(pending.toOfficeId),
         toOfficeId: coerceString(pending.fromOfficeId),
+        reason,
+        fromStatus: "IN_TRANSIT",
+        toStatus: previousStatus,
+        officeId: fromOfficeId,
+        officeName: coerceString(row.currentOfficeName) ?? actor.officeName ?? null,
+        status: previousStatus,
         notePublic: "Receiving office rejected the transfer. Document returned to the source office.",
         notes: `Transfer rejected: ${reason}`,
         attachments,
@@ -10439,94 +13881,204 @@ export const dtsRejectTransfer = functions.https.onCall(
   }
 );
 
-export const dtsConfirmReceipt = functions.https.onCall(
+export const dtsConfirmReceipt = protectedCallableFunctions.https.onCall(
   async (data, context) => {
     const actor = await requireStaffContext(context);
     await requireFeatureWritable("documentTracking");
     const docId = coerceString(data?.docId);
+    const destinationId = coerceString(data?.destinationId);
+    const verificationValue = normalizeDtsVerificationValue(data?.verificationValue);
+    const verificationMethod = normalizeDtsVerificationMethod(data?.verificationMethod);
+    const confirmPhysicalReceipt = coerceBool(data?.confirmPhysicalReceipt, false);
     if (!docId) {
       throw new functions.https.HttpsError(
         "invalid-argument",
         "docId is required."
       );
     }
+    if (!confirmPhysicalReceipt) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "Physical receipt confirmation is required."
+      );
+    }
+    if (!verificationValue) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "Invalid tracking number or QR code."
+      );
+    }
+    if (destinationId) {
+      return dtsConfirmDestinationReceiptHandler(
+        {
+          docId,
+          destinationId,
+          verificationValue,
+          verificationMethod,
+          confirmPhysicalReceipt,
+        },
+        context
+      );
+    }
+    const destinationProbe = await db
+      .collection("dts_documents")
+      .doc(docId)
+      .collection("destinations")
+      .limit(1)
+      .get();
+    if (!destinationProbe.empty) {
+      return dtsConfirmDestinationReceiptHandler(
+        {
+          docId,
+          verificationValue,
+          verificationMethod,
+          confirmPhysicalReceipt,
+        },
+        context
+      );
+    }
 
+    const receiptAttemptScope = `TRANSFER_${docId}`;
+    await assertReceiptVerificationNotLocked(receiptAttemptScope, actor.uid, context);
     const docRef = db.collection("dts_documents").doc(docId);
     const actorName = actorDisplayName(actor);
 
-    await db.runTransaction(async (tx) => {
-      const snap = await tx.get(docRef);
-      if (!snap.exists) {
-        throw new functions.https.HttpsError("not-found", "Document not found.");
-      }
+    try {
+      await db.runTransaction(async (tx) => {
+        const snap = await tx.get(docRef);
+        if (!snap.exists) {
+          throw new functions.https.HttpsError("not-found", "Document not found.");
+        }
 
-      const row = snap.data() ?? {};
-      const currentStatus = normalizeDtsStatus(row.status, "RECEIVED");
-      if (currentStatus !== "IN_TRANSIT") {
-        throw new functions.https.HttpsError(
-          "failed-precondition",
-          "Document is not currently in transit."
-        );
-      }
-      const pending = dtsPendingTransfer(row);
-      if (!pending) {
-        throw new functions.https.HttpsError(
-          "failed-precondition",
-          "No pending transfer to confirm."
-        );
-      }
+        const row = snap.data() ?? {};
+        const currentStatus = normalizeDtsStatus(row.status, "RECEIVED");
+        if (currentStatus === "WITH_OFFICE") {
+          throw new functions.https.HttpsError(
+            "failed-precondition",
+            "Document already received."
+          );
+        }
+        if (currentStatus !== "IN_TRANSIT") {
+          throw new functions.https.HttpsError(
+            "failed-precondition",
+            "Document not in transit."
+          );
+        }
 
-      if (actor.role !== "super_admin" && !isIntendedDtsReceiver(actor, pending)) {
-        throw new functions.https.HttpsError(
-          "permission-denied",
-          "You are not the receiving office for this transfer."
-        );
-      }
+        const pending = dtsPendingTransfer(row);
+        if (!pending) {
+          throw new functions.https.HttpsError(
+            "failed-precondition",
+            "Document not in transit."
+          );
+        }
 
-      const toOfficeId = coerceString(pending.toOfficeId);
-      if (!toOfficeId) {
-        throw new functions.https.HttpsError(
-          "failed-precondition",
-          "Transfer destination office is missing."
-        );
-      }
-      const toOfficeName =
-        coerceString(pending.toOfficeName) ??
-        actor.officeName ??
-        coerceString(row.currentOfficeName) ??
-        toOfficeId;
+        if (actor.role !== "super_admin" && !isIntendedDtsReceiver(actor, pending)) {
+          throw new functions.https.HttpsError(
+            "permission-denied",
+            "You are not authorized to receive this document."
+          );
+        }
 
-      tx.set(
-        docRef,
-        {
-          currentOfficeId: toOfficeId,
-          currentOfficeName: toOfficeName,
-          currentCustodianUid: actor.uid,
-          pendingTransfer: null,
+        const trackingNo = coerceString(row.trackingNo) ?? "";
+        const qrCode = coerceString(row.qrCode);
+        const expectedQrSuffix = dtsQrSuffix(qrCode);
+        if (expectedQrSuffix) {
+          if (verificationValue !== expectedQrSuffix) {
+            throw new functions.https.HttpsError(
+              "invalid-argument",
+              `Invalid QR suffix. Enter the last ${DTS_RECEIPT_QR_SUFFIX_LENGTH} characters of the printed QR code.`
+            );
+          }
+        } else if (!matchesDtsTrackingOrQr(verificationValue, trackingNo, qrCode)) {
+          throw new functions.https.HttpsError(
+            "invalid-argument",
+            "Invalid tracking number or QR code."
+          );
+        }
+
+        const toOfficeId = coerceString(pending.toOfficeId);
+        if (!toOfficeId) {
+          throw new functions.https.HttpsError(
+            "failed-precondition",
+            "Document not in transit."
+          );
+        }
+        const toOfficeName =
+          coerceString(pending.toOfficeName) ??
+          actor.officeName ??
+          coerceString(row.currentOfficeName) ??
+          toOfficeId;
+
+        tx.set(
+          docRef,
+          {
+            currentOfficeId: toOfficeId,
+            currentOfficeName: toOfficeName,
+            currentCustodianUid: actor.uid,
+            pendingTransfer: null,
+            status: "WITH_OFFICE",
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          {merge: true}
+        );
+
+        const timelineRef = docRef.collection("timeline").doc();
+        tx.set(timelineRef, {
+          type: "DOCUMENT_RECEIVED",
+          actionType: "DOCUMENT_RECEIVED",
+          action: "DOCUMENT_RECEIVED",
+          method: verificationMethod,
+          verificationMethod,
+          byUid: actor.uid,
+          byName: actorName,
+          byOfficeId: actor.officeId ?? toOfficeId,
+          byOfficeName: actor.officeName ?? toOfficeName,
+          toOfficeId,
+          toOfficeName,
+          officeId: toOfficeId,
+          officeName: toOfficeName,
+          fromStatus: "IN_TRANSIT",
+          toStatus: "WITH_OFFICE",
           status: "WITH_OFFICE",
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        },
-        {merge: true}
-      );
-
-      const timelineRef = docRef.collection("timeline").doc();
-      tx.set(timelineRef, {
-        type: "TRANSFER_CONFIRMED",
-        byUid: actor.uid,
-        byName: actorName,
-        toOfficeId,
-        toOfficeName,
-        notePublic: `Document received by ${toOfficeName}.`,
-        notes: `Transfer confirmed by ${actorName}.`,
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          notePublic: `Document received by ${toOfficeName}.`,
+          notes: `Receipt confirmed by ${actorName} (${verificationMethod}).`,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
       });
-    });
+    } catch (error) {
+      const code = (error as {code?: string})?.code ?? "";
+      const message = (error as {message?: string})?.message ?? "";
+      const shouldCountFailure =
+        code === "invalid-argument" &&
+        /tracking number|qr code/i.test(message);
+      if (shouldCountFailure) {
+        const locked = await registerReceiptVerificationFailure(
+          receiptAttemptScope,
+          actor.uid,
+          context
+        );
+        if (locked) {
+          throw new functions.https.HttpsError(
+            "resource-exhausted",
+            "Too many invalid verification attempts. Please wait before trying again."
+          );
+        }
+        throw new functions.https.HttpsError(
+          "invalid-argument",
+          "Invalid tracking number or QR code."
+        );
+      }
+      throw error;
+    }
+
+    await clearReceiptVerificationAttempts(receiptAttemptScope, actor.uid, context);
 
     return {success: true};
   }
 );
 
-export const dtsUpdateStatus = functions.https.onCall(
+export const dtsUpdateStatus = protectedCallableFunctions.https.onCall(
   async (data, context) => {
     const actor = await requireStaffContext(context);
     await requireFeatureWritable("documentTracking");
@@ -10541,6 +14093,7 @@ export const dtsUpdateStatus = functions.https.onCall(
 
     const status = normalizeDtsStatus(requestedStatus);
     const actorName = coerceString(data?.actorName) ?? actorDisplayName(actor);
+    const reason = coerceString(data?.reason);
     const docRef = db.collection("dts_documents").doc(docId);
 
     await db.runTransaction(async (tx) => {
@@ -10568,6 +14121,38 @@ export const dtsUpdateStatus = functions.https.onCall(
           "Use transfer actions to set IN_TRANSIT."
         );
       }
+      if (
+        status === "VOIDED" &&
+        currentStatus !== "DRAFT" &&
+        currentStatus !== "CREATED" &&
+        actor.role !== "super_admin" &&
+        actor.role !== "admin"
+      ) {
+        throw new functions.https.HttpsError(
+          "permission-denied",
+          "Voiding after routing/processing requires admin authorization."
+        );
+      }
+      if (status === "VOIDED") {
+        if (!reason) {
+          throw new functions.https.HttpsError(
+            "invalid-argument",
+            "Void reason is required."
+          );
+        }
+        if (reason.length < 6) {
+          throw new functions.https.HttpsError(
+            "invalid-argument",
+            "Void reason must be at least 6 characters."
+          );
+        }
+      }
+      if (reason && reason.length > 500) {
+        throw new functions.https.HttpsError(
+          "invalid-argument",
+          "reason must be 500 characters or fewer."
+        );
+      }
       if (!canTransitionDtsStatus(currentStatus, status)) {
         throw new functions.https.HttpsError(
           "failed-precondition",
@@ -10584,13 +14169,27 @@ export const dtsUpdateStatus = functions.https.onCall(
         {merge: true}
       );
       const timelineRef = docRef.collection("timeline").doc();
+      const eventType = status === "VOIDED" ? "DOCUMENT_VOIDED" : "STATUS_CHANGED";
+      const resolvedOfficeId = coerceString(row.currentOfficeId) ?? actor.officeId ?? null;
+      const resolvedOfficeName = coerceString(row.currentOfficeName) ?? actor.officeName ?? null;
       tx.set(timelineRef, {
-        type: "STATUS_CHANGED",
+        type: eventType,
+        actionType: eventType,
+        action: eventType,
         byUid: actor.uid,
         byName: actorName,
+        byOfficeId: actor.officeId ?? resolvedOfficeId,
+        byOfficeName: actor.officeName ?? resolvedOfficeName,
+        officeId: resolvedOfficeId,
+        officeName: resolvedOfficeName,
+        reason: reason ?? null,
+        fromStatus: currentStatus,
+        toStatus: status,
         status,
         notePublic: `Status updated to ${prettyDtsStatus(status)}.`,
-        notes: `Status updated to ${prettyDtsStatus(status)} by ${actorName}.`,
+        notes: reason
+          ? `Status updated to ${prettyDtsStatus(status)} by ${actorName}. Reason: ${reason}`
+          : `Status updated to ${prettyDtsStatus(status)} by ${actorName}.`,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
     });
@@ -10599,7 +14198,7 @@ export const dtsUpdateStatus = functions.https.onCall(
   }
 );
 
-export const dtsAddNote = functions.https.onCall(
+export const dtsAddNote = protectedCallableFunctions.https.onCall(
   async (data, context) => {
     const actor = await requireStaffContext(context);
     await requireFeatureWritable("documentTracking");
@@ -10644,10 +14243,19 @@ export const dtsAddNote = functions.https.onCall(
         {merge: true}
       );
       const timelineRef = docRef.collection("timeline").doc();
+      const resolvedOfficeId = coerceString(row.currentOfficeId) ?? actor.officeId ?? null;
+      const resolvedOfficeName = coerceString(row.currentOfficeName) ?? actor.officeName ?? null;
       tx.set(timelineRef, {
         type: "NOTE",
+        actionType: "NOTE_ADDED",
+        action: "NOTE_ADDED",
         byUid: actor.uid,
         byName: actorName,
+        byOfficeId: actor.officeId ?? resolvedOfficeId,
+        byOfficeName: actor.officeName ?? resolvedOfficeName,
+        officeId: resolvedOfficeId,
+        officeName: resolvedOfficeName,
+        status: normalizeDtsStatus(row.status, "RECEIVED"),
         notes,
         attachments,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -10658,7 +14266,7 @@ export const dtsAddNote = functions.https.onCall(
   }
 );
 
-export const dtsSetCoverPhoto = functions.https.onCall(
+export const dtsSetCoverPhoto = protectedCallableFunctions.https.onCall(
   async (data, context) => {
     const actor = await requireStaffContext(context);
     await requireFeatureWritable("documentTracking");
@@ -10701,9 +14309,17 @@ export const dtsSetCoverPhoto = functions.https.onCall(
         {merge: true}
       );
       tx.set(docRef.collection("timeline").doc(), {
-        type: "NOTE",
+        type: "FILE_ATTACHED",
+        actionType: "FILE_ATTACHED",
+        action: "FILE_ATTACHED",
         byUid: actor.uid,
         byName: actorName,
+        byOfficeId: actor.officeId ?? coerceString(row.currentOfficeId) ?? null,
+        byOfficeName: actor.officeName ?? coerceString(row.currentOfficeName) ?? null,
+        officeId: coerceString(row.currentOfficeId) ?? actor.officeId ?? null,
+        officeName: coerceString(row.currentOfficeName) ?? actor.officeName ?? null,
+        status: normalizeDtsStatus(row.status, "RECEIVED"),
+        notePublic: "Cover photo uploaded.",
         notes: "Cover photo uploaded.",
         attachments: [coverPhoto],
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -10714,7 +14330,7 @@ export const dtsSetCoverPhoto = functions.https.onCall(
   }
 );
 
-export const dtsAuditAttachmentAccess = functions.https.onCall(
+export const dtsAuditAttachmentAccess = protectedCallableFunctions.https.onCall(
   async (data, context) => {
     const actor = await requireStaffContext(context);
     await requireFeatureWritable("documentTracking");
@@ -10861,7 +14477,7 @@ async function setTrackingPinHandler(
   return {success: true};
 }
 
-export const setTrackingPin = onCallV2({region: REGION}, async (request) => {
+export const setTrackingPin = onCallV2(protectedCallableV2Options, async (request) => {
   try {
     return await setTrackingPinHandler(request.data, toCallableContextFromV2(request));
   } catch (error) {
@@ -11337,23 +14953,499 @@ export const dtsUnsaveTrackedDocument = functions.https.onCall(
  * =========================
  * Lists recent QR sticker batches for Super Admin management.
  */
-export const dtsListQrBatches = functions.https.onCall(
+type DtsQrBatchReconcileSummary = {
+  batchId: string;
+  totalCount: number;
+  unusedCount: number;
+  usedCount: number;
+  voidedCount: number;
+  patchedQrCodes: number;
+  patchedIndexRows: number;
+  deletedIndexRows: number;
+};
+
+function normalizeDtsQrCodeStatus(value: unknown): string {
+  return (coerceString(value) ?? "").trim().toLowerCase();
+}
+
+function resolveDtsQrReservationExpiryMs(row: Record<string, unknown>): number {
+  const explicitExpiryMs = parseEpochMs(row.reservationExpiresAt);
+  if (explicitExpiryMs > 0) {
+    return explicitExpiryMs;
+  }
+  const reservedAtMs = parseEpochMs(row.reservedAt);
+  if (reservedAtMs > 0) {
+    return reservedAtMs + (DTS_QR_RESERVATION_TTL_MINUTES * 60 * 1000);
+  }
+  // Missing metadata is treated as stale so old reserved rows are auto-released.
+  return 0;
+}
+
+function isDtsQrReservationExpired(
+  row: Record<string, unknown>,
+  nowMs = Date.now()
+): boolean {
+  const expiresAtMs = resolveDtsQrReservationExpiryMs(row);
+  return expiresAtMs <= 0 || expiresAtMs <= nowMs;
+}
+
+function buildDtsQrReservationReleasePatch(
+  row: Record<string, unknown>
+): Record<string, unknown> {
+  const linkedDocId = coerceString(row.docId);
+  const patch: Record<string, unknown> = {
+    status: linkedDocId ? "used" : "unused",
+    reservedAt: admin.firestore.FieldValue.delete(),
+    reservedByUid: admin.firestore.FieldValue.delete(),
+    reservationExpiresAt: admin.firestore.FieldValue.delete(),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+  if (linkedDocId) {
+    if (!row.usedAt) {
+      patch.usedAt = admin.firestore.FieldValue.serverTimestamp();
+    }
+  } else {
+    patch.docId = admin.firestore.FieldValue.delete();
+    patch.usedAt = admin.firestore.FieldValue.delete();
+    patch.usedByUid = admin.firestore.FieldValue.delete();
+  }
+  return patch;
+}
+
+type DtsQrReservationResult = {
+  status: "reserved" | "used";
+  batchId: string | null;
+  imagePath: string | null;
+  reservationExpiresAt: string | null;
+};
+
+async function reserveDtsQrForIntake(
+  qrCode: string,
+  actorUid: string
+): Promise<DtsQrReservationResult> {
+  const qrRef = db.collection("dts_qr_codes").doc(qrCode);
+  const nowMs = Date.now();
+  const reservationExpiresAtTs = admin.firestore.Timestamp.fromMillis(
+    nowMs + (DTS_QR_RESERVATION_TTL_MINUTES * 60 * 1000)
+  );
+
+  return db.runTransaction(async (tx) => {
+    const qrSnap = await tx.get(qrRef);
+    if (!qrSnap.exists) {
+      throw new functions.https.HttpsError("not-found", "QR code not found.");
+    }
+    const row = (qrSnap.data() ?? {}) as Record<string, unknown>;
+    const status = normalizeDtsQrCodeStatus(row.status) || "unused";
+    const batchId = coerceString(row.batchId);
+    const imagePath = coerceString(row.imagePath);
+
+    if (status === "voided") {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "This QR code has been voided."
+      );
+    }
+    if (status === "used") {
+      return {
+        status: "used",
+        batchId,
+        imagePath,
+        reservationExpiresAt: null,
+      };
+    }
+
+    if (status === "reserved") {
+      const reservedByUid = coerceString(row.reservedByUid);
+      if (!isDtsQrReservationExpired(row, nowMs) &&
+          reservedByUid &&
+          reservedByUid !== actorUid) {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          "This QR code is currently reserved."
+        );
+      }
+    }
+
+    tx.set(
+      qrRef,
+      {
+        status: "reserved",
+        reservedAt: admin.firestore.FieldValue.serverTimestamp(),
+        reservedByUid: actorUid,
+        reservationExpiresAt: reservationExpiresAtTs,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        docId: admin.firestore.FieldValue.delete(),
+        usedAt: admin.firestore.FieldValue.delete(),
+        usedByUid: admin.firestore.FieldValue.delete(),
+      },
+      {merge: true}
+    );
+
+    return {
+      status: "reserved",
+      batchId,
+      imagePath,
+      reservationExpiresAt: reservationExpiresAtTs.toDate().toISOString(),
+    };
+  });
+}
+
+type DtsQrLinkEvidence = {
+  docId: string | null;
+  trackingNo: string | null;
+  hasIndexRow: boolean;
+};
+
+async function loadDtsQrLinkEvidence(
+  qrCodes: string[]
+): Promise<Map<string, DtsQrLinkEvidence>> {
+  const evidence = new Map<string, DtsQrLinkEvidence>();
+  if (qrCodes.length === 0) {
+    return evidence;
+  }
+
+  const indexSnapshots = await Promise.all(
+    qrCodes.map((qrCode) => db.collection("dts_qr_index").doc(qrCode).get())
+  );
+  for (let i = 0; i < qrCodes.length; i += 1) {
+    const qrCode = qrCodes[i];
+    const snap = indexSnapshots[i];
+    const row = snap.data() ?? {};
+    evidence.set(qrCode, {
+      docId: coerceString(row.docId),
+      trackingNo: coerceString(row.trackingNo),
+      hasIndexRow: snap.exists,
+    });
+  }
+
+  for (const codeChunk of chunk(qrCodes, 30)) {
+    if (codeChunk.length === 0) continue;
+    const docsByQr = await db
+      .collection("dts_documents")
+      .where("qrCode", "in", codeChunk)
+      .get();
+    docsByQr.forEach((docSnap) => {
+      const row = docSnap.data() ?? {};
+      const qrCode = coerceString(row.qrCode);
+      if (!qrCode) return;
+      const current = evidence.get(qrCode) ?? {
+        docId: null,
+        trackingNo: null,
+        hasIndexRow: false,
+      };
+      evidence.set(qrCode, {
+        docId: current.docId ?? docSnap.id,
+        trackingNo: current.trackingNo ?? coerceString(row.trackingNo),
+        hasIndexRow: current.hasIndexRow,
+      });
+    });
+  }
+
+  return evidence;
+}
+
+async function commitDtsQrReconcileWrites(
+  setWrites: Array<{
+    ref: FirebaseFirestore.DocumentReference<FirebaseFirestore.DocumentData>;
+    data: Record<string, unknown>;
+    merge?: boolean;
+  }>,
+  deleteWrites: Array<
+    FirebaseFirestore.DocumentReference<FirebaseFirestore.DocumentData>
+  >
+): Promise<void> {
+  if (setWrites.length === 0 && deleteWrites.length === 0) {
+    return;
+  }
+  let setCursor = 0;
+  let deleteCursor = 0;
+  while (setCursor < setWrites.length || deleteCursor < deleteWrites.length) {
+    const batch = db.batch();
+    let opCount = 0;
+    while (opCount < 400 && setCursor < setWrites.length) {
+      const write = setWrites[setCursor];
+      if (write.merge) {
+        batch.set(write.ref, write.data, {merge: true});
+      } else {
+        batch.set(write.ref, write.data);
+      }
+      setCursor += 1;
+      opCount += 1;
+    }
+    while (opCount < 400 && deleteCursor < deleteWrites.length) {
+      batch.delete(deleteWrites[deleteCursor]);
+      deleteCursor += 1;
+      opCount += 1;
+    }
+    await batch.commit();
+  }
+}
+
+async function reconcileDtsQrBatch(
+  batchId: string,
+  options?: {
+    repairQrRows?: boolean;
+    syncBatchCounters?: boolean;
+  }
+): Promise<DtsQrBatchReconcileSummary> {
+  const repairQrRows = coerceBool(options?.repairQrRows, false);
+  const syncBatchCounters = coerceBool(options?.syncBatchCounters, true);
+  const codesSnapshot = await db
+    .collection("dts_qr_codes")
+    .where("batchId", "==", batchId)
+    .get();
+  const codeIds = codesSnapshot.docs.map((doc) => doc.id);
+  const evidenceByCode = await loadDtsQrLinkEvidence(codeIds);
+
+  let totalCount = 0;
+  let usedCount = 0;
+  let unusedCount = 0;
+  let voidedCount = 0;
+  let patchedQrCodes = 0;
+  let patchedIndexRows = 0;
+  let deletedIndexRows = 0;
+
+  const setWrites: Array<{
+    ref: FirebaseFirestore.DocumentReference<FirebaseFirestore.DocumentData>;
+    data: Record<string, unknown>;
+    merge?: boolean;
+  }> = [];
+  const deleteWrites: Array<
+    FirebaseFirestore.DocumentReference<FirebaseFirestore.DocumentData>
+  > = [];
+
+  for (const codeDoc of codesSnapshot.docs) {
+    totalCount += 1;
+    const qrCode = codeDoc.id;
+    const row = codeDoc.data() ?? {};
+    const status = normalizeDtsQrCodeStatus(row.status);
+    const existingDocId = coerceString(row.docId);
+    const existingUsedAt = Boolean(row.usedAt);
+    const evidence = evidenceByCode.get(qrCode) ?? {
+      docId: null,
+      trackingNo: null,
+      hasIndexRow: false,
+    };
+    const linkedDocId = existingDocId ?? evidence.docId;
+    const linkedTrackingNo = evidence.trackingNo;
+    const targetStatus = status === "voided" && !linkedDocId ?
+      "voided" :
+      (linkedDocId ? "used" : "unused");
+
+    if (targetStatus === "voided") {
+      voidedCount += 1;
+    } else if (targetStatus === "used") {
+      usedCount += 1;
+    } else {
+      unusedCount += 1;
+    }
+
+    if (repairQrRows) {
+      const qrPatch: Record<string, unknown> = {};
+      if (status !== targetStatus) {
+        qrPatch.status = targetStatus;
+      }
+      if (targetStatus === "used") {
+        if (linkedDocId && existingDocId !== linkedDocId) {
+          qrPatch.docId = linkedDocId;
+        }
+        if (!existingUsedAt) {
+          qrPatch.usedAt = admin.firestore.FieldValue.serverTimestamp();
+        }
+      } else {
+        if (existingDocId) {
+          qrPatch.docId = admin.firestore.FieldValue.delete();
+        }
+        if (existingUsedAt) {
+          qrPatch.usedAt = admin.firestore.FieldValue.delete();
+        }
+      }
+      if (Object.keys(qrPatch).length > 0) {
+        qrPatch.updatedAt = admin.firestore.FieldValue.serverTimestamp();
+        setWrites.push({
+          ref: codeDoc.ref,
+          data: qrPatch,
+          merge: true,
+        });
+        patchedQrCodes += 1;
+      }
+
+      const indexRef = db.collection("dts_qr_index").doc(qrCode);
+      if (targetStatus === "used" && linkedDocId) {
+        if (
+          !evidence.hasIndexRow ||
+          evidence.docId !== linkedDocId ||
+          coerceString(evidence.trackingNo) !== coerceString(linkedTrackingNo)
+        ) {
+          setWrites.push({
+            ref: indexRef,
+            data: {
+              docId: linkedDocId,
+              trackingNo: linkedTrackingNo ?? null,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              ...(evidence.hasIndexRow ?
+                {} :
+                {createdAt: admin.firestore.FieldValue.serverTimestamp()}),
+            },
+            merge: true,
+          });
+          patchedIndexRows += 1;
+        }
+      } else if (evidence.hasIndexRow) {
+        deleteWrites.push(indexRef);
+        deletedIndexRows += 1;
+      }
+    }
+  }
+
+  if (syncBatchCounters) {
+    setWrites.push({
+      ref: db.collection("dts_qr_batches").doc(batchId),
+      data: {
+        totalCount,
+        unusedCount,
+        usedCount,
+        voidedCount,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      merge: true,
+    });
+  }
+
+  if (repairQrRows) {
+    await commitDtsQrReconcileWrites(setWrites, deleteWrites);
+  } else if (syncBatchCounters) {
+    await db.collection("dts_qr_batches").doc(batchId).set({
+      totalCount,
+      unusedCount,
+      usedCount,
+      voidedCount,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, {merge: true});
+  }
+
+  return {
+    batchId,
+    totalCount,
+    unusedCount,
+    usedCount,
+    voidedCount,
+    patchedQrCodes,
+    patchedIndexRows,
+    deletedIndexRows,
+  };
+}
+
+export const dtsListQrBatches = protectedCallableFunctions.https.onCall(
   async (data, context) => {
     await requireFeatureWritable("documentTracking");
     await requireSuperAdminContext(context);
 
     const limitRaw = typeof data?.limit === "number" ? data.limit : 24;
     const limit = Math.max(1, Math.min(100, Math.floor(limitRaw)));
+    const repair = coerceBool(data?.repair, true);
     const snapshot = await db
       .collection("dts_qr_batches")
       .orderBy("createdAt", "desc")
       .limit(limit)
       .get();
 
+    const items = await Promise.all(
+      snapshot.docs.map(async (doc) => {
+        const row = doc.data() ?? {};
+        const existingTotal = Number.isFinite(Number(row.totalCount)) ? Number(row.totalCount) : 0;
+        const existingUnused = Number.isFinite(Number(row.unusedCount)) ? Number(row.unusedCount) : 0;
+        const existingUsed = Number.isFinite(Number(row.usedCount)) ? Number(row.usedCount) : 0;
+        const existingVoided = Number.isFinite(Number(row.voidedCount)) ? Number(row.voidedCount) : 0;
+        let summary: DtsQrBatchReconcileSummary = {
+          batchId: doc.id,
+          totalCount: existingTotal,
+          unusedCount: existingUnused,
+          usedCount: existingUsed,
+          voidedCount: existingVoided,
+          patchedQrCodes: 0,
+          patchedIndexRows: 0,
+          deletedIndexRows: 0,
+        };
+        try {
+          summary = await reconcileDtsQrBatch(doc.id, {
+            repairQrRows: repair,
+            syncBatchCounters: true,
+          });
+        } catch (error) {
+          console.warn("dtsListQrBatches: count reconciliation failed", {
+            batchId: doc.id,
+            error,
+          });
+        }
+        return {
+          id: doc.id,
+          ...row,
+          totalCount: summary.totalCount,
+          unusedCount: summary.unusedCount,
+          usedCount: summary.usedCount,
+          voidedCount: summary.voidedCount,
+        };
+      })
+    );
+
+    return {items};
+  }
+);
+
+/**
+ * =========================
+ * DTS QR INVENTORY RECONCILE
+ * =========================
+ * Repairs QR status/index drift and refreshes batch counters.
+ */
+export const dtsReconcileQrBatches = protectedCallableFunctions.https.onCall(
+  async (data, context) => {
+    await requireFeatureWritable("documentTracking");
+    await requireSuperAdminContext(context);
+
+    const batchId = coerceString(data?.batchId);
+    const apply = coerceBool(data?.apply, true);
+    const limitRaw = typeof data?.limit === "number" ? data.limit : 24;
+    const limit = Math.max(1, Math.min(100, Math.floor(limitRaw)));
+
+    let batchIds: string[] = [];
+    if (batchId) {
+      batchIds = [batchId];
+    } else {
+      const snapshot = await db
+        .collection("dts_qr_batches")
+        .orderBy("createdAt", "desc")
+        .limit(limit)
+        .get();
+      batchIds = snapshot.docs.map((doc) => doc.id);
+    }
+
+    const rows: DtsQrBatchReconcileSummary[] = [];
+    for (const rowBatchId of batchIds) {
+      const summary = await reconcileDtsQrBatch(rowBatchId, {
+        repairQrRows: apply,
+        syncBatchCounters: true,
+      });
+      rows.push(summary);
+    }
+
     return {
-      items: snapshot.docs.map((doc) => ({
-        id: doc.id,
-        ...(doc.data() ?? {}),
+      success: true,
+      apply,
+      processed: rows.length,
+      patchedQrCodes: rows.reduce((sum, row) => sum + row.patchedQrCodes, 0),
+      patchedIndexRows: rows.reduce((sum, row) => sum + row.patchedIndexRows, 0),
+      deletedIndexRows: rows.reduce((sum, row) => sum + row.deletedIndexRows, 0),
+      items: rows.map((row) => ({
+        batchId: row.batchId,
+        totalCount: row.totalCount,
+        unusedCount: row.unusedCount,
+        usedCount: row.usedCount,
+        voidedCount: row.voidedCount,
+        patchedQrCodes: row.patchedQrCodes,
+        patchedIndexRows: row.patchedIndexRows,
+        deletedIndexRows: row.deletedIndexRows,
       })),
     };
   }
@@ -11365,7 +15457,7 @@ export const dtsListQrBatches = functions.https.onCall(
  * =========================
  * Generates QR codes and stores them in Firestore + Storage.
  */
-export const generateDtsQrCodes = functions.https.onCall(
+export const generateDtsQrCodes = protectedCallableFunctions.https.onCall(
   async (data, context) => {
     await requireFeatureWritable("documentTracking");
     if (!context.auth) {
@@ -11494,7 +15586,7 @@ export const generateDtsQrCodes = functions.https.onCall(
  * =========================
  * Exports up to 10 QR PNGs into a zip file and returns a download URL.
  */
-export const exportDtsQrZip = functions.https.onCall(
+export const exportDtsQrZip = protectedCallableFunctions.https.onCall(
   async (data, context) => {
     await requireFeatureWritable("documentTracking");
     if (!context.auth) {
@@ -11521,6 +15613,9 @@ export const exportDtsQrZip = functions.https.onCall(
     const bucket = admin.storage().bucket();
     let codes: string[] = [];
     const batchId = coerceString(data?.batchId);
+    const exportUnusedOnly =
+      coerceBool(data?.unusedOnly, true) &&
+      coerceBool(data?.includeUsed, false) === false;
     if (Array.isArray(data?.codes)) {
       codes = data.codes
         .map((c: unknown) => (c ? String(c).trim() : ""))
@@ -11532,15 +15627,71 @@ export const exportDtsQrZip = functions.https.onCall(
         const batchSnap = await db
           .collection("dts_qr_codes")
           .where("batchId", "==", batchId)
-          .limit(100)
+          .limit(400)
           .get();
-        codes = batchSnap.docs.map((d) => d.id);
+        let batchRows = batchSnap.docs;
+        if (exportUnusedOnly) {
+          const candidateCodeIds = batchRows.map((doc) => doc.id);
+          const usedByIndex = new Set<string>();
+          const usedByDocuments = new Set<string>();
+
+          if (candidateCodeIds.length > 0) {
+            const indexSnapshots = await Promise.all(
+              candidateCodeIds.map((qrCode) =>
+                db.collection("dts_qr_index").doc(qrCode).get()
+              )
+            );
+            for (let i = 0; i < indexSnapshots.length; i += 1) {
+              const snap = indexSnapshots[i];
+              const qrCode = candidateCodeIds[i];
+              const docId = coerceString(snap.data()?.docId);
+              if (snap.exists && docId) {
+                usedByIndex.add(qrCode);
+              }
+            }
+            for (let i = 0; i < candidateCodeIds.length; i += 30) {
+              const chunk = candidateCodeIds.slice(i, i + 30);
+              const docsByQr = await db
+                .collection("dts_documents")
+                .where("qrCode", "in", chunk)
+                .get();
+              docsByQr.forEach((docSnap) => {
+                const qrCode = coerceString(docSnap.data()?.qrCode);
+                if (qrCode) {
+                  usedByDocuments.add(qrCode);
+                }
+              });
+            }
+          }
+
+          batchRows = batchRows.filter((docSnap) => {
+            const codeRow = docSnap.data() ?? {};
+            const status = (coerceString(codeRow.status) ?? "")
+              .toLowerCase()
+              .trim();
+            if (status !== "unused") {
+              return false;
+            }
+            if (coerceString(codeRow.docId)) {
+              return false;
+            }
+            if (codeRow.usedAt) {
+              return false;
+            }
+            if (usedByIndex.has(docSnap.id) || usedByDocuments.has(docSnap.id)) {
+              return false;
+            }
+            return true;
+          });
+        }
+        codes = batchRows.map((d) => d.id);
       } else {
-        const snap = await db
+        const query = db
           .collection("dts_qr_codes")
-          .orderBy("createdAt", "desc")
-          .limit(10)
-          .get();
+          .orderBy("createdAt", "desc");
+        const snap = await (exportUnusedOnly ?
+          query.where("status", "==", "unused").limit(50).get() :
+          query.limit(10).get());
         codes = snap.docs.map((d) => d.id);
       }
     }
@@ -11575,7 +15726,8 @@ export const exportDtsQrZip = functions.https.onCall(
 
     const zipBuffer = zip.toBuffer();
     const exportPath = `dts_qr_exports/qr-batch-${Date.now()}.zip`;
-    await bucket.file(exportPath).save(zipBuffer, {
+    const exportFile = bucket.file(exportPath);
+    await exportFile.save(zipBuffer, {
       metadata: { contentType: "application/zip" },
     });
 
@@ -11602,7 +15754,7 @@ export const exportDtsQrZip = functions.https.onCall(
 
     let downloadUrl: string | null = null;
     try {
-      const result = await bucket.file(exportPath).getSignedUrl({
+      const result = await exportFile.getSignedUrl({
         action: "read",
         expires: Date.now() + 1000 * 60 * 60,
       });
@@ -11611,12 +15763,37 @@ export const exportDtsQrZip = functions.https.onCall(
       console.warn("exportDtsQrZip: signed URL generation failed", error);
     }
 
+    if (!downloadUrl) {
+      try {
+        const [metadata] = await exportFile.getMetadata();
+        const customMetadata = metadata.metadata ?? {};
+        let token = coerceString(customMetadata.firebaseStorageDownloadTokens);
+        if (token && token.includes(",")) {
+          token = token.split(",")[0].trim();
+        }
+        if (!token) {
+          token = crypto.randomUUID();
+          await exportFile.setMetadata({
+            metadata: {
+              ...customMetadata,
+              firebaseStorageDownloadTokens: token,
+            },
+          });
+        }
+        downloadUrl = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/` +
+          `${encodeURIComponent(exportPath)}?alt=media&token=${token}`;
+      } catch (fallbackError) {
+        console.warn("exportDtsQrZip: token URL fallback failed", fallbackError);
+      }
+    }
+
     return {
       batchId,
       count: exportedCodes.length,
       path: exportPath,
       downloadUrl,
       codes: exportedCodes,
+      unusedOnly: exportUnusedOnly,
     };
   }
 );
@@ -11632,6 +15809,11 @@ export const __testing = {
   loadScopedReportsForActor,
   loadScopedReportViewCountsForActor,
   buildScopedReportViewCounts,
+  dtsCreateDestinationsHandler,
+  dtsDispatchDestinationsHandler,
+  dtsConfirmDestinationReceiptHandler,
+  dtsRejectDestinationHandler,
+  dtsCancelDestinationHandler,
   strictCorsEnabled,
   isAllowedCorsOrigin,
   isAllowedPublicReportCorsOrigin,

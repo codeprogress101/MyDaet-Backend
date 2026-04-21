@@ -12,6 +12,12 @@ function hasFlag(name) {
   return process.argv.includes(`--${name}`);
 }
 
+function allowServiceAccountKey() {
+  if (hasFlag("allow-service-account-key")) return true;
+  const raw = String(process.env.ALLOW_SERVICE_ACCOUNT_KEY || "").trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes";
+}
+
 function normalizeRole(raw) {
   const role = String(raw || "").trim().toLowerCase();
   if (role === "admin") return "super_admin";
@@ -30,6 +36,17 @@ function initAdmin() {
 
   if (projectId) options.projectId = projectId;
   if (keyPath) {
+    if (!allowServiceAccountKey()) {
+      throw new Error(
+        "Refusing to load a JSON service-account key without explicit approval. " +
+          "Use --allow-service-account-key (or ALLOW_SERVICE_ACCOUNT_KEY=true) " +
+          "only for approved break-glass operations."
+      );
+    }
+    console.warn(
+      "[security] Loading service-account key from keyPath. " +
+        "Ensure key file is stored securely and deleted after use."
+    );
     const absoluteKeyPath = path.isAbsolute(keyPath)
       ? keyPath
       : path.resolve(process.cwd(), keyPath);

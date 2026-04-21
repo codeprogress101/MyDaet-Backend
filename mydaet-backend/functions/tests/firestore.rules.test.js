@@ -137,10 +137,19 @@ async function seedBaseData(testEnv) {
       publicPinHash: "legacy",
       title: "Office 1 Doc",
       docType: "Request",
-      status: "WITH_OFFICE",
+      status: "IN_TRANSIT",
       currentOfficeId: "OFF-1",
       currentOfficeName: "Office 1",
-      currentCustodianUid: "mod1",
+      currentCustodianUid: null,
+      distributionMode: "MULTI",
+      destTotal: 2,
+      destPending: 1,
+      destInTransit: 1,
+      destReceived: 0,
+      destRejected: 0,
+      destCancelled: 0,
+      activeDestinationOfficeIds: ["OFF-2"],
+      destinationOfficeIds: ["OFF-2", "OFF-3"],
       updatedAt: new Date(),
     });
     await db.doc("dts_documents/doc-2").set({
@@ -168,6 +177,39 @@ async function seedBaseData(testEnv) {
       byUid: "mod2",
       officeName: "Office 2",
       createdAt: nowIso(),
+    });
+    await db.doc("dts_documents/doc-1/destinations/dest-1").set({
+      docId: "doc-1",
+      toOfficeId: "OFF-2",
+      toOfficeName: "Office 2",
+      sourceOfficeId: "OFF-1",
+      sourceOfficeName: "Office 1",
+      status: "IN_TRANSIT",
+      createdByUid: "mod1",
+      createdByName: "Office 1 Admin",
+      updatedAt: nowIso(),
+    });
+    await db.doc("dts_documents/doc-1/destinations/dest-2").set({
+      docId: "doc-1",
+      toOfficeId: "OFF-3",
+      toOfficeName: "Office 3",
+      sourceOfficeId: "OFF-1",
+      sourceOfficeName: "Office 1",
+      status: "PENDING",
+      createdByUid: "mod1",
+      createdByName: "Office 1 Admin",
+      updatedAt: nowIso(),
+    });
+    await db.doc("dts_documents/doc-2/destinations/dest-1").set({
+      docId: "doc-2",
+      toOfficeId: "OFF-2",
+      toOfficeName: "Office 2",
+      sourceOfficeId: "OFF-2",
+      sourceOfficeName: "Office 2",
+      status: "PENDING",
+      createdByUid: "mod2",
+      createdByName: "Office 2 Admin",
+      updatedAt: nowIso(),
     });
 
     await db.doc("civil_registry_requests/cr-1").set({
@@ -443,8 +485,19 @@ async function run() {
     await assertSucceeds(officeDb.doc("dts_documents/doc-1").get());
     await assertFails(officeDb.doc("dts_documents/doc-2").get());
     await assertSucceeds(adminDb.doc("dts_documents/doc-2").get());
+    await assertSucceeds(mod2Db.doc("dts_documents/doc-1").get());
     await assertSucceeds(mod1Db.doc("dts_documents/doc-1/timeline/event-1").get());
     await assertFails(mod1Db.doc("dts_documents/doc-2/timeline/event-1").get());
+    await assertSucceeds(mod1Db.doc("dts_documents/doc-1/destinations/dest-1").get());
+    await assertSucceeds(mod2Db.doc("dts_documents/doc-1/destinations/dest-1").get());
+    await assertFails(mod2Db.doc("dts_documents/doc-1/destinations/dest-2").get());
+    await assertFails(resident1Db.doc("dts_documents/doc-1/destinations/dest-1").get());
+    await assertFails(
+      mod2Db.doc("dts_documents/doc-1/destinations/dest-2").set(
+        {status: "RECEIVED"},
+        {merge: true}
+      )
+    );
     await assertFails(
       mod1Db.doc("dts_documents/doc-1/timeline/event-2").set({
         type: "NOTE",
