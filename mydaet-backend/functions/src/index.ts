@@ -2364,36 +2364,6 @@ function decodePdfBase64(input: unknown): Buffer {
   return bytes;
 }
 
-async function buildStorageTokenUrl(filePath: string): Promise<string> {
-  const bucket = admin.storage().bucket();
-  const file = bucket.file(filePath);
-  try {
-    const [signed] = await file.getSignedUrl({
-      action: "read",
-      expires: Date.now() + 1000 * 60 * 60,
-    });
-    return signed;
-  } catch (_error) {
-    const [metadata] = await file.getMetadata();
-    const custom = metadata.metadata ?? {};
-    let token = coerceString(custom.firebaseStorageDownloadTokens);
-    if (token && token.includes(",")) {
-      token = token.split(",")[0].trim();
-    }
-    if (!token) {
-      token = crypto.randomUUID();
-      await file.setMetadata({
-        metadata: {
-          ...custom,
-          firebaseStorageDownloadTokens: token,
-        },
-      });
-    }
-    return `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/` +
-      `${encodeURIComponent(filePath)}?alt=media&token=${token}`;
-  }
-}
-
 async function buildStorageSignedReadUrl(
   filePath: string,
   expiresAtMs: number
@@ -2720,6 +2690,18 @@ function matchesDtsTrackingOrQr(
     return true;
   }
   return false;
+}
+
+function matchesDtsTrackingQrOrSuffix(
+  verificationValue: string,
+  trackingNo: string,
+  qrCode: string | null
+): boolean {
+  if (matchesDtsTrackingOrQr(verificationValue, trackingNo, qrCode)) {
+    return true;
+  }
+  const expectedSuffix = dtsQrSuffix(qrCode);
+  return Boolean(expectedSuffix && verificationValue === expectedSuffix);
 }
 
 function dtsQrSuffix(qrCode: string | null): string | null {
@@ -11246,7 +11228,7 @@ async function dtsCreateTrackingRecordHandler(
     if (!requestedQrCode && verificationValue !== trackingNo) {
       requestedQrCode = verificationValue;
     }
-    if (!matchesDtsTrackingOrQr(verificationValue, trackingNo, requestedQrCode)) {
+    if (!matchesDtsTrackingQrOrSuffix(verificationValue, trackingNo, requestedQrCode)) {
       const locked = await registerReceiptVerificationFailure(
         receiptAttemptScope,
         actor.uid,
@@ -12075,14 +12057,15 @@ async function dtsPreviewInternalPdfHandler(
   });
 
   const expiresAtMs = Date.now() + 1000 * 60 * 15;
-  let previewDownloadUrl: string | null = null;
+  let previewDownloadUrl: string;
   try {
     previewDownloadUrl = await buildStorageSignedReadUrl(previewPath, expiresAtMs);
   } catch (error) {
-    console.warn("dtsPreviewInternalPdf: signed URL generation failed; using token URL fallback", {
-      error,
-    });
-    previewDownloadUrl = await buildStorageTokenUrl(previewPath);
+    console.warn("dtsPreviewInternalPdf: signed URL generation failed", {error});
+    throw new functions.https.HttpsError(
+      "unavailable",
+      "Unable to generate secure preview access. Please retry."
+    );
   }
 
   return {
@@ -12227,15 +12210,12 @@ async function dtsStampInternalPdfHandler(
         Date.now() + 1000 * 60 * 15
       );
     } catch (error) {
-      if (FUNCTIONS_EMULATOR_ENABLED) {
-        generatedFileUrl = await buildStorageTokenUrl(stampedPath);
-      } else {
-        console.warn("dtsStampInternalPdf: signed URL generation failed", {
-          docId,
-          stampedPath,
-          error,
-        });
-      }
+      console.warn("dtsStampInternalPdf: signed URL generation failed", {
+        docId,
+        stampedPath,
+        error,
+        emulator: FUNCTIONS_EMULATOR_ENABLED,
+      });
     }
 
     const timelineAttachments: Array<Record<string, unknown>> = [
@@ -12474,15 +12454,16 @@ async function dtsGetGeneratedPdfAccessHandler(
   }
 
   const expiresAtMs = Date.now() + 1000 * 60 * 15;
-  let downloadUrl: string | null = null;
-  try {
-    downloadUrl = await buildStorageSignedReadUrl(generatedFilePath, expiresAtMs);
-  } catch (error) {
-    console.warn("dtsGetGeneratedPdfAccess: signed URL generation failed; using token URL fallback", {
-      error,
-    });
-    downloadUrl = await buildStorageTokenUrl(generatedFilePath);
-  }
+    let downloadUrl: string;
+    try {
+      downloadUrl = await buildStorageSignedReadUrl(generatedFilePath, expiresAtMs);
+    } catch (error) {
+      console.warn("dtsGetGeneratedPdfAccess: signed URL generation failed", {error});
+      throw new functions.https.HttpsError(
+        "unavailable",
+        "Unable to generate secure generated-file access. Please retry."
+      );
+    }
 
   await addAuditLog({
     action: "dts_generated_pdf_access",
@@ -13189,15 +13170,7 @@ async function dtsConfirmDestinationReceiptHandler(
 
       const trackingNo = coerceString(row.trackingNo) ?? "";
       const qrCode = coerceString(row.qrCode);
-      const expectedQrSuffix = dtsQrSuffix(qrCode);
-      if (expectedQrSuffix) {
-        if (verificationValue !== expectedQrSuffix) {
-          throw new functions.https.HttpsError(
-            "invalid-argument",
-            "Invalid tracking number or QR code."
-          );
-        }
-      } else if (!matchesDtsTrackingOrQr(verificationValue, trackingNo, qrCode)) {
+      if (!matchesDtsTrackingQrOrSuffix(verificationValue, trackingNo, qrCode)) {
         throw new functions.https.HttpsError(
           "invalid-argument",
           "Invalid tracking number or QR code."
@@ -13982,15 +13955,7 @@ export const dtsConfirmReceipt = protectedCallableFunctions.https.onCall(
 
         const trackingNo = coerceString(row.trackingNo) ?? "";
         const qrCode = coerceString(row.qrCode);
-        const expectedQrSuffix = dtsQrSuffix(qrCode);
-        if (expectedQrSuffix) {
-          if (verificationValue !== expectedQrSuffix) {
-            throw new functions.https.HttpsError(
-              "invalid-argument",
-              `Invalid QR suffix. Enter the last ${DTS_RECEIPT_QR_SUFFIX_LENGTH} characters of the printed QR code.`
-            );
-          }
-        } else if (!matchesDtsTrackingOrQr(verificationValue, trackingNo, qrCode)) {
+        if (!matchesDtsTrackingQrOrSuffix(verificationValue, trackingNo, qrCode)) {
           throw new functions.https.HttpsError(
             "invalid-argument",
             "Invalid tracking number or QR code."
@@ -15343,51 +15308,16 @@ export const dtsListQrBatches = protectedCallableFunctions.https.onCall(
 
     const limitRaw = typeof data?.limit === "number" ? data.limit : 24;
     const limit = Math.max(1, Math.min(100, Math.floor(limitRaw)));
-    const repair = coerceBool(data?.repair, true);
     const snapshot = await db
       .collection("dts_qr_batches")
       .orderBy("createdAt", "desc")
       .limit(limit)
       .get();
 
-    const items = await Promise.all(
-      snapshot.docs.map(async (doc) => {
-        const row = doc.data() ?? {};
-        const existingTotal = Number.isFinite(Number(row.totalCount)) ? Number(row.totalCount) : 0;
-        const existingUnused = Number.isFinite(Number(row.unusedCount)) ? Number(row.unusedCount) : 0;
-        const existingUsed = Number.isFinite(Number(row.usedCount)) ? Number(row.usedCount) : 0;
-        const existingVoided = Number.isFinite(Number(row.voidedCount)) ? Number(row.voidedCount) : 0;
-        let summary: DtsQrBatchReconcileSummary = {
-          batchId: doc.id,
-          totalCount: existingTotal,
-          unusedCount: existingUnused,
-          usedCount: existingUsed,
-          voidedCount: existingVoided,
-          patchedQrCodes: 0,
-          patchedIndexRows: 0,
-          deletedIndexRows: 0,
-        };
-        try {
-          summary = await reconcileDtsQrBatch(doc.id, {
-            repairQrRows: repair,
-            syncBatchCounters: true,
-          });
-        } catch (error) {
-          console.warn("dtsListQrBatches: count reconciliation failed", {
-            batchId: doc.id,
-            error,
-          });
-        }
-        return {
-          id: doc.id,
-          ...row,
-          totalCount: summary.totalCount,
-          unusedCount: summary.unusedCount,
-          usedCount: summary.usedCount,
-          voidedCount: summary.voidedCount,
-        };
-      })
-    );
+    const items = snapshot.docs.map((doc) => ({
+      id: doc.id,
+      ...(doc.data() ?? {}),
+    }));
 
     return {items};
   }
@@ -15752,7 +15682,7 @@ export const exportDtsQrZip = protectedCallableFunctions.https.onCall(
       message: `Exported ${exportedCodes.length} DTS QR codes for printing.`,
     });
 
-    let downloadUrl: string | null = null;
+    let downloadUrl: string;
     try {
       const result = await exportFile.getSignedUrl({
         action: "read",
@@ -15761,30 +15691,10 @@ export const exportDtsQrZip = protectedCallableFunctions.https.onCall(
       downloadUrl = result[0];
     } catch (error) {
       console.warn("exportDtsQrZip: signed URL generation failed", error);
-    }
-
-    if (!downloadUrl) {
-      try {
-        const [metadata] = await exportFile.getMetadata();
-        const customMetadata = metadata.metadata ?? {};
-        let token = coerceString(customMetadata.firebaseStorageDownloadTokens);
-        if (token && token.includes(",")) {
-          token = token.split(",")[0].trim();
-        }
-        if (!token) {
-          token = crypto.randomUUID();
-          await exportFile.setMetadata({
-            metadata: {
-              ...customMetadata,
-              firebaseStorageDownloadTokens: token,
-            },
-          });
-        }
-        downloadUrl = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/` +
-          `${encodeURIComponent(exportPath)}?alt=media&token=${token}`;
-      } catch (fallbackError) {
-        console.warn("exportDtsQrZip: token URL fallback failed", fallbackError);
-      }
+      throw new functions.https.HttpsError(
+        "unavailable",
+        "Unable to generate secure export download URL. Please retry."
+      );
     }
 
     return {

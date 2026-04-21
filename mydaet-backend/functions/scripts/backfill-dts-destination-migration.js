@@ -419,7 +419,9 @@ function reportPathFromArg() {
 
 async function run() {
   const apply = hasFlag("apply");
-  const limit = parseIntArg("limit", null);
+  const allowAll = hasFlag("all");
+  const requestedLimit = parseIntArg("limit", null);
+  const limit = allowAll ? null : Math.min(requestedLimit ?? 500, 5000);
   const sampleLimit = parseIntArg("sample-limit", 40);
   const reportPath = reportPathFromArg();
   const docIds = parseArgList("doc-id");
@@ -553,6 +555,12 @@ async function run() {
   }
 
   if (!apply) {
+    if (!allowAll) {
+      report.notes.push(
+        `Safety limit applied: scanning up to ${limit} documents. ` +
+          "Use --all only for approved full-dataset runs."
+      );
+    }
     report.notes.push("Dry run only. Re-run with --apply to commit migration writes.");
     if (reportPath) {
       fs.mkdirSync(path.dirname(reportPath), {recursive: true});
@@ -580,6 +588,8 @@ async function run() {
     scanned: report.scanned,
     considered: report.considered,
     plannedMutations: plans.length,
+    limitApplied: limit,
+    allowAll,
     actor: SCRIPT_ACTOR,
   }, {merge: true});
 

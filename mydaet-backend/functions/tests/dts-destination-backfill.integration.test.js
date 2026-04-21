@@ -116,9 +116,13 @@ async function run() {
     throw new Error("FIRESTORE_EMULATOR_HOST is required for migration integration tests.");
   }
 
+  const projectId =
+    process.env.GCLOUD_PROJECT ||
+    process.env.FIREBASE_PROJECT_ID ||
+    "mydaet";
+
   const functionsModule = require("../lib/index.js");
   if (admin.apps.length === 0) {
-    const projectId = process.env.GCLOUD_PROJECT || "mydaet";
     admin.initializeApp({projectId});
   }
   const db = admin.firestore();
@@ -127,7 +131,7 @@ async function run() {
   const dryRunReport = path.join(os.tmpdir(), `md7-backfill-dry-${Date.now()}.json`);
   runNodeScript([
     SCRIPT_BACKFILL,
-    "--project=mydaet",
+    `--project=${projectId}`,
     `--report=${dryRunReport}`,
     "--sample-limit=10",
   ]);
@@ -138,7 +142,7 @@ async function run() {
   const applyReportPath = path.join(os.tmpdir(), `md7-backfill-apply-${Date.now()}.json`);
   runNodeScript([
     SCRIPT_BACKFILL,
-    "--project=mydaet",
+    `--project=${projectId}`,
     "--apply",
     `--report=${applyReportPath}`,
     "--sample-limit=10",
@@ -175,7 +179,7 @@ async function run() {
   const rollbackDryPath = path.join(os.tmpdir(), `md7-rollback-dry-${Date.now()}.json`);
   runNodeScript([
     SCRIPT_ROLLBACK,
-    "--project=mydaet",
+    `--project=${projectId}`,
     `--run-id=${applyReport.runId}`,
     `--report=${rollbackDryPath}`,
   ]);
